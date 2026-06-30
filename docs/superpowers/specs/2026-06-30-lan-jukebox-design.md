@@ -49,7 +49,7 @@ by "serve an audio stream that a browser plays."
 | Cold start   | Wait for a seed — "Queue a song to start the station"; no default station                                    |
 | Timeouts     | None. Never stops, never disconnects on idle                                                                 |
 | Source       | YouTube only (exact link + search→pick)                                                                      |
-| Access       | Single shared password (signed cookie); optional admin password for destructive/global actions               |
+| Access       | Single shared password (signed cookie); anyone authenticated may control everything                          |
 | Hosting      | A `waterburp.com` subdomain served from a high-uptime 2 Gbit home network (public HTTPS → local Docker host) |
 | Deploy       | GitHub Actions builds the image → **GHCR (public)** → `docker-compose` pulls it                              |
 | UI quality   | Built with the `frontend-design` skill — professional-grade for a professional group                         |
@@ -85,7 +85,7 @@ Reused from the bot (de-Discorded, de-guilded):
 - `queue/` — pure single-queue logic (add/remove/reorder/next/repeat/shuffle).
   De-guilded: one queue, not a per-guild map.
 - `orchestrator/` — single **station** context (was per-guild "hub"): current
-  track, queue, upcoming radio buffer, history, playlists, settings (volume,
+  track, queue, upcoming radio buffer, history, settings (volume,
   repeat, shuffle), restart-safe snapshot.
 - `server/` — Fastify app, REST, WebSocket hub, static serving.
 - `util/` — logger (pino), mutex, semaphore.
@@ -100,8 +100,9 @@ New / reworked modules:
   correct `Content-Type`, `Accept-Ranges`, `Content-Range`, 206.
 - `players/` — **active-player registry + device memory + state machine** (§5).
 - `auth/` — **shared-password** auth: reuse `session-store.ts`, **delete
-  `oauth.ts`**. `POST /api/login` → signed session cookie; optional admin
-  password elevates the session. Display-name is attribution only.
+  `oauth.ts`**. `POST /api/login` → signed session cookie; a single shared
+  `VIEWER_PASSWORD` for everyone, and anyone authenticated may control
+  everything. Display-name is attribution only.
 
 Deleted from the bot: `discord/`, `voice/`, `auth/oauth.ts`, all Discord config,
 the guild concept, **uploads, local-file sources, and all idle-timeout logic**.
@@ -112,19 +113,19 @@ Single SPA; role is runtime state:
 
 - **Remote (default):** add bar (YouTube link / search→pick), now-playing with
   live progress, the queue (reorder/remove/clear) + the upcoming-radio preview,
-  transport (play/pause/skip/seek/volume/repeat/shuffle), history, playlists,
+  transport (play/pause/skip/seek/volume/repeat/shuffle), history,
   lyrics, and a clear "📻 Station is live / waiting for a seed" status. (No
   "stop" that kills the station — skip advances; the station never ends.)
 - **Player role** (after "Play on this device", or auto on a remembered speaker):
   a managed hidden `<audio>` element subscribing to WS commands (load
   `/audio/:id`, play, pause, seek, setVolume), reporting `timeupdate` position
   and `ended` back. Shows "This device is the speaker" + a relinquish control.
-- **Login gate** for the shared password; optional admin unlock; a display-name
+- **Login gate** for the shared password; a display-name
   prompt persisted with a **persistent device token** in `localStorage` (this is
   how the backend remembers the device — see §5).
 
 Reused components (de-guilded, Discord UI removed): AddBar, Controls,
-NowPlaying, Queue, History, Playlists, Lyrics, Thumb, Picker, Grain, `lib/api`,
+NowPlaying, Queue, History, Lyrics, Thumb, Picker, Grain, `lib/api`,
 `lib/format`, and `useGuildState` → `useStationState`. **Removed:**
 ServerSelector, VoiceChannelPicker, Discord LoginGate, Visualizer, Discover
 (optional), upload UI, local-file browser.
@@ -189,15 +190,14 @@ lastSeen, isPreferredSpeaker }`.
 REST (under `/api`, session-gated except `/api/login`):
 
 - `POST /api/login` `{ password, displayName, deviceId }` → signed session cookie.
-- `POST /api/admin` `{ password }` → elevate session (if admin password set).
 - `GET  /api/state` → station snapshot (current, position, queue, upcoming-radio,
-  settings, history, playlists, seed, activePlayer present?, isThisDeviceSpeaker).
+  settings, history, seed, activePlayer present?, isThisDeviceSpeaker).
 - `POST /api/add` `{ urlOrQuery }` → resolve YouTube link, or return search
   candidates for `pick`; sets/updates the seed.
 - `POST /api/pick` `{ candidateId }` → enqueue a chosen search result.
 - `POST /api/control` `{ action, value? }` — play/pause/skip/seek/volume/repeat/
-  shuffle/clear/remove/reorder. (No "stop the station".) Destructive/global
-  actions need an elevated session if an admin password is set.
+  shuffle/clear/remove/reorder. (No "stop the station".) Any authenticated user
+  may perform any control action.
 - `POST /api/speaker` `{ action: 'claim'|'release'|'remember'|'forget' }` —
   device/Player role management.
 - `GET  /api/lyrics?trackId=` → lyrics.ovh passthrough.
@@ -217,14 +217,14 @@ WebSocket `/ws` (one per browser, carries `deviceId`):
 
 - Single shared **viewer password** (required) → signed session cookie via the
   reused session store. If unset in config the server refuses to start, unless
-  `ALLOW_NO_PASSWORD=true`.
-- Optional **admin password**: if set, destructive/global actions
-  (skip / clear / settings / remove others' tracks) require an elevated session;
-  if unset, all authenticated users can do everything.
+  `ALLOW_NO_PASSWORD=true`. There is no second/admin password: anyone
+  authenticated may control everything.
 - **Display name** + **deviceId** are client-supplied (attribution + device
   memory), not security boundaries.
-- Behind HTTPS: secure, `SameSite` cookies; `TRUST_PROXY` so the reverse proxy's
-  forwarded headers are honored.
+- Behind HTTPS: secure, `SameSite` cookies; Fastify `trustProxy` is always `true`
+  (the app is always behind the user's HTTPS proxy/tunnel) so the forwarded
+  headers are honored for correct scheme detection + secure cookies + real
+  client IP.
 
 ## 8. Audio format policy
 
@@ -243,9 +243,9 @@ WebSocket `/ws` (one per browser, carries `deviceId`):
 seed, Player/Remote roles + handoff, **device memory + auto-select speaker**,
 no-timeout guarantee, YouTube link + search→pick, queue (reorder/remove/clear) +
 upcoming-radio preview, now-playing live progress, transport
-(play/pause/skip/seek/volume/repeat/shuffle), history, playlists, lyrics,
-shared-password auth (+ optional admin), restart-safe snapshot, professional UI
-via `frontend-design`, Dockerized GHCR deploy via GitHub Actions.
+(play/pause/skip/seek/volume/repeat/shuffle), history, lyrics,
+shared-password auth (single shared password), restart-safe snapshot,
+professional UI via `frontend-design`, Dockerized GHCR deploy via GitHub Actions.
 
 **Deferred:** crossfade/gapless, EQ & FX presets, loudness normalization,
 visualizer, multi-room/zones, audio sync, non-YouTube sources, wall-clock "live
@@ -263,19 +263,22 @@ broadcast" mode, mobile-native clients.
 - **Run:** `docker-compose.yml` pulls the GHCR image (`pull_policy: always`),
   mounts a named volume for cache + a volume/file for the persisted device
   registry + station snapshot, and sets env inline.
-- **Ingress:** a **Cloudflare Tunnel** (`cloudflared`) exposes the
-  `waterburp.com` subdomain → the container. Implications: **no port-forwarding /
-  no published host port needed** (cloudflared dials out and routes to the app's
-  `PORT` over the Docker network or loopback); **HTTPS is terminated at the
-  Cloudflare edge** and `cloudflared` reaches the origin over plain HTTP;
-  Cloudflare sets `X-Forwarded-Proto: https`, so `TRUST_PROXY=true` is required
-  for correct scheme detection + secure cookies; Cloudflare Tunnels pass
-  **WebSockets** through (verify `/ws` upgrades end-to-end). `cloudflared` may run
-  as its own service in the same compose file or already exist on the host.
+- **Ingress (bring your own — NOT bundled):** the project does **not** bundle or
+  run `cloudflared`. The user fronts it with their **own separate** Cloudflare
+  Tunnel (or any HTTPS reverse proxy). The container publishes a localhost-bound
+  host port (`127.0.0.1:${HOST_PORT:-8080}:8080`) that a host-level tunnel dials,
+  or — if the tunnel runs as its own container — it joins a shared Docker network
+  and reaches the app at `http://jukebox:8080`. **HTTPS is terminated at the
+  Cloudflare edge** and the tunnel reaches the origin over plain HTTP; Cloudflare
+  sets `X-Forwarded-Proto: https`, and Fastify `trustProxy` is always `true` so
+  scheme detection + secure cookies + real client IP are correct behind the
+  tunnel; Cloudflare Tunnels pass **WebSockets** through (verify `/ws` upgrades
+  end-to-end, expect HTTP 101).
 - **Config (env):** `PORT`, `PUBLIC_BASE_URL` (the `https://` subdomain),
-  `ALLOWED_WS_ORIGINS` (**must equal** `PUBLIC_BASE_URL`), `TRUST_PROXY=true`,
-  `VIEWER_PASSWORD`, `ADMIN_PASSWORD` (optional), `CACHE_DIR`, cache size,
+  `ALLOWED_WS_ORIGINS` (**must equal** `PUBLIC_BASE_URL`),
+  `VIEWER_PASSWORD`, `CACHE_DIR`, cache size,
   yt-dlp player clients, optional bgutil POT URL. No idle-timeout settings exist.
+  (Fastify `trustProxy` is hardcoded `true` — not a configurable env var.)
 - Speaker PC: open the subdomain in a browser, log in, grant autoplay permission
   once; thereafter it's the remembered, auto-selected speaker.
 
@@ -284,7 +287,7 @@ broadcast" mode, mobile-native clients.
 - Vitest. Unit-test: queue logic, orchestrator/station transitions, **radio
   engine** (seed → related fetch → de-dup → keep-ahead → never-empty),
   **active-player + device-memory state machine** (manual designate, auto-select
-  remembered speaker, disconnect/resume), auth (password + admin elevation),
+  remembered speaker, disconnect/resume), auth (shared-password login/logout),
   YouTube resolvers (URL parse, search), and the WS protocol against a **mock
   Player**.
 - Real browser `<audio>` playback + autoplay-permission behavior is

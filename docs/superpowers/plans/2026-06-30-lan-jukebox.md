@@ -6,7 +6,7 @@
 
 **Architecture:** A Dockerized Node/Fastify backend holds the station state (queue + radio engine + orchestrator), serves `GET /audio/:trackId` with HTTP range to the browser `<audio>` sink, fans out `StationSnapshot` over WebSocket to all subscribers, and sends targeted player commands to the one active Player; a React SPA renders the Remote + Player roles; ingress is bring-your-own (e.g. a separate Cloudflare Tunnel) — the app only publishes a localhost-bound host port, it does NOT bundle cloudflared.
 
-**Tech Stack:** Node >=22.12 <23, TypeScript (ESM/NodeNext, strict), Fastify 5 + @fastify/{cookie,session,rate-limit,websocket,static}, pino, yt-dlp + ffmpeg + Deno (nsig) + optional bgutil POT; React 19 + Vite 6 + Tailwind v4; Vitest + @testing-library; Docker + GitHub Actions → GHCR + docker-compose; bring-your-own external ingress (no bundled cloudflared).
+**Tech Stack:** Node >=22.12 <23, TypeScript (ESM/NodeNext, strict), Fastify 5 + @fastify/{cookie,session,websocket,static}, pino, yt-dlp + ffmpeg + Deno (nsig) + optional bgutil POT; React 19 + Vite 6 + Tailwind v4; Vitest + @testing-library; Docker + GitHub Actions → GHCR + docker-compose; bring-your-own external ingress (no bundled cloudflared).
 
 ## Global Constraints
 
@@ -16,7 +16,7 @@
 - Source: YouTube only (exact link + search->pick).
 - Audio: the browser <audio> element is the output; backend serves GET /audio/:trackId with HTTP range (206). yt-dlp bestaudio, remux/transcode to AAC m4a only if not browser-playable. Carry over the player-client ladder (android_vr,web_embedded,tv) + optional bgutil POT.
 - Device memory: persisted device registry; the remembered speaker (isPreferredSpeaker) is auto-selected as the Player on connect; document the one-time browser autoplay-permission grant.
-- Auth: required shared VIEWER_PASSWORD (signed session cookie); optional ADMIN_PASSWORD elevates destructive/global actions; secure SameSite cookies; TRUST_PROXY=true (Cloudflare Tunnel sets X-Forwarded-Proto); ALLOWED_WS_ORIGINS must equal PUBLIC_BASE_URL.
+- Auth: required single shared VIEWER_PASSWORD (signed session cookie); anyone authenticated may control everything (no second/admin password); secure SameSite cookies; Fastify trustProxy is always true (the app is always behind the user's HTTPS proxy/tunnel which sets X-Forwarded-Proto — needed for correct scheme detection + secure cookies + real client IP), not a configurable env var; ALLOWED_WS_ORIGINS must equal PUBLIC_BASE_URL.
 - UI: built with the frontend-design skill to a professional, production-grade standard (design system first, then per-component).
 - Deploy: GitHub Actions (Atvriders) -> GHCR (PUBLIC) on push to master + weekly rebuild + yt-dlp cache-bust (+ first-build workflow_dispatch); docker-compose pulls the image (pull_policy: always) with named volumes for cache + persisted device registry/snapshot; bring-your-own external ingress (the app publishes a localhost-bound host port for the user's OWN separate Cloudflare Tunnel / reverse proxy — NO bundled cloudflared); gosu entrypoint chowns the cache volume.
 - Repo: public, under Atvriders, branch master.
@@ -139,22 +139,6 @@ export interface PreparingState {
 }
 
 // ---------------------------------------------------------------------------
-// Playlists
-// ---------------------------------------------------------------------------
-
-export interface SavedPlaylist {
-  name: string;
-  savedAt: number;
-  tracks: TrackMeta[];
-}
-
-export interface PlaylistSummary {
-  name: string;
-  trackCount: number;
-  savedAt: number;
-}
-
-// ---------------------------------------------------------------------------
 // Device registry / player role (spec §5)
 // ---------------------------------------------------------------------------
 
@@ -231,13 +215,9 @@ export interface LoginRequest {
   displayName: string;
   deviceId: string;
 }
-export interface AdminRequest {
-  password: string;
-}
 export interface SessionInfo {
   displayName: string;
   deviceId: string;
-  isAdmin: boolean;
 }
 
 export interface AddRequest {
@@ -356,12 +336,10 @@ export interface StationConfig {
 export interface WebConfig {
   publicBaseUrl: string;
   viewerPassword: string; // required unless allowNoPassword
-  adminPassword: string | null;
   allowNoPassword: boolean;
   sessionSecret: string; // >= 32 chars
   port: number;
   host: string;
-  trustProxy: boolean;
   allowedWsOrigins: string[]; // must equal [publicBaseUrl]
   nodeEnv: string;
   secureCookies: boolean;
@@ -379,7 +357,6 @@ export interface AppConfig {
 declare module "fastify" {
   interface Session {
     authed?: boolean;
-    isAdmin?: boolean;
     displayName?: string;
     deviceId?: string;
   }
@@ -442,11 +419,8 @@ declare module "fastify" {
 │   ├── orchestrator
 │   │   ├── index.ts                     # StationController: queue+sink+playback+advance-guard+seed; de-guilded/de-Discorded; NO idle timer
 │   │   ├── index.test.ts                # core/seek/preparing tests (FakeBrowserPlayer sink)
-│   │   ├── index.playlists.test.ts      # playlist delegation tests
 │   │   ├── settings.ts                  # StationSettings + applySettingsPatch (pruned to surviving fields)
 │   │   ├── settings.test.ts
-│   │   ├── playlists.ts                 # PlaylistStore (de-guilded: name->SavedPlaylist, atomic write)
-│   │   ├── playlists.test.ts
 │   │   ├── snapshot.ts                  # collect/write/read/restore single StationSnapshotFile (de-guilded, atomic)
 │   │   ├── snapshot.test.ts
 │   │   └── browser-player-sink.ts       # NEW: VoiceSession-shaped sink over WS (play/pause/resume/skip/seek/stop + trackEnd/error)
@@ -465,10 +439,10 @@ declare module "fastify" {
 │   ├── auth
 │   │   ├── session-store.ts             # MemorySessionStore (verbatim)
 │   │   ├── session-store.test.ts
-│   │   ├── password.ts                  # NEW: verifyPassword(timing-safe) + registerAuthRoutes(/api/login,/api/admin,/api/logout) + requireSession/requireAdmin
+│   │   ├── password.ts                  # NEW: verifyPassword(timing-safe) + registerAuthRoutes(/api/login,/api/logout) + requireSession
 │   │   └── password.test.ts
 │   └── server
-│       ├── app.ts                       # buildApp: cookie/session/rate-limit/websocket/static + /healthz + SPA fallback + error handler
+│       ├── app.ts                       # buildApp: cookie/session/websocket/static + /healthz + SPA fallback + error handler
 │       ├── app.test.ts                  # /healthz + login-guard inject tests
 │       ├── rest.ts                      # registerRest: /api flat routes (state/add/pick/control/speaker/lyrics) + enqueue helper
 │       ├── rest.test.ts
@@ -486,7 +460,7 @@ declare module "fastify" {
         ├── index.css                    # NEW design system (frontend-design skill) — Tailwind v4 @theme tokens
         ├── types.ts                     # web mirror of shared types (StationSnapshot/WS DTOs/SessionInfo) — kept in sync with src/types
         ├── lib
-        │   ├── api.ts                   # REST client: ApiError + flat /api endpoints (login/admin/state/add/pick/control/speaker/lyrics)
+        │   ├── api.ts                   # REST client: ApiError + flat /api endpoints (login/state/add/pick/control/speaker/lyrics)
         │   ├── api.test.ts
         │   ├── format.ts                # fmtTime/fmtAudio (verbatim)
         │   ├── format.test.ts
@@ -500,7 +474,7 @@ declare module "fastify" {
         └── components
             ├── App.tsx                  # root: session check, station-live/waiting banner, all handlers, player-role wiring, layout
             ├── App.test.tsx
-            ├── LoginGate.tsx            # NEW: shared-password form (password+displayName+deviceId) + admin unlock
+            ├── LoginGate.tsx            # NEW: shared-password form (password+displayName+deviceId)
             ├── LoginGate.test.tsx
             ├── PlayerPanel.tsx          # NEW: "This device is the speaker" + relinquish + managed <audio> mount point
             ├── PlayerPanel.test.tsx
@@ -514,8 +488,6 @@ declare module "fastify" {
             ├── Queue.test.tsx
             ├── History.tsx              # recently-played re-queue (verbatim-ish)
             ├── History.test.tsx
-            ├── Playlists.tsx            # save/load/delete (verbatim-ish)
-            ├── Playlists.test.tsx
             ├── Lyrics.tsx               # lazy lyrics panel (api.lyrics(trackId))
             ├── Lyrics.test.tsx
             ├── Settings.tsx             # repeat/volume/autoplay/autoplaySource/maxTrackDuration only (idle/fx/crossfade removed)
@@ -555,7 +527,7 @@ declare module "fastify" {
 **Interfaces**
 
 - Consumes: nothing.
-- Produces (exact names — single source of truth): `LiveStatus`, `TrackMeta`, `AudioInfo`, `RequestSource`, `Requester`, `AUTOPLAY_REQUESTER`, `QueueItem`, `QueueSnapshot`, `RepeatMode`, `AutoplaySource`, `StationSettings`, `DEFAULT_SETTINGS`, `VOLUME_MAX`, `MAX_TRACK_DURATION_CEILING_SEC`, `PreparingPhase`, `PreparingState`, `SavedPlaylist`, `PlaylistSummary`, `DeviceRecord`, `DeviceRegistryFile`, `CurrentItem`, `StationSnapshot`, `StationStateResponse`, `StationSnapshotFile`, `LoginRequest`, `AdminRequest`, `SessionInfo`, `AddRequest`, `AddResponse`, `PickRequest`, `PickResponse`, `ControlAction`, `ControlRequest`, `ControlResponse`, `SpeakerAction`, `SpeakerRequest`, `SpeakerResponse`, `LyricsResult`, `ApiErrorBody`, `ClientWsMessage`, `ServerBroadcastMessage`, `ServerPlayerMessage`, `ServerWsMessage`, `MediaConfig`, `StationConfig`, `WebConfig`, `AppConfig`, plus the `declare module "fastify"` session augmentation.
+- Produces (exact names — single source of truth): `LiveStatus`, `TrackMeta`, `AudioInfo`, `RequestSource`, `Requester`, `AUTOPLAY_REQUESTER`, `QueueItem`, `QueueSnapshot`, `RepeatMode`, `AutoplaySource`, `StationSettings`, `DEFAULT_SETTINGS`, `VOLUME_MAX`, `MAX_TRACK_DURATION_CEILING_SEC`, `PreparingPhase`, `PreparingState`, `DeviceRecord`, `DeviceRegistryFile`, `CurrentItem`, `StationSnapshot`, `StationStateResponse`, `StationSnapshotFile`, `LoginRequest`, `SessionInfo`, `AddRequest`, `AddResponse`, `PickRequest`, `PickResponse`, `ControlAction`, `ControlRequest`, `ControlResponse`, `SpeakerAction`, `SpeakerRequest`, `SpeakerResponse`, `LyricsResult`, `ApiErrorBody`, `ClientWsMessage`, `ServerBroadcastMessage`, `ServerPlayerMessage`, `ServerWsMessage`, `MediaConfig`, `StationConfig`, `WebConfig`, `AppConfig`, plus the `declare module "fastify"` session augmentation.
 
 **Steps**
 
@@ -673,7 +645,6 @@ declare module "fastify" {
    declare module "fastify" {
      interface Session {
        authed?: boolean;
-       isAdmin?: boolean;
        displayName?: string;
        deviceId?: string;
      }
@@ -685,7 +656,7 @@ declare module "fastify" {
 4. **Run it (expect PASS)** — `npx vitest run src/types/index.test.ts`
    Expected: `Test Files 1 passed`, all assertions green.
 
-5. **Mirror for the web** — create `web/src/types.ts`. Copy every domain/attribution/station/playlist/device/DTO/WS type from `src/types/index.ts` VERBATIM, but OMIT: (a) the `MediaConfig`/`StationConfig`/`WebConfig`/`AppConfig` interfaces (server-only), and (b) the `declare module "fastify"` block (Node-only). Add a top comment: `// web mirror of src/types/index.ts — keep in sync; domain/DTO/WS types only.` No test file for the mirror (it is type-only and exercised by the web component tests in 0.7); a structural mismatch surfaces in `tsc -p web/tsconfig.json` during Phase completion.
+5. **Mirror for the web** — create `web/src/types.ts`. Copy every domain/attribution/station/device/DTO/WS type from `src/types/index.ts` VERBATIM, but OMIT: (a) the `MediaConfig`/`StationConfig`/`WebConfig`/`AppConfig` interfaces (server-only), and (b) the `declare module "fastify"` block (Node-only). Add a top comment: `// web mirror of src/types/index.ts — keep in sync; domain/DTO/WS types only.` No test file for the mirror (it is type-only and exercised by the web component tests in 0.7); a structural mismatch surfaces in `tsc -p web/tsconfig.json` during Phase completion.
 
 ---
 
@@ -699,7 +670,7 @@ declare module "fastify" {
 **Interfaces**
 
 - Consumes: nothing.
-- Produces: npm scripts — `build` = `npm run build:web && tsc -p tsconfig.json`; `build:web` = `vite build web --outDir ../dist/public --emptyOutDir`; `test` = `vitest run`; `test:watch` = `vitest`; `typecheck` = `tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && tsc -p web/tsconfig.json`; `lint` = `eslint . && prettier --check .`; `start` = `node dist/index.js`; `dev` = `tsx watch src/index.ts`; `dev:web` = `vite web`. Deps: `fastify@^5`, `@fastify/{cookie,session,rate-limit,websocket,static}`, `@noble/ciphers`, `pino`. devDeps: `react@^19`, `react-dom@^19`, `@types/react`, `@types/react-dom`, `vite@^6`, `@vitejs/plugin-react`, `tailwindcss@^4`, `@tailwindcss/vite@^4`, `vitest@^4`, `@testing-library/react@^16`, `@testing-library/jest-dom`, `jsdom`, `typescript`, `typescript-eslint`, `eslint`, `@eslint/js`, `eslint-plugin-react-hooks`, `prettier`, `tsx`, `@types/node`, `sharp`. **Explicitly absent: `discord.js`, `@discordjs/voice`, `@discordjs/opus`, `prism-media`.**
+- Produces: npm scripts — `build` = `npm run build:web && tsc -p tsconfig.json`; `build:web` = `vite build web --outDir ../dist/public --emptyOutDir`; `test` = `vitest run`; `test:watch` = `vitest`; `typecheck` = `tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && tsc -p web/tsconfig.json`; `lint` = `eslint . && prettier --check .`; `start` = `node dist/index.js`; `dev` = `tsx watch src/index.ts`; `dev:web` = `vite web`. Deps: `fastify@^5`, `@fastify/{cookie,session,websocket,static}`, `@noble/ciphers`, `pino`. devDeps: `react@^19`, `react-dom@^19`, `@types/react`, `@types/react-dom`, `vite@^6`, `@vitejs/plugin-react`, `tailwindcss@^4`, `@tailwindcss/vite@^4`, `vitest@^4`, `@testing-library/react@^16`, `@testing-library/jest-dom`, `jsdom`, `typescript`, `typescript-eslint`, `eslint`, `@eslint/js`, `eslint-plugin-react-hooks`, `prettier`, `tsx`, `@types/node`, `sharp`. **Explicitly absent: `discord.js`, `@discordjs/voice`, `@discordjs/opus`, `prism-media`.**
 
 **Steps**
 
@@ -728,7 +699,7 @@ declare module "fastify" {
 3. **Author `package.json`** — base it on `~/discord-yt-music-bot/package.json` with these mutations:
    - `"name": "lan-jukebox"`, keep `"private": true`, `"type": "module"`, `"engines": { "node": ">=22.12 <23" }`.
    - Scripts: exactly the set in Produces above (keep `build:web`, `dev`, `dev:web`, `test:watch`).
-   - `dependencies`: `@fastify/cookie@^11`, `@fastify/rate-limit@^10`, `@fastify/session@^11`, `@fastify/static@^9`, `@fastify/websocket@^11`, `@noble/ciphers@^1`, `fastify@^5`, `pino@^10`. **Delete** `@discordjs/opus`, `@discordjs/voice`, `discord.js`, `prism-media`.
+   - `dependencies`: `@fastify/cookie@^11`, `@fastify/session@^11`, `@fastify/static@^9`, `@fastify/websocket@^11`, `@noble/ciphers@^1`, `fastify@^5`, `pino@^10`. **Delete** `@discordjs/opus`, `@discordjs/voice`, `discord.js`, `prism-media`.
    - `devDependencies`: copy verbatim from the bot (the React/Vite/Tailwind/Vitest/ESLint/Prettier/tsx/types/sharp set) — none of those carry Discord.
 
 4. **Author the TS configs** — copy `~/discord-yt-music-bot/{tsconfig.json,tsconfig.test.json,vitest.config.ts}` VERBATIM (they are framework-agnostic: NodeNext, `strict`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax`, `rootDir: src`, exclude `web` + `**/*.test.ts`; vitest includes `src/**/*.test.ts` + `web/**/*.test.{ts,tsx}`, jsx automatic). Copy `eslint.config.js` and `.prettierrc.json` -> name it `.prettierrc` (rename per the file tree; keep the JSON contents identical).
@@ -870,7 +841,7 @@ declare module "fastify" {
 **Interfaces**
 
 - Consumes: 0.1 (`MediaConfig`, `StationConfig`, `WebConfig`, `AppConfig` from `./types/index.js`).
-- Produces: `loadConfig(env?: Env): AppConfig` (= `{ media, station, web }`), `loadMediaConfig(env?): MediaConfig`, `loadStationConfig(env?): StationConfig`, `loadWebConfig(env?): WebConfig`, `intEnv`, `strEnv`, plus a re-export `export type { MediaConfig, StationConfig, WebConfig, AppConfig } from "./types/index.js";`. `loadWebConfig` throws unless `VIEWER_PASSWORD` set OR `ALLOW_NO_PASSWORD==="true"`; requires `SESSION_SECRET` length ≥ 32; requires `PUBLIC_BASE_URL` (trailing `/` stripped); `ALLOWED_WS_ORIGINS` defaults to `[publicBaseUrl]`; `TRUST_PROXY==="true"`; `secureCookies = nodeEnv === "production"`. NO Discord token, NO `idleTimeoutMs`, NO `adminUserIds`, NO `clientId`/`clientSecret`/`redirectUri`/`normalizeLoudness`/`sponsorblockRemove`.
+- Produces: `loadConfig(env?: Env): AppConfig` (= `{ media, station, web }`), `loadMediaConfig(env?): MediaConfig`, `loadStationConfig(env?): StationConfig`, `loadWebConfig(env?): WebConfig`, `intEnv`, `strEnv`, plus a re-export `export type { MediaConfig, StationConfig, WebConfig, AppConfig } from "./types/index.js";`. `loadWebConfig` throws unless `VIEWER_PASSWORD` set OR `ALLOW_NO_PASSWORD==="true"`; requires `SESSION_SECRET` length ≥ 32; requires `PUBLIC_BASE_URL` (trailing `/` stripped); `ALLOWED_WS_ORIGINS` defaults to `[publicBaseUrl]`; `secureCookies = nodeEnv === "production"`. NO Discord token, NO `idleTimeoutMs`, NO `adminUserIds`, NO `adminPassword` and no trust-proxy env knob (Fastify `trustProxy` is hardcoded `true` at the app layer — see Task 4.3), NO `clientId`/`clientSecret`/`redirectUri`/`normalizeLoudness`/`sponsorblockRemove`.
 
 **Steps**
 
@@ -909,16 +880,11 @@ declare module "fastify" {
        const cfg = loadWebConfig(base);
        expect(cfg.allowedWsOrigins).toEqual(["https://jukebox.waterburp.com"]);
      });
-     it("honors TRUST_PROXY === 'true' and derives secureCookies from NODE_ENV", () => {
-       const dev = loadWebConfig({ ...base, TRUST_PROXY: "true" });
-       expect(dev.trustProxy).toBe(true);
+     it("derives secureCookies from NODE_ENV", () => {
+       const dev = loadWebConfig(base);
        expect(dev.secureCookies).toBe(false);
        const prod = loadWebConfig({ ...base, NODE_ENV: "production" });
        expect(prod.secureCookies).toBe(true);
-     });
-     it("sets adminPassword from ADMIN_PASSWORD (null when unset)", () => {
-       expect(loadWebConfig(base).adminPassword).toBeNull();
-       expect(loadWebConfig({ ...base, ADMIN_PASSWORD: "rootpw" }).adminPassword).toBe("rootpw");
      });
    });
 
@@ -1038,12 +1004,10 @@ declare module "fastify" {
      return {
        publicBaseUrl,
        viewerPassword: viewerPassword ?? "",
-       adminPassword: strEnv(env, "ADMIN_PASSWORD"),
        allowNoPassword,
        sessionSecret,
        port: intEnv(env, "PORT", 8080, { min: 1, max: 65535 }),
        host: strEnv(env, "HOST") ?? "0.0.0.0",
-       trustProxy: strEnv(env, "TRUST_PROXY") === "true",
        allowedWsOrigins: (strEnv(env, "ALLOWED_WS_ORIGINS") ?? publicBaseUrl)
          .split(",")
          .map((s) => s.trim())
@@ -1062,7 +1026,7 @@ declare module "fastify" {
    }
    ```
 
-   Note vs the bot: removed `loadBotConfig`, `parseAdminIds`, `DISCORD_*`, `idleTimeoutMs`, `normalizeLoudness`, `sponsorblockRemove`, `clientId/secret/redirectUri`; added `viewerPassword`/`allowNoPassword`/`adminPassword` and a `StationConfig` reader.
+   Note vs the bot: removed `loadBotConfig`, `parseAdminIds`, `DISCORD_*`, `idleTimeoutMs`, `normalizeLoudness`, `sponsorblockRemove`, `clientId/secret/redirectUri`; added `viewerPassword`/`allowNoPassword` and a `StationConfig` reader. No `adminPassword` (single shared password) and no trust-proxy env knob (Fastify `trustProxy` is hardcoded `true` at the app layer, since the app is always behind the user's HTTPS proxy/tunnel).
 
 4. **Run it (expect PASS)** — `npx vitest run src/config.test.ts`
    Expected: all assertions green, including `loadStationConfig({})` having no `idleTimeoutMs` property and the `android_vr,web_embedded,tv` default.
@@ -1356,13 +1320,13 @@ declare module "fastify" {
 
 ## Phase 1:Station orchestrator & radio engine — Station orchestrator & radio engine
 
-**Goal:** De-guild + de-Discord the queue and orchestrator into a single never-stopping `StationController` whose sink is a browser-player adapter (`BrowserPlayerSink`), then build the `RadioEngine` on top of `YouTubeService.related/artistTracks` with seed tracking, de-dup vs recent history, keep-ahead, cold-start-waits-for-seed, and NO idle timeout — plus the de-guilded settings/playlists/snapshot.
+**Goal:** De-guild + de-Discord the queue and orchestrator into a single never-stopping `StationController` whose sink is a browser-player adapter (`BrowserPlayerSink`), then build the `RadioEngine` on top of `YouTubeService.related/artistTracks` with seed tracking, de-dup vs recent history, keep-ahead, cold-start-waits-for-seed, and NO idle timeout — plus the de-guilded settings/snapshot.
 
 ### Parallelization
 
 - **Sequential (shared hub — one editor at a time):** `src/orchestrator/index.ts` (`StationController`). Task 1.5 builds it; Task 1.6 (`RadioEngine`) and Task 1.7 (snapshot) only _consume_ its public surface and live in disjoint files, so they may proceed once 1.5's public API is frozen.
-- **Parallel-safe (disjoint files, may run concurrently after types are frozen):** Task 1.1 `src/queue/index.ts`, Task 1.2 `src/orchestrator/settings.ts`, Task 1.3 `src/orchestrator/playlists.ts`, Task 1.4 `src/orchestrator/browser-player-sink.ts`. Task 1.5 depends on all of 1.1–1.4. Task 1.6 `src/radio/index.ts` is fully disjoint from the controller file. Task 1.7 `src/orchestrator/snapshot.ts` is disjoint from the controller file.
-- **Dependency order:** 1.1 → (1.2, 1.3, 1.4 in parallel) → 1.5 → (1.6, 1.7 in parallel) → Phase completion.
+- **Parallel-safe (disjoint files, may run concurrently after types are frozen):** Task 1.1 `src/queue/index.ts`, Task 1.2 `src/orchestrator/settings.ts`, Task 1.4 `src/orchestrator/browser-player-sink.ts`. (Task 1.3 is REMOVED — saved playlists cut from scope.) Task 1.5 depends on all of 1.1, 1.2, 1.4. Task 1.6 `src/radio/index.ts` is fully disjoint from the controller file. Task 1.7 `src/orchestrator/snapshot.ts` is disjoint from the controller file.
+- **Dependency order:** 1.1 → (1.2, 1.4 in parallel) → 1.5 → (1.6, 1.7 in parallel) → Phase completion.
 
 All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared types are imported from `../types/index.js`. The test runner is Vitest (node env). Run commands from the repo root `/home/kasm-user/lan-jukebox`.
 
@@ -1860,218 +1824,7 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 
 ---
 
-### Task 1.3: De-guild PlaylistStore
-
-**Files**
-
-- Create: `src/orchestrator/playlists.ts`
-- Test: `src/orchestrator/playlists.test.ts`
-
-**Interfaces**
-
-- Consumes (from `src/types/index.ts`): `SavedPlaylist`, `PlaylistSummary`, `TrackMeta`; (from `src/util/mutex.js`): `Mutex`.
-- Produces:
-  ```ts
-  export const PLAYLISTS_FILE = "playlists.json";
-  export class PlaylistStore {
-    constructor(dir: string, now?: () => number);
-    init(): Promise<void>;
-    list(): PlaylistSummary[];
-    get(name: string): TrackMeta[] | null;
-    save(name: string, tracks: TrackMeta[]): Promise<void>;
-    delete(name: string): Promise<boolean>;
-  }
-  ```
-  File shape (de-guilded — one flat map, no `guilds` dimension): `{ version: 1; playlists: Record<string, SavedPlaylist> }`, written atomically via tmp+rename, tolerant of a missing/corrupt file on load. `SavedPlaylist`/`PlaylistSummary`/`TrackMeta` are imported from `../types/index.js` (NOT re-declared).
-
-**Steps**
-
-1. Write the failing test `src/orchestrator/playlists.test.ts`:
-
-   ```ts
-   import { describe, it, expect, beforeEach, afterEach } from "vitest";
-   import { mkdtemp, rm, readFile } from "node:fs/promises";
-   import { tmpdir } from "node:os";
-   import { join } from "node:path";
-   import { PlaylistStore, PLAYLISTS_FILE } from "./playlists.js";
-   import type { TrackMeta } from "../types/index.js";
-
-   function meta(id: string): TrackMeta {
-     return {
-       videoId: id,
-       title: id,
-       channel: "c",
-       durationSec: 10,
-       isLive: false,
-       thumbnailUrl: null,
-     };
-   }
-   let dir: string;
-   beforeEach(async () => {
-     dir = await mkdtemp(join(tmpdir(), "pl-"));
-   });
-   afterEach(async () => {
-     await rm(dir, { recursive: true, force: true });
-   });
-
-   describe("PlaylistStore", () => {
-     it("saves, lists (newest first), and gets a playlist", async () => {
-       let t = 0;
-       const store = new PlaylistStore(dir, () => ++t);
-       await store.init();
-       await store.save("mix", [meta("aaaaaaaaaaa")]);
-       await store.save("chill", [meta("bbbbbbbbbbb"), meta("ccccccccccc")]);
-       expect(store.list().map((p) => p.name)).toEqual(["chill", "mix"]);
-       expect(store.list().find((p) => p.name === "chill")?.trackCount).toBe(2);
-       expect(store.get("mix")?.map((m) => m.videoId)).toEqual(["aaaaaaaaaaa"]);
-       expect(store.get("missing")).toBeNull();
-     });
-
-     it("rejects a blank name and an empty track list", async () => {
-       const store = new PlaylistStore(dir);
-       await store.init();
-       await expect(store.save("  ", [meta("a")])).rejects.toThrow();
-       await expect(store.save("x", [])).rejects.toThrow();
-     });
-
-     it("delete returns whether it existed and persists", async () => {
-       const store = new PlaylistStore(dir);
-       await store.init();
-       await store.save("mix", [meta("aaaaaaaaaaa")]);
-       expect(await store.delete("mix")).toBe(true);
-       expect(await store.delete("mix")).toBe(false);
-       expect(store.get("mix")).toBeNull();
-     });
-
-     it("persists to PLAYLISTS_FILE and reloads across instances", async () => {
-       const a = new PlaylistStore(dir);
-       await a.init();
-       await a.save("mix", [meta("aaaaaaaaaaa")]);
-       const raw = JSON.parse(await readFile(join(dir, PLAYLISTS_FILE), "utf8"));
-       expect(raw.version).toBe(1);
-       expect(raw.playlists.mix.tracks[0].videoId).toBe("aaaaaaaaaaa");
-       const b = new PlaylistStore(dir);
-       await b.init();
-       expect(b.get("mix")?.[0]?.videoId).toBe("aaaaaaaaaaa");
-     });
-
-     it("starts empty when the file is missing or corrupt", async () => {
-       const store = new PlaylistStore(dir);
-       await store.init();
-       expect(store.list()).toEqual([]);
-     });
-   });
-   ```
-
-2. Run the test (expected FAIL):
-
-   ```
-   npx vitest run src/orchestrator/playlists.test.ts
-   ```
-
-   Expected failure: `Cannot find module './playlists.js'`.
-
-3. Write the minimal implementation `src/orchestrator/playlists.ts`:
-
-   ```ts
-   import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-   import { join } from "node:path";
-   import type { PlaylistSummary, SavedPlaylist, TrackMeta } from "../types/index.js";
-   import { Mutex } from "../util/mutex.js";
-
-   interface PlaylistsFile {
-     version: 1;
-     // playlist name -> playlist. An object (not a Map) so it serializes cleanly.
-     playlists: Record<string, SavedPlaylist>;
-   }
-
-   export const PLAYLISTS_FILE = "playlists.json";
-   const MAX_NAME_LEN = 80;
-
-   export class PlaylistStore {
-     private file: PlaylistsFile = { version: 1, playlists: {} };
-     private readonly now: () => number;
-     private readonly persistLock = new Mutex();
-     private persistSeq = 0;
-
-     constructor(
-       private readonly dir: string,
-       now: () => number = () => Date.now(),
-     ) {
-       this.now = now;
-     }
-
-     async init(): Promise<void> {
-       try {
-         const raw = await readFile(join(this.dir, PLAYLISTS_FILE), "utf8");
-         const parsed = JSON.parse(raw) as PlaylistsFile;
-         if (parsed.version === 1 && parsed.playlists && typeof parsed.playlists === "object") {
-           this.file = { version: 1, playlists: parsed.playlists };
-         }
-       } catch {
-         // Missing or corrupt → keep the empty default.
-       }
-     }
-
-     // Storage KEY derivation: trim + clamp. save/get/delete MUST share this or a name longer
-     // than MAX_NAME_LEN is stored truncated but looked up full-length — an unconditional miss.
-     private toKey(name: string): string {
-       return (name ?? "").toString().trim().slice(0, MAX_NAME_LEN);
-     }
-     private normalizeName(name: string): string {
-       const key = this.toKey(name);
-       if (!key) throw new Error("playlist name is required");
-       return key;
-     }
-
-     list(): PlaylistSummary[] {
-       return Object.values(this.file.playlists)
-         .map((p) => ({ name: p.name, trackCount: p.tracks.length, savedAt: p.savedAt }))
-         .sort((a, b) => b.savedAt - a.savedAt);
-     }
-
-     get(name: string): TrackMeta[] | null {
-       const pl = this.file.playlists[this.toKey(name)];
-       return pl ? pl.tracks.map((t) => ({ ...t })) : null;
-     }
-
-     async save(name: string, tracks: TrackMeta[]): Promise<void> {
-       const key = this.normalizeName(name);
-       if (!Array.isArray(tracks) || tracks.length === 0) {
-         throw new Error("cannot save an empty playlist");
-       }
-       this.file.playlists[key] = {
-         name: key,
-         savedAt: this.now(),
-         tracks: tracks.map((t) => ({ ...t })),
-       };
-       await this.persist();
-     }
-
-     async delete(name: string): Promise<boolean> {
-       const key = this.toKey(name);
-       if (!(key in this.file.playlists)) return false;
-       delete this.file.playlists[key];
-       await this.persist();
-       return true;
-     }
-
-     private persist(): Promise<void> {
-       return this.persistLock.runExclusive(async () => {
-         await mkdir(this.dir, { recursive: true });
-         const tmp = join(this.dir, `${PLAYLISTS_FILE}.${process.pid}.${++this.persistSeq}.tmp`);
-         await writeFile(tmp, JSON.stringify(this.file));
-         await rename(tmp, join(this.dir, PLAYLISTS_FILE)); // atomic swap
-       });
-     }
-   }
-   ```
-
-4. Run the test (expected PASS):
-   ```
-   npx vitest run src/orchestrator/playlists.test.ts
-   ```
-   Expected: `Tests  5 passed (5)`.
+### Task 1.3: REMOVED — saved playlists cut from scope (no work)
 
 ---
 
@@ -2297,11 +2050,10 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 
 - Create: `src/orchestrator/index.ts`
 - Test: `src/orchestrator/index.test.ts`
-- Test: `src/orchestrator/index.playlists.test.ts`
 
 **Interfaces**
 
-- Consumes: 1.1 `Queue`; 1.2 `applySettingsPatch`; 1.3 `PlaylistStore`; 1.4 `BrowserPlayerSink`; (Phase 0) `YouTubeService.download` from `../youtube/index.js`; (Phase 0) `AudioCache` from `../cache/index.js`; (Phase 0) `Mutex`/`Semaphore` from `../util/`; (types) `StationSnapshot`, `CurrentItem`, `PreparingState`, `StationSnapshotFile`, `StationSettings`, `QueueItem`, `TrackMeta`, `Requester`, `AUTOPLAY_REQUESTER`, `DEFAULT_SETTINGS`.
+- Consumes: 1.1 `Queue`; 1.2 `applySettingsPatch`; 1.4 `BrowserPlayerSink`; (Phase 0) `YouTubeService.download` from `../youtube/index.js`; (Phase 0) `AudioCache` from `../cache/index.js`; (Phase 0) `Mutex`/`Semaphore` from `../util/`; (types) `StationSnapshot`, `CurrentItem`, `PreparingState`, `StationSnapshotFile`, `StationSettings`, `QueueItem`, `TrackMeta`, `Requester`, `AUTOPLAY_REQUESTER`, `DEFAULT_SETTINGS`.
 - Produces:
 
   ```ts
@@ -2344,10 +2096,6 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
     setRadioContinuation(fn: (() => Promise<TrackMeta | null>) | null): void; // 1.6 wiring
     setRadioTopUp(fn: (() => void) | null): void; // 1.6 proactive top-up on queue 'changed'
     setUpcomingRadio(items: QueueItem[]): void; // 1.6 pre-resolved radio buffer for the UI preview
-    listPlaylists(): PlaylistSummary[]; // delegates to the injected PlaylistStore (Task 1.5 step 7)
-    savePlaylist(name: string): Promise<void>; // saves current + upcoming metas
-    loadPlaylist(name: string, requester: Requester): Promise<number>; // enqueues saved tracks; returns count
-    deletePlaylist(name: string): Promise<boolean>;
     restore(file: StationSnapshotFile): Promise<void>;
     // events: 'changed'
   }
@@ -2926,117 +2674,11 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 
    Expected: `Tests  11 passed (11)` (all core/seek/preparing/no-timeout/sink cases green).
 
-5. Write the failing playlist-delegation test `src/orchestrator/index.playlists.test.ts`. The controller delegates save/load/list/delete to an injected `PlaylistStore`; loading a playlist enqueues its tracks. Add a `playlists?` dep + delegating methods. Real code:
-
-   ```ts
-   import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-   import { mkdtemp, rm } from "node:fs/promises";
-   import { tmpdir } from "node:os";
-   import { join } from "node:path";
-   import { StationController } from "./index.js";
-   import { PlaylistStore } from "./playlists.js";
-   import type { Requester, TrackMeta } from "../types/index.js";
-
-   const user: Requester = { deviceId: "d1", displayName: "u", source: "user" };
-   function meta(id: string): TrackMeta {
-     return {
-       videoId: id,
-       title: id,
-       channel: "c",
-       durationSec: 10,
-       isLive: false,
-       thumbnailUrl: null,
-     };
-   }
-   let dir: string;
-   beforeEach(async () => {
-     dir = await mkdtemp(join(tmpdir(), "stp-"));
-   });
-   afterEach(async () => {
-     await rm(dir, { recursive: true, force: true });
-   });
-
-   describe("StationController playlists", () => {
-     it("savePlaylist captures current+upcoming metas; loadPlaylist enqueues them", async () => {
-       const store = new PlaylistStore(dir, () => 1);
-       await store.init();
-       const c = new StationController({
-         download: vi.fn(async (id) => ({ path: id })),
-         playlists: store,
-       });
-       await c.enqueue(meta("aaaaaaaaaaa"), user);
-       await c.enqueue(meta("bbbbbbbbbbb"), user);
-       await c.savePlaylist("mix");
-       expect(c.listPlaylists().map((p) => p.name)).toEqual(["mix"]);
-       await c.clear();
-       const n = await c.loadPlaylist("mix", user);
-       expect(n).toBe(2);
-       const ids = [c.snapshot().current, ...c.snapshot().upcoming]
-         .filter(Boolean)
-         .map((i) => i!.meta.videoId);
-       expect(ids).toContain("aaaaaaaaaaa");
-       expect(ids).toContain("bbbbbbbbbbb");
-     });
-
-     it("deletePlaylist removes it; loadPlaylist of a missing name returns 0", async () => {
-       const store = new PlaylistStore(dir, () => 1);
-       await store.init();
-       const c = new StationController({
-         download: vi.fn(async (id) => ({ path: id })),
-         playlists: store,
-       });
-       await c.enqueue(meta("aaaaaaaaaaa"), user);
-       await c.savePlaylist("mix");
-       expect(await c.deletePlaylist("mix")).toBe(true);
-       expect(await c.loadPlaylist("mix", user)).toBe(0);
-     });
-   });
+5. Run the controller test file (expected PASS):
    ```
-
-6. Run the test (expected FAIL):
-
+   npx vitest run src/orchestrator/index.test.ts
    ```
-   npx vitest run src/orchestrator/index.playlists.test.ts
-   ```
-
-   Expected failure: `c.savePlaylist is not a function` (the delegating methods do not exist yet).
-
-7. Add the playlist delegation to `src/orchestrator/index.ts`. Add `playlists?: PlaylistStore;` to `StationControllerDeps` (and `import { PlaylistStore } from "./playlists.js";`), then add these methods to the class:
-
-   ```ts
-   listPlaylists() {
-     return this.deps.playlists ? this.deps.playlists.list() : [];
-   }
-   async savePlaylist(name: string): Promise<void> {
-     if (!this.deps.playlists) return;
-     const snap = this.queue.snapshot();
-     const tracks: TrackMeta[] = [
-       ...(snap.current ? [snap.current.meta] : []),
-       ...snap.upcoming.map((i) => i.meta),
-     ];
-     await this.deps.playlists.save(name, tracks);
-     this.emit("changed");
-   }
-   async loadPlaylist(name: string, requester: Requester): Promise<number> {
-     if (!this.deps.playlists) return 0;
-     const tracks = this.deps.playlists.get(name);
-     if (!tracks) return 0;
-     for (const t of tracks) await this.enqueue(t, requester);
-     return tracks.length;
-   }
-   async deletePlaylist(name: string): Promise<boolean> {
-     if (!this.deps.playlists) return false;
-     const ok = await this.deps.playlists.delete(name);
-     if (ok) this.emit("changed");
-     return ok;
-   }
-   ```
-
-8. Run both controller test files (expected PASS):
-   ```
-   npx vitest run src/orchestrator/index.test.ts src/orchestrator/index.playlists.test.ts
-   ```
-   Expected: `Test Files  2 passed (2)` / `Tests  13 passed (13)`.
+   Expected: `Test Files  1 passed (1)` / `Tests  11 passed (11)`.
 
 ---
 
@@ -3702,26 +3344,24 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    > vitest run
     ✓ src/queue/index.test.ts (9)
     ✓ src/orchestrator/settings.test.ts (6)
-    ✓ src/orchestrator/playlists.test.ts (5)
     ✓ src/orchestrator/browser-player-sink.test.ts (7)
     ✓ src/orchestrator/index.test.ts (11)
-    ✓ src/orchestrator/index.playlists.test.ts (2)
     ✓ src/radio/index.test.ts (10)
     ✓ src/orchestrator/snapshot.test.ts (5)
-    Test Files  8 passed (8)
-         Tests  55 passed (55)
+    Test Files  6 passed (6)
+         Tests  48 passed (48)
    ```
 
    If anything is red, fix it before proceeding — do NOT commit on red.
 
 2. Run a full adversarial multi-agent `/debug` pass over the Phase 1 changed files. Fan out finder agents across:
-   - `src/queue/index.ts`, `src/orchestrator/settings.ts`, `src/orchestrator/playlists.ts`, `src/orchestrator/browser-player-sink.ts`, `src/orchestrator/index.ts`, `src/radio/index.ts`, `src/orchestrator/snapshot.ts`
+   - `src/queue/index.ts`, `src/orchestrator/settings.ts`, `src/orchestrator/browser-player-sink.ts`, `src/orchestrator/index.ts`, `src/radio/index.ts`, `src/orchestrator/snapshot.ts`
    - Reliability lenses to assign the finders:
      - **Advance-exactly-once correctness:** can an `error` + `trackEnd` pair (or a stale post-detach signal) ever double-advance? Verify the `playGeneration` guard is bumped on every play/seek/detach/skip and checked under the lock.
      - **Never-stops invariant (spec §3/§4):** confirm there is NO idle timer, NO `'idle'` event, NO teardown/stop path anywhere; a queue-dry with no radio MUST hold paused with `current`/`seed`/`position` preserved, not clear state.
      - **Seed semantics (spec §4):** only `requester.source === "user"` updates the seed; `AUTOPLAY_REQUESTER` adds must NOT reset it; cold start (`seed === null`) yields no radio.
      - **Radio de-dup boundedness:** the recent-history `Set` is bounded (evicts past `recentWindow`); `nextCandidate` never throws; `ensureAhead` terminates when no candidate is available (no infinite loop).
-     - **Atomic persistence:** tmp+rename is used for playlists AND station snapshot; reads are tolerant of missing/corrupt/wrong-version; restore validates per-item shape (skips malformed) and never aborts the whole restore.
+     - **Atomic persistence:** tmp+rename is used for the station snapshot; reads are tolerant of missing/corrupt/wrong-version; restore validates per-item shape (skips malformed) and never aborts the whole restore.
      - **Concurrency:** the controller's `lock` serializes advance/play/skip/jump so they cannot interleave; the queue's `Mutex` serializes its own mutations.
    - Adversarially verify EACH finding (reproduce with a focused failing test before accepting it as a real bug; reject non-reproducing/speculative findings).
    - Fix all CONFIRMED bugs, adding a regression test for each, and re-run `npm test` until green again.
@@ -3737,11 +3377,10 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    adapter (BrowserPlayerSink, ServerPlayerMessage over WS). Build the
    RadioEngine on YouTubeService.related/artistTracks with seed tracking,
    bounded recent-history de-dup, keep-ahead, cold-start-waits-for-seed,
-   and NO idle timeout. Wire de-guilded settings/playlists/snapshot.
+   and NO idle timeout. Wire de-guilded settings/snapshot.
 
    - queue: GuildQueue → Queue, add() gains fromRadio, QueueItem.audio/fromRadio
    - settings: pruned to repeat/autoplay/autoplaySource/volume/maxTrackDuration
-   - playlists: de-guilded flat {version,playlists} store, atomic tmp+rename
    - browser-player-sink: VoiceSession-shaped WS sink, no idle timer
    - orchestrator: StationController, advance-exactly-once guard, no stop path
    - radio: RadioEngine seed→related/artist→de-dup→keep-ahead→never-empty
@@ -5820,11 +5459,11 @@ Per the one-commit-per-phase rule (overrides the skill's per-task default): exac
 
 ## Phase 4:Auth & REST API — Auth & REST API
 
-**Goal:** Shared-password auth (login/admin/logout, timing-safe compare, session-fixation fix) + `requireSession`/`requireAdmin` guards; the flat de-guilded REST surface (state/add/pick/control/speaker/lyrics) with the bot's hardened error-mapping; and `buildApp` wiring cookie/session/rate-limit/websocket/static + `/healthz` + SPA fallback + the audio route + ws; finally the composition root `main()`.
+**Goal:** Shared-password auth (login/logout, timing-safe compare, session-fixation fix) + a `requireSession` guard (single shared password — anyone authenticated may control everything); the flat de-guilded REST surface (state/add/pick/control/speaker/lyrics) with the bot's hardened error-mapping; and `buildApp` wiring cookie/session/websocket/static + `/healthz` + SPA fallback + the audio route + ws; finally the composition root `main()`.
 
 ### Parallelization
 
-- **Parallel-safe (build first, nothing else touches it):** `src/auth/password.ts` (+ `password.test.ts`) — Task 4.1. It only consumes `WebConfig`, `MemorySessionStore`, and the `LoginRequest`/`AdminRequest`/`SessionInfo` types + the Fastify `Session` augmentation, all from earlier phases. No other Phase-4 file writes to it.
+- **Parallel-safe (build first, nothing else touches it):** `src/auth/password.ts` (+ `password.test.ts`) — Task 4.1. It only consumes `WebConfig`, `MemorySessionStore`, and the `LoginRequest`/`SessionInfo` types + the Fastify `Session` augmentation, all from earlier phases. No other Phase-4 file writes to it.
 - **Sequential (shared hubs — parallel edits clobber):** `src/server/rest.ts` (Task 4.2) **then** `src/server/app.ts` (Task 4.3) **then** `src/index.ts` (Task 4.4). `rest.ts` consumes 4.1; `app.ts` consumes 4.1 + 4.2; `index.ts` consumes 4.3. Do these strictly in order, one editor at a time.
 
 All backend files are ESM/NodeNext: relative imports use the `.js` extension. Strict TS, `noUncheckedIndexedAccess`. Test command for a single file: `npx vitest run <path>`.
@@ -5842,9 +5481,9 @@ All backend files are ESM/NodeNext: relative imports use the `.js` extension. St
 
 Consumes:
 
-- `WebConfig` from `../config.js` — fields used: `viewerPassword: string`, `adminPassword: string | null`, `allowNoPassword: boolean`.
+- `WebConfig` from `../config.js` — fields used: `viewerPassword: string`, `allowNoPassword: boolean`.
 - `MemorySessionStore` from `./session-store.js` (already verbatim from Phase 0.6) — only relevant here because `req.sessionStore.destroy(oldId, cb)` is called after `regenerate()`.
-- From `../types/index.js`: `LoginRequest { password; displayName; deviceId }`, `AdminRequest { password }`, `SessionInfo { displayName; deviceId; isAdmin }`, and the `declare module "fastify"` Session augmentation (`authed?`, `isAdmin?`, `displayName?`, `deviceId?`).
+- From `../types/index.js`: `LoginRequest { password; displayName; deviceId }`, `SessionInfo { displayName; deviceId }`, and the `declare module "fastify"` Session augmentation (`authed?`, `displayName?`, `deviceId?`).
 
 Produces (exact signatures):
 
@@ -5852,22 +5491,15 @@ Produces (exact signatures):
 export function verifyPassword(input: string, expected: string): boolean;
 export function registerAuthRoutes(app: FastifyInstance, cfg: WebConfig): void;
 export async function requireSession(req: FastifyRequest, reply: FastifyReply): Promise<boolean>;
-export async function requireAdmin(
-  req: FastifyRequest,
-  reply: FastifyReply,
-  cfg: WebConfig,
-): Promise<boolean>;
 export function sessionInfo(req: FastifyRequest): SessionInfo | null;
 ```
 
 Behavior:
 
 - `POST /api/login` `{ password, displayName, deviceId }` → verify against `cfg.viewerPassword` (timing-safe). On success: `await req.session.regenerate()` (fixation fix), destroy the old store entry, set `session.authed = true`, `session.displayName`, `session.deviceId`. Returns `SessionInfo`.
-- `POST /api/admin` `{ password }` → must already be `authed`; verify against `cfg.adminPassword`; set `session.isAdmin = true`. Returns `SessionInfo`.
 - `POST /api/logout` → `await req.session.destroy()`, clear the `sid` cookie, `204`.
-- `requireSession` → `401 { error: "unauthenticated" }` when `!session.authed`.
-- `requireAdmin` → `requireSession` first; if `cfg.adminPassword` is set and `!session.isAdmin`, `403 { error: "forbidden" }`; if `adminPassword` is null, any authed user passes.
-- `sessionInfo` → `null` when not authed, else `{ displayName, deviceId, isAdmin }`.
+- `requireSession` → `401 { error: "unauthenticated" }` when `!session.authed`. Single shared password: any authenticated user may perform any action (no admin/elevation tier).
+- `sessionInfo` → `null` when not authed, else `{ displayName, deviceId }`.
 
 #### Steps
 
@@ -5902,7 +5534,7 @@ Behavior:
    import { timingSafeEqual } from "node:crypto";
    import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
    import type { WebConfig } from "../config.js";
-   import type { LoginRequest, AdminRequest, SessionInfo } from "../types/index.js";
+   import type { LoginRequest, SessionInfo } from "../types/index.js";
 
    /**
     * Constant-time string comparison. timingSafeEqual throws on unequal lengths, so we
@@ -5927,19 +5559,17 @@ Behavior:
    import cookie from "@fastify/cookie";
    import session from "@fastify/session";
    import { MemorySessionStore } from "./session-store.js";
-   import { registerAuthRoutes, requireSession, requireAdmin, sessionInfo } from "./password.js";
+   import { registerAuthRoutes, requireSession, sessionInfo } from "./password.js";
    import type { WebConfig } from "../config.js";
 
    function cfg(over: Partial<WebConfig> = {}): WebConfig {
      return {
        publicBaseUrl: "https://j",
        viewerPassword: "letmein",
-       adminPassword: null,
        allowNoPassword: false,
        sessionSecret: "x".repeat(32),
        port: 8080,
        host: "0.0.0.0",
-       trustProxy: true,
        allowedWsOrigins: ["https://j"],
        nodeEnv: "test",
        secureCookies: false,
@@ -5959,14 +5589,10 @@ Behavior:
        cookie: { path: "/", httpOnly: true, secure: false, sameSite: "lax", maxAge: 1000 },
      });
      registerAuthRoutes(app, c);
-     // A probe route to exercise requireSession/requireAdmin/sessionInfo behind the same session.
+     // A probe route to exercise requireSession/sessionInfo behind the same session.
      app.get("/probe/session", async (req, reply) => {
        if (!(await requireSession(req, reply))) return;
        return reply.send({ info: sessionInfo(req) });
-     });
-     app.get("/probe/admin", async (req, reply) => {
-       if (!(await requireAdmin(req, reply, c))) return;
-       return reply.send({ ok: true });
      });
      return app;
    }
@@ -5986,7 +5612,7 @@ Behavior:
          payload: { password: "letmein", displayName: "Ada", deviceId: "dev-1" },
        });
        expect(res.statusCode).toBe(200);
-       expect(res.json()).toEqual({ displayName: "Ada", deviceId: "dev-1", isAdmin: false });
+       expect(res.json()).toEqual({ displayName: "Ada", deviceId: "dev-1" });
        expect(res.headers["set-cookie"]).toBeTruthy();
        await app.close();
      });
@@ -6019,13 +5645,13 @@ Behavior:
 6. **Run it — expect FAIL.** `npx vitest run src/auth/password.test.ts`
    Expected: the `verifyPassword` block still passes; the new block fails — `registerAuthRoutes is not a function` / `requireSession is not exported`.
 
-7. **Implement `registerAuthRoutes` + `sessionInfo` + `requireSession`/`requireAdmin`.** Append to `password.ts`:
+7. **Implement `registerAuthRoutes` + `sessionInfo` + `requireSession`.** Append to `password.ts`:
 
    ```ts
    export function sessionInfo(req: FastifyRequest): SessionInfo | null {
      const s = req.session;
      if (!s.authed || !s.deviceId || !s.displayName) return null;
-     return { displayName: s.displayName, deviceId: s.deviceId, isAdmin: s.isAdmin === true };
+     return { displayName: s.displayName, deviceId: s.deviceId };
    }
 
    export async function requireSession(
@@ -6037,67 +5663,30 @@ Behavior:
      return false;
    }
 
-   export async function requireAdmin(
-     req: FastifyRequest,
-     reply: FastifyReply,
-     cfg: WebConfig,
-   ): Promise<boolean> {
-     if (!(await requireSession(req, reply))) return false;
-     // No admin password configured -> every authed user is effectively admin.
-     if (cfg.adminPassword === null) return true;
-     if (req.session.isAdmin === true) return true;
-     await reply.code(403).send({ error: "forbidden" });
-     return false;
-   }
-
    export function registerAuthRoutes(app: FastifyInstance, cfg: WebConfig): void {
-     app.post<{ Body: Partial<LoginRequest> }>(
-       "/api/login",
-       { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
-       async (req, reply) => {
-         const password = (req.body?.password ?? "").toString();
-         const displayName = (req.body?.displayName ?? "").toString().trim();
-         const deviceId = (req.body?.deviceId ?? "").toString().trim();
-         if (!displayName || !deviceId) {
-           return reply.code(400).send({ error: "displayName and deviceId are required" });
-         }
-         if (!verifyPassword(password, cfg.viewerPassword)) {
-           return reply.code(401).send({ error: "invalid_password" });
-         }
-         // Rotate the session id to defeat fixation, then destroy the consumed pre-login
-         // record. regenerate() replaces req.session in place but leaves the old store entry,
-         // so capture its id first and destroy it explicitly.
-         const oldId = req.session.sessionId;
-         await req.session.regenerate();
-         if (oldId && oldId !== req.session.sessionId) {
-           await new Promise<void>((res) => req.sessionStore.destroy(oldId, () => res()));
-         }
-         req.session.authed = true;
-         req.session.displayName = displayName;
-         req.session.deviceId = deviceId;
-         return reply.send({ displayName, deviceId, isAdmin: false } satisfies SessionInfo);
-       },
-     );
-
-     app.post<{ Body: Partial<AdminRequest> }>(
-       "/api/admin",
-       { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
-       async (req, reply) => {
-         if (req.session.authed !== true) {
-           return reply.code(401).send({ error: "unauthenticated" });
-         }
-         if (cfg.adminPassword === null) {
-           return reply.code(400).send({ error: "admin password not configured" });
-         }
-         const password = (req.body?.password ?? "").toString();
-         if (!verifyPassword(password, cfg.adminPassword)) {
-           return reply.code(401).send({ error: "invalid_password" });
-         }
-         req.session.isAdmin = true;
-         const info = sessionInfo(req);
-         return reply.send(info);
-       },
-     );
+     app.post<{ Body: Partial<LoginRequest> }>("/api/login", async (req, reply) => {
+       const password = (req.body?.password ?? "").toString();
+       const displayName = (req.body?.displayName ?? "").toString().trim();
+       const deviceId = (req.body?.deviceId ?? "").toString().trim();
+       if (!displayName || !deviceId) {
+         return reply.code(400).send({ error: "displayName and deviceId are required" });
+       }
+       if (!verifyPassword(password, cfg.viewerPassword)) {
+         return reply.code(401).send({ error: "invalid_password" });
+       }
+       // Rotate the session id to defeat fixation, then destroy the consumed pre-login
+       // record. regenerate() replaces req.session in place but leaves the old store entry,
+       // so capture its id first and destroy it explicitly.
+       const oldId = req.session.sessionId;
+       await req.session.regenerate();
+       if (oldId && oldId !== req.session.sessionId) {
+         await new Promise<void>((res) => req.sessionStore.destroy(oldId, () => res()));
+       }
+       req.session.authed = true;
+       req.session.displayName = displayName;
+       req.session.deviceId = deviceId;
+       return reply.send({ displayName, deviceId } satisfies SessionInfo);
+     });
 
      app.post("/api/logout", async (req, reply) => {
        await req.session.destroy();
@@ -6109,10 +5698,10 @@ Behavior:
 8. **Run it — expect PASS.** `npx vitest run src/auth/password.test.ts`
    Expected: all login + verifyPassword tests pass.
 
-9. **Write failing test — admin elevation + guards + logout.** Append:
+9. **Write failing test — session guard + logout.** Append:
 
    ```ts
-   describe("/api/admin + guards", () => {
+   describe("requireSession + logout", () => {
      async function login(app: FastifyInstance, c = cfg()): Promise<string> {
        const res = await app.inject({
          method: "POST",
@@ -6129,38 +5718,7 @@ Behavior:
        const cookie = await login(app);
        const res = await app.inject({ method: "GET", url: "/probe/session", headers: { cookie } });
        expect(res.statusCode).toBe(200);
-       expect(res.json().info).toEqual({ displayName: "Ada", deviceId: "dev-1", isAdmin: false });
-       await app.close();
-     });
-
-     it("requireAdmin passes any authed user when no admin password is set", async () => {
-       const app = await buildAuthApp(cfg({ adminPassword: null }));
-       const cookie = await login(app);
-       const res = await app.inject({ method: "GET", url: "/probe/admin", headers: { cookie } });
-       expect(res.statusCode).toBe(200);
-       await app.close();
-     });
-
-     it("requireAdmin 403s an authed-but-unelevated user when an admin password IS set", async () => {
-       const c = cfg({ adminPassword: "boss" });
-       const app = await buildAuthApp(c);
-       const cookie = await login(app, c);
-       const denied = await app.inject({ method: "GET", url: "/probe/admin", headers: { cookie } });
-       expect(denied.statusCode).toBe(403);
-       const elev = await app.inject({
-         method: "POST",
-         url: "/api/admin",
-         headers: { cookie },
-         payload: { password: "boss" },
-       });
-       expect(elev.statusCode).toBe(200);
-       expect(elev.json().isAdmin).toBe(true);
-       const allowed = await app.inject({
-         method: "GET",
-         url: "/probe/admin",
-         headers: { cookie: sid(elev) },
-       });
-       expect(allowed.statusCode).toBe(200);
+       expect(res.json().info).toEqual({ displayName: "Ada", deviceId: "dev-1" });
        await app.close();
      });
 
@@ -6181,7 +5739,7 @@ Behavior:
    ```
 
 10. **Run it — expect PASS.** `npx vitest run src/auth/password.test.ts`
-    Expected: all auth tests green (verifyPassword + login + admin/guards/logout).
+    Expected: all auth tests green (verifyPassword + login + session-guard/logout).
 
 ---
 
@@ -6196,13 +5754,13 @@ Behavior:
 
 Consumes:
 
-- `requireSession`, `requireAdmin`, `sessionInfo` from `../auth/password.js` (4.1).
+- `requireSession`, `sessionInfo` from `../auth/password.js` (4.1).
 - `StationController` from `../orchestrator/index.js` (1.5) — methods used (exact names per Task 1.5): `snapshot(): StationSnapshot`, `enqueue(meta, requester): Promise<QueueItem>` (returns the QueueItem whose `.id` the route surfaces), `pause()`, `resume()`, `skip()`, `seek(ms): Promise<boolean>`, `setVolume(pct): StationSettings`, `shuffle(rng?): Promise<void>`, `clear(): Promise<void>`, `remove(itemId): Promise<boolean>`, `reorder(itemId, toIndex): Promise<boolean>`, `jump(itemId): Promise<boolean>`, `updateSettings(patch): StationSettings` (repeat is set via `updateSettings({ repeat })` — there is NO separate `setRepeat`). The seed is set inside `enqueue` for `source:"user"` adds (there is no `setSeed`).
 - `RadioEngine` from `../radio/index.js` (1.6) — `reset(): void` (clears the recent-history de-dup window; invoked when a user adds a track so the fresh seed gets a clean run). There is NO `reseed` method — the seed itself is set inside `StationController.enqueue` for `source:"user"` adds; the REST layer only triggers the radio's window `reset()`.
 - `PlayerRegistry` from `../players/registry.js` (3.2) — `isSpeaker(deviceId): boolean`, `activePlayerDeviceId: string | null`, and the REST-callable (sink-free) `release(deviceId)`/`remember(deviceId)`/`forget(deviceId)`, each returning `{ activePlayerDeviceId: string | null }`. `claim` is NOT REST-callable (it needs the per-socket sink); the UI claims the player via the WS `becomePlayer` frame (Task 3.4).
 - `YouTubeService` (0.4): `resolve(videoId): Promise<TrackMeta>`, `search(q, n): Promise<TrackMeta[]>`; `parseInput` from `../youtube/url-parser.js`; `YtError` from `../youtube/errors.js`; `fetchLyrics` + `LyricsResult` from `../youtube/lyrics.js`.
 - REST DTOs from `../types/index.js`: `AddRequest`, `AddResponse`, `PickRequest`, `PickResponse`, `ControlRequest`, `ControlResponse`, `ControlAction`, `SpeakerRequest`, `SpeakerResponse`, `SpeakerAction`, `LyricsResult`, `StationStateResponse`, `Requester`, `TrackMeta`, `RepeatMode`, `StationSettings`.
-- `WebConfig` from `../config.js` (for `cfg.adminPassword` admin-gating).
+- `WebConfig` from `../config.js` (carried on `RestDeps` for surface symmetry; the single shared password means no per-route admin/elevation gating).
 
 Produces (exact signature):
 
@@ -6223,13 +5781,9 @@ Routes & error idioms (preserved from the bot):
 - `GET /api/state` → `StationStateResponse` = `station.snapshot()` + `isThisDeviceSpeaker: registry.isSpeaker(session.deviceId)`.
 - `POST /api/add` `{ urlOrQuery }`: `input.length > 2000` → `400`; `parseInput` → `reject` → `400 { error: reason }`; `query` → `{ candidates }` (YtError → `400 { error: kind }`); `link` → resolve+enqueue (the seed is set inside `enqueue`; then `radio.reset()` clears the de-dup window) → `{ queued: { id, title } }`. Resolve YtError → `400 { error: kind }`; enqueue YtError → `400 { error: message }`; other enqueue failure → `500 { error: "enqueue_failed" }`.
 - `POST /api/pick` `{ candidateId }`: validate 11-char videoId else `400`; enqueue (same idioms as add-link).
-- `POST /api/control` `{ action, value? }`: admin-gated (`requireAdmin`) when `cfg.adminPassword` is set; else `requireSession`. Validate per-action value: `seek` value must be a non-negative finite number, `409` nothing playing, `400` out-of-range; `volume` 0..VOLUME_MAX; `repeat` ∈ RepeatMode; `remove`/`jump` require `itemId` (400 if missing); `reorder` requires `itemId` + non-negative integer `toIndex`; `settings` → `updateSettings(patch)`. Returns `{ ok }`.
+- `POST /api/control` `{ action, value? }`: `requireSession` (any authenticated user may control — single shared password, no elevation tier). Validate per-action value: `seek` value must be a non-negative finite number, `409` nothing playing, `400` out-of-range; `volume` 0..VOLUME_MAX; `repeat` ∈ RepeatMode; `remove`/`jump` require `itemId` (400 if missing); `reorder` requires `itemId` + non-negative integer `toIndex`; `settings` → `updateSettings(patch)`. Returns `{ ok }`.
 - `POST /api/speaker` `{ action }`: `requireSession`; dispatch `release`/`remember`/`forget` keyed on the session deviceId; returns `SpeakerResponse { ok, activePlayerDeviceId }`. The `claim` action is `400`ed here — claiming the Player is the WS `becomePlayer` path (it needs the per-socket sink).
-- `GET /api/lyrics?trackId=`: `requireSession`; if no current track → `{ lyrics: null, source: "lyrics.ovh" }`; else `lyricsOf(current.meta)`. Rate-limited.
-- `GET /api/playlists`: `requireSession`; → `{ playlists: PlaylistSummary[] }` from `station.listPlaylists()`.
-- `POST /api/playlists` `{ name }`: `requireSession`; trimmed name required (400 if blank); `station.savePlaylist(name)` (current + upcoming metas); → `{ ok: true }`.
-- `POST /api/playlists/load` `{ name }`: `requireSession`; `station.loadPlaylist(name, { source:"user", … })`; `404` when the playlist is missing/empty (queued 0); else `radio.reset()` + `{ ok: true, queued }`.
-- `DELETE /api/playlists/:name`: admin-gated (`requireAdmin`) when `cfg.adminPassword` is set, else `requireSession`; `station.deletePlaylist(name)` → `{ ok }`.
+- `GET /api/lyrics?trackId=`: `requireSession`; if no current track → `{ lyrics: null, source: "lyrics.ovh" }`; else `lyricsOf(current.meta)`.
 
 #### Steps
 
@@ -6259,12 +5813,10 @@ Routes & error idioms (preserved from the bot):
      return {
        publicBaseUrl: "https://j",
        viewerPassword: "letmein",
-       adminPassword: null,
        allowNoPassword: false,
        sessionSecret: "x".repeat(32),
        port: 8080,
        host: "0.0.0.0",
-       trustProxy: true,
        allowedWsOrigins: ["https://j"],
        nodeEnv: "test",
        secureCookies: false,
@@ -6397,7 +5949,7 @@ Routes & error idioms (preserved from the bot):
    import { parseInput } from "../youtube/url-parser.js";
    import { YtError } from "../youtube/errors.js";
    import { fetchLyrics, type LyricsResult } from "../youtube/lyrics.js";
-   import { requireSession, requireAdmin, sessionInfo } from "../auth/password.js";
+   import { requireSession, sessionInfo } from "../auth/password.js";
    import type { YouTubeService } from "../youtube/index.js";
    import type { StationController } from "../orchestrator/index.js";
    import type { RadioEngine } from "../radio/index.js";
@@ -6555,14 +6107,11 @@ Routes & error idioms (preserved from the bot):
      return reply.send({ queued: { id: item.id, title: meta.title } });
    }
 
-   app.post<{ Body: { urlOrQuery?: string } }>(
-     "/api/add",
-     { config: { rateLimit: { max: 15, timeWindow: "1 minute" } } },
-     async (req, reply) => {
-       if (!(await requireSession(req, reply))) return;
-       const input = (req.body?.urlOrQuery ?? "").toString();
-       if (input.length > 2000) return reply.code(400).send({ error: "input too long" });
-       const parsed = parseInput(input);
+   app.post<{ Body: { urlOrQuery?: string } }>("/api/add", async (req, reply) => {
+     if (!(await requireSession(req, reply))) return;
+     const input = (req.body?.urlOrQuery ?? "").toString();
+     if (input.length > 2000) return reply.code(400).send({ error: "input too long" });
+     const parsed = parseInput(input);
        if (parsed.kind === "reject") return reply.code(400).send({ error: parsed.reason });
        if (parsed.kind === "query") {
          try {
@@ -6575,8 +6124,7 @@ Routes & error idioms (preserved from the bot):
          }
        }
        return enqueueVideo(req, reply, parsed.videoId);
-     },
-   );
+   });
    ```
 
 8. **Run it — expect PASS.** `npx vitest run src/server/rest.test.ts`
@@ -6618,21 +6166,17 @@ Routes & error idioms (preserved from the bot):
 10. **Run it — expect FAIL, then implement `POST /api/pick`.** Run `npx vitest run src/server/rest.test.ts` (pick tests 404). Add inside `registerRest`:
 
     ```ts
-    app.post<{ Body: { candidateId?: string } }>(
-      "/api/pick",
-      { config: { rateLimit: { max: 15, timeWindow: "1 minute" } } },
-      async (req, reply) => {
-        if (!(await requireSession(req, reply))) return;
-        const candidateId = (req.body?.candidateId ?? "").toString();
-        if (!VIDEO_ID.test(candidateId)) return reply.code(400).send({ error: "bad candidateId" });
-        return enqueueVideo(req, reply, candidateId);
-      },
-    );
+    app.post<{ Body: { candidateId?: string } }>("/api/pick", async (req, reply) => {
+      if (!(await requireSession(req, reply))) return;
+      const candidateId = (req.body?.candidateId ?? "").toString();
+      if (!VIDEO_ID.test(candidateId)) return reply.code(400).send({ error: "bad candidateId" });
+      return enqueueVideo(req, reply, candidateId);
+    });
     ```
 
     Re-run — expect PASS.
 
-11. **Write failing test — control (pause/skip ok; seek 409/400; volume/repeat validation; admin-gate).** Append:
+11. **Write failing test — control (pause/skip ok; seek 409/400; volume/repeat validation).** Append:
 
     ```ts
     describe("POST /api/control", () => {
@@ -6742,31 +6286,17 @@ Routes & error idioms (preserved from the bot):
         }
         await app.close();
       });
-      it("requireAdmin-403s control when an admin password is set and the user is not elevated", async () => {
-        const c = cfg({ adminPassword: "boss" });
-        const { app } = await build({}, c);
-        const cookie = await login(app, c);
-        const res = await app.inject({
-          method: "POST",
-          url: "/api/control",
-          headers: { cookie },
-          payload: { action: "skip" },
-        });
-        expect(res.statusCode).toBe(403);
-        await app.close();
-      });
     });
     ```
 
-12. **Run it — expect FAIL, then implement `POST /api/control`.** Run the suite (control tests 404/403-missing). Add inside `registerRest`:
+12. **Run it — expect FAIL, then implement `POST /api/control`.** Run the suite (control tests 404). Add inside `registerRest`:
 
     ```ts
     app.post<{ Body: { action?: ControlAction; value?: unknown } }>(
       "/api/control",
       async (req, reply) => {
-        // Destructive/global control is admin-gated only when an admin password is configured;
-        // otherwise any authed user can control (requireAdmin returns true for null adminPassword).
-        if (!(await requireAdmin(req, reply, deps.cfg))) return;
+        // Single shared password: any authenticated user may control everything.
+        if (!(await requireSession(req, reply))) return;
         const action = req.body?.action;
         const value = req.body?.value;
         const station = deps.station;
@@ -6996,183 +6526,19 @@ Routes & error idioms (preserved from the bot):
       return reply.send(body);
     });
 
-    app.get<{ Querystring: { trackId?: string } }>(
-      "/api/lyrics",
-      { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } },
-      async (req, reply) => {
-        if (!(await requireSession(req, reply))) return;
-        const current = deps.station.snapshot().current;
-        if (!current)
-          return reply.send({ lyrics: null, source: "lyrics.ovh" } satisfies LyricsResult);
-        return reply.send(await lyricsOf(current.meta));
-      },
-    );
+    app.get<{ Querystring: { trackId?: string } }>("/api/lyrics", async (req, reply) => {
+      if (!(await requireSession(req, reply))) return;
+      const current = deps.station.snapshot().current;
+      if (!current)
+        return reply.send({ lyrics: null, source: "lyrics.ovh" } satisfies LyricsResult);
+      return reply.send(await lyricsOf(current.meta));
+    });
     ```
 
     Re-run — expect PASS. (`AUTOPLAY_REQUESTER` is imported for type-completeness of the requester surface; if eslint flags it as unused after wiring, remove it from the import — radio adds use it inside the engine, not here.)
 
 16. **Run the whole file — expect PASS.** `npx vitest run src/server/rest.test.ts`
     Expected: every state/add/pick/control/speaker/lyrics test green.
-
-17. **Write failing test — playlists list/save/load/delete (spec §6 playlists surface).** The `StationController` already delegates to a `PlaylistStore` via `listPlaylists()`/`savePlaylist(name)`/`loadPlaylist(name, requester)`/`deletePlaylist(name)` (Task 1.5). Expose them over REST so the `Playlists.tsx` panel (Task 5.5) is functional — not a stub. Extend `fakeStation()` with the four playlist methods, then append:
-
-    ```ts
-    describe("playlist REST", () => {
-      function withPlaylists() {
-        const station = fakeStation() as ReturnType<typeof fakeStation> & {
-          listPlaylists: ReturnType<typeof vi.fn>;
-          savePlaylist: ReturnType<typeof vi.fn>;
-          loadPlaylist: ReturnType<typeof vi.fn>;
-          deletePlaylist: ReturnType<typeof vi.fn>;
-        };
-        station.listPlaylists = vi.fn(() => [{ name: "mix", trackCount: 2, savedAt: 5 }]);
-        station.savePlaylist = vi.fn(async () => {});
-        station.loadPlaylist = vi.fn(async () => 2);
-        station.deletePlaylist = vi.fn(async () => true);
-        return station;
-      }
-
-      it("GET /api/playlists returns the PlaylistSummary list", async () => {
-        const { app } = await build({ station: withPlaylists() } as never);
-        const c = await login(app);
-        const res = await app.inject({
-          method: "GET",
-          url: "/api/playlists",
-          headers: { cookie: c },
-        });
-        expect(res.statusCode).toBe(200);
-        expect(res.json().playlists).toEqual([{ name: "mix", trackCount: 2, savedAt: 5 }]);
-        await app.close();
-      });
-      it("POST /api/playlists saves the current queue under a name", async () => {
-        const station = withPlaylists();
-        const { app } = await build({ station } as never);
-        const c = await login(app);
-        const res = await app.inject({
-          method: "POST",
-          url: "/api/playlists",
-          headers: { cookie: c },
-          payload: { name: "road trip" },
-        });
-        expect(res.statusCode).toBe(200);
-        expect(res.json().ok).toBe(true);
-        expect(station.savePlaylist).toHaveBeenCalledWith("road trip");
-        await app.close();
-      });
-      it("400s a blank playlist name on save", async () => {
-        const { app } = await build({ station: withPlaylists() } as never);
-        const c = await login(app);
-        const res = await app.inject({
-          method: "POST",
-          url: "/api/playlists",
-          headers: { cookie: c },
-          payload: { name: "  " },
-        });
-        expect(res.statusCode).toBe(400);
-        await app.close();
-      });
-      it("POST /api/playlists/load enqueues a saved playlist (as the session user) and reports the count", async () => {
-        const station = withPlaylists();
-        const { app } = await build({ station } as never);
-        const c = await login(app, cfg(), "dev-5");
-        const res = await app.inject({
-          method: "POST",
-          url: "/api/playlists/load",
-          headers: { cookie: c },
-          payload: { name: "mix" },
-        });
-        expect(res.statusCode).toBe(200);
-        expect(res.json()).toEqual({ ok: true, queued: 2 });
-        expect(station.loadPlaylist).toHaveBeenCalledWith(
-          "mix",
-          expect.objectContaining({ deviceId: "dev-5", source: "user" }),
-        );
-        await app.close();
-      });
-      it("404s loading a playlist that does not exist (queued count 0)", async () => {
-        const station = withPlaylists();
-        station.loadPlaylist = vi.fn(async () => 0);
-        const { app } = await build({ station } as never);
-        const c = await login(app);
-        const res = await app.inject({
-          method: "POST",
-          url: "/api/playlists/load",
-          headers: { cookie: c },
-          payload: { name: "ghost" },
-        });
-        expect(res.statusCode).toBe(404);
-        await app.close();
-      });
-      it("DELETE /api/playlists/:name removes it (admin-gated when ADMIN_PASSWORD is set)", async () => {
-        const station = withPlaylists();
-        const { app } = await build({ station } as never);
-        const c = await login(app);
-        const res = await app.inject({
-          method: "DELETE",
-          url: "/api/playlists/mix",
-          headers: { cookie: c },
-        });
-        expect(res.statusCode).toBe(200);
-        expect(res.json().ok).toBe(true);
-        expect(station.deletePlaylist).toHaveBeenCalledWith("mix");
-        await app.close();
-      });
-    });
-    ```
-
-18. **Run it — expect FAIL, then implement the playlist routes.** Run the suite (playlist routes 404). Add inside `registerRest`:
-
-    ```ts
-    app.get("/api/playlists", async (req, reply) => {
-      if (!(await requireSession(req, reply))) return;
-      return reply.send({ playlists: deps.station.listPlaylists() });
-    });
-
-    app.post<{ Body: { name?: string } }>("/api/playlists", async (req, reply) => {
-      if (!(await requireSession(req, reply))) return;
-      const name = (req.body?.name ?? "").toString().trim();
-      if (!name) return reply.code(400).send({ error: "playlist name is required" });
-      try {
-        await deps.station.savePlaylist(name);
-      } catch (err) {
-        return reply.code(400).send({ error: err instanceof Error ? err.message : "save_failed" });
-      }
-      return reply.send({ ok: true });
-    });
-
-    app.post<{ Body: { name?: string } }>("/api/playlists/load", async (req, reply) => {
-      if (!(await requireSession(req, reply))) return;
-      const info = sessionInfo(req);
-      if (!info) return reply.code(401).send({ error: "unauthenticated" });
-      const name = (req.body?.name ?? "").toString().trim();
-      if (!name) return reply.code(400).send({ error: "playlist name is required" });
-      const requester: Requester = {
-        deviceId: info.deviceId,
-        displayName: info.displayName,
-        source: "user",
-      };
-      const queued = await deps.station.loadPlaylist(name, requester);
-      if (queued === 0) return reply.code(404).send({ error: "playlist not found or empty" });
-      // Loading a playlist re-seeds off the user's adds; clear the radio de-dup window.
-      deps.radio.reset();
-      return reply.send({ ok: true, queued });
-    });
-
-    // Deleting is a destructive/global action: admin-gated when ADMIN_PASSWORD is set,
-    // otherwise any authed user (requireAdmin returns true for a null adminPassword).
-    app.delete<{ Params: { name: string } }>("/api/playlists/:name", async (req, reply) => {
-      if (!(await requireAdmin(req, reply, deps.cfg))) return;
-      const name = decodeURIComponent(req.params.name).trim();
-      if (!name) return reply.code(400).send({ error: "playlist name is required" });
-      const ok = await deps.station.deletePlaylist(name);
-      return reply.send({ ok });
-    });
-    ```
-
-    Add the four playlist methods to the `StationController` slice consumed by `RestDeps` (they exist on the real controller per Task 1.5): `listPlaylists(): PlaylistSummary[]`, `savePlaylist(name): Promise<void>`, `loadPlaylist(name, requester): Promise<number>`, `deletePlaylist(name): Promise<boolean>`. Re-run — expect PASS.
-
-19. **Run the whole file — expect PASS.** `npx vitest run src/server/rest.test.ts`
-    Expected: every state/add/pick/control/speaker/lyrics/playlists test green.
 
 ---
 
@@ -7213,7 +6579,7 @@ export interface AppDeps {
 export function buildApp(deps: AppDeps): Promise<FastifyInstance>;
 ```
 
-Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, cookieName `sid`, `secure: cfg.secureCookies`, `rolling: true`, `maxAge: 7d`, `sameSite: lax`, `saveUninitialized: false`), `@fastify/rate-limit` (global, key on `session.deviceId` else `socket.remoteAddress`), `@fastify/websocket`, `@fastify/static` (the web `public` dir). `setErrorHandler`: `URIError` → `400 bad_request`, `>=500` → `500 internal_error`, else preserve the status with `err.message`. `GET /healthz` → `{ ok: true, uptimeSec }`. `setNotFoundHandler` SPA fallback (GET, not `/api`/`/ws`/`/audio` → `index.html`, else `404 not_found`). Wire `registerAuthRoutes`, `registerRest`, `registerAudioRoute`, `registerWebsocket`.
+Behavior: construct the Fastify instance with `trustProxy: true` unconditionally (the app is always behind the user's HTTPS proxy/tunnel, which sets `X-Forwarded-Proto`; trusting it is required for correct scheme detection + secure cookies + real client IP — it is a fixed behavior, not a configurable knob). Register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, cookieName `sid`, `secure: cfg.secureCookies`, `rolling: true`, `maxAge: 7d`, `sameSite: lax`, `saveUninitialized: false`), `@fastify/websocket`, `@fastify/static` (the web `public` dir). `setErrorHandler`: `URIError` → `400 bad_request`, `>=500` → `500 internal_error`, else preserve the status with `err.message`. `GET /healthz` → `{ ok: true, uptimeSec }`. `setNotFoundHandler` SPA fallback (GET, not `/api`/`/ws`/`/audio` → `index.html`, else `404 not_found`). Wire `registerAuthRoutes`, `registerRest`, `registerAudioRoute`, `registerWebsocket`.
 
 #### Steps
 
@@ -7229,12 +6595,10 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
      return {
        publicBaseUrl: "https://j",
        viewerPassword: "letmein",
-       adminPassword: null,
        allowNoPassword: false,
        sessionSecret: "x".repeat(32),
        port: 8080,
        host: "0.0.0.0",
-       trustProxy: true,
        allowedWsOrigins: ["https://j"],
        nodeEnv: "test",
        secureCookies: false,
@@ -7263,7 +6627,6 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
            activePlayerLabel: null,
          })),
          reportPosition: vi.fn(),
-         listPlaylists: vi.fn(() => []),
        }),
        youtube: { resolve: vi.fn(), search: vi.fn(), download: vi.fn() },
        registry: {
@@ -7355,7 +6718,6 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
    import Fastify, { type FastifyInstance, type FastifyError } from "fastify";
    import cookie from "@fastify/cookie";
    import session from "@fastify/session";
-   import rateLimit from "@fastify/rate-limit";
    import websocket from "@fastify/websocket";
    import fastifyStatic from "@fastify/static";
    import path from "node:path";
@@ -7388,7 +6750,10 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
    }
 
    export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
-     const app = Fastify({ trustProxy: deps.cfg.trustProxy, logger: false });
+     // trustProxy is always true: the app is always behind the user's HTTPS proxy/tunnel,
+     // which sets X-Forwarded-Proto. Trusting it is required for correct scheme detection,
+     // secure cookies, and the real client IP. This is a fixed behavior, not a config knob.
+     const app = Fastify({ trustProxy: true, logger: false });
 
      // Never let an unexpected throw leak raw internals (yt-dlp stderr, fs paths, stacks).
      // URIError (e.g. a bad percent-encoding) -> 400; genuine 5xx -> a stable generic body.
@@ -7412,19 +6777,6 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
          secure: deps.cfg.secureCookies,
          sameSite: "lax",
          maxAge: 7 * 24 * 60 * 60 * 1000,
-       },
-     });
-     await app.register(rateLimit, {
-       global: true,
-       max: 120,
-       timeWindow: "1 minute",
-       // Authenticated requests key on the session deviceId. Unauthenticated requests key on
-       // the raw socket address (NOT req.ip, which honors X-Forwarded-For under trustProxy)
-       // so a spoofed XFF cannot mint a fresh bucket per request.
-       keyGenerator: (req) => {
-         const deviceId = (req as { session?: { deviceId?: string } }).session?.deviceId;
-         if (deviceId) return deviceId;
-         return req.socket.remoteAddress ?? req.ip;
        },
      });
      await app.register(websocket);
@@ -7499,11 +6851,11 @@ Consumes:
 
 - `loadConfig` from `./config.js` (0.5) → `AppConfig { media, station, web }`.
 - `createLogger`, `setRootLogger` from `./util/logger.js`; `installCrashHandlers`, `installSignalHandlers` from `./lifecycle.js`; `startupCanary` from `./canary.js` (0.3).
-- `YouTubeService` (0.4), `AudioCache` (0.6), `Semaphore` (0.3), `StationController` (1.5), `RadioEngine` (1.6), `PlaylistStore` (1.3), snapshot helpers `collectStationSnapshot`/`writeStationSnapshot`/`readStationSnapshot`/`restoreStationSnapshot` (1.7), `PlayerRegistry` (3.2), `StationBroadcaster` (3.3), `buildApp` (4.3).
+- `YouTubeService` (0.4), `AudioCache` (0.6), `Semaphore` (0.3), `StationController` (1.5), `RadioEngine` (1.6), snapshot helpers `collectStationSnapshot`/`writeStationSnapshot`/`readStationSnapshot`/`restoreStationSnapshot` (1.7), `PlayerRegistry` (3.2), `StationBroadcaster` (3.3), `buildApp` (4.3).
 
 Produces: `async function main(): Promise<void>` + the `main().catch(...)` bootstrap.
 
-Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + playlists + device registry; build `RadioEngine`, `StationController`, `PlayerRegistry`, `StationBroadcaster.attach(station)`; `buildApp` + `listen` immediately (no gateway wait); restore station + device snapshots; `installSignalHandlers([flush snapshots, app.close], { graceMs: 8000 })`; debounced snapshot writer on the controller's `changed` event; `startupCanary`. `main().catch(-> exit(1))`.
+Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + device registry; build `RadioEngine`, `StationController`, `PlayerRegistry`, `StationBroadcaster.attach(station)`; `buildApp` + `listen` immediately (no gateway wait); restore station + device snapshots; `installSignalHandlers([flush snapshots, app.close], { graceMs: 8000 })`; debounced snapshot writer on the controller's `changed` event; `startupCanary`. `main().catch(-> exit(1))`.
 
 #### Steps
 
@@ -7516,7 +6868,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    import { Semaphore } from "./util/semaphore.js";
    import { StationController } from "./orchestrator/index.js";
    import { DEFAULT_SETTINGS } from "./types/index.js";
-   import { PlaylistStore } from "./orchestrator/playlists.js";
    import { RadioEngine } from "./radio/index.js";
    import { PlayerRegistry } from "./players/registry.js";
    import { buildApp } from "./server/app.js";
@@ -7544,9 +6895,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      const cache = new AudioCache(media.cacheDir, media.cacheMaxBytes);
      await cache.init();
      const downloads = new Semaphore(stationCfg.maxConcurrentDownloads);
-
-     const playlists = new PlaylistStore(media.cacheDir);
-     await playlists.init();
 
      // Debounced snapshot writer — defined before the controller so its 'changed' handler
      // (wired below) closes over it. Coalesces bursts of queue/settings changes into one write.
@@ -7718,10 +7066,10 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    If anything is red, fix it before proceeding — do NOT commit a partial phase.
 
 2. **Adversarial multi-agent /debug pass.** Fan out finder subagents across this phase's changed files — `src/auth/password.ts`, `src/server/rest.ts`, `src/server/app.ts`, `src/index.ts` — each through a reliability lens, then adversarially verify every finding before fixing. Lenses to assign:
-   - **Auth / session correctness:** does `login` rotate the session id and destroy the old store entry (fixation)? Is `verifyPassword` length-guarded so `timingSafeEqual` never throws? Does `/api/admin` require a prior `authed` session and reject when `adminPassword` is null? Does `requireAdmin` open the gate (return true) when no admin password is configured, and 403 an unelevated user when one is set? Does `logout` truly destroy the session (subsequent guarded call 401s)?
+   - **Auth / session correctness:** does `login` rotate the session id and destroy the old store entry (fixation)? Is `verifyPassword` length-guarded so `timingSafeEqual` never throws? Single shared password — does any authed user pass `requireSession` on every route (no elevation tier)? Does `logout` truly destroy the session (subsequent guarded call 401s)?
    - **REST error-mapping:** is every `YtError` mapped to a 4xx (kind for resolve/search, message for enqueue) and never an unhandled 500 leaking yt-dlp stderr? Is the `input>2000` guard before `parseInput`? Does `seek` return 409 (nothing playing) vs 400 (out-of-range) correctly? Are `remove`/`jump`/`reorder` value-shape validated (missing `itemId` → 400, non-integer `toIndex` → 400)? Is `volume` clamped to `0..VOLUME_MAX`? Is `repeat` checked against the real RepeatMode set?
    - **Attribution & seed:** does an `/api/add` link/pick build a `Requester` with `source:"user"` and the session deviceId/displayName, and call `radio.reset()` exactly once on success (and never on a search-candidates response)? Is the seed itself set inside `StationController.enqueue` (not via a non-existent `setSeed`/`reseed`)?
-   - **buildApp hardening:** is the rate-limit key the session deviceId else `socket.remoteAddress` (NOT `req.ip`, to defeat XFF spoofing under trustProxy)? Does the error handler map URIError→400 and >=500→internal_error while preserving explicit 4xx? Does the SPA fallback exclude `/api`, `/ws`, `/audio`? Are cookies `httpOnly`, `sameSite:lax`, `secure:cfg.secureCookies`?
+   - **buildApp hardening:** is the Fastify instance constructed with `trustProxy: true` (always, since the app is behind the user's HTTPS proxy/tunnel)? Does the error handler map URIError→400 and >=500→internal_error while preserving explicit 4xx? Does the SPA fallback exclude `/api`, `/ws`, `/audio`? Are cookies `httpOnly`, `sameSite:lax`, `secure:cfg.secureCookies`?
    - **Composition root:** is `buildApp`+`listen` done immediately (no gateway wait)? Is the snapshot flushed on SIGTERM and `app.close()` called within `graceMs`? Is the debounced writer timer cleared in the shutdown task so it can't fire post-close? Does `main().catch` exit(1) on a fatal startup error?
    - **WS origin guard reachability:** confirm `buildApp` passes `cfg.allowedWsOrigins` (which the config layer pins to `[publicBaseUrl]`) into `registerWebsocket` so the origin guard is actually armed.
      Verify each candidate finding against the code/tests; fix ALL confirmed bugs (add a regression test for each behavioral fix); discard the false positives. Re-run the full verification from step 1 until green.
@@ -7733,16 +7081,16 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    Phase 4: shared-password auth + flat REST API + buildApp wiring + composition root
 
    - auth/password.ts: timing-safe verifyPassword (length-guarded), registerAuthRoutes
-     (/api/login with session.regenerate fixation fix + old-entry destroy, /api/admin
-     elevation, /api/logout), requireSession/requireAdmin/sessionInfo guards.
+     (/api/login with session.regenerate fixation fix + old-entry destroy, /api/logout),
+     requireSession/sessionInfo guards (single shared password, no elevation tier).
    - server/rest.ts: flat de-guilded /api surface (state/add/pick/control/speaker/lyrics)
      with the bot's hardened error-mapping (input>2000 -> 400, parseInput reject -> 400,
      YtError -> 400 kind/message, enqueue fail -> 500, seek 409/400, missing itemId -> 400);
-     user adds reset the radio de-dup window; control is admin-gated only when ADMIN_PASSWORD is set.
-   - server/app.ts: buildApp wiring cookie/session(MemorySessionStore,7d,rolling)/rate-limit
-     (key on deviceId else socket addr)/websocket/static + /healthz + SPA fallback + audio
-     route + ws; error handler URIError->400, >=500->internal_error.
-   - index.ts: composition root main() — load config, init cache/playlists/registry, wire
+     user adds reset the radio de-dup window; any authed user may control everything.
+   - server/app.ts: buildApp wiring cookie/session(MemorySessionStore,7d,rolling)/websocket/
+     static + /healthz + SPA fallback + audio route + ws; trustProxy:true always;
+     error handler URIError->400, >=500->internal_error.
+   - index.ts: composition root main() — load config, init cache/registry, wire
      radio+station+broadcaster, buildApp+listen immediately, restore snapshots, debounced
      snapshot writer, graceful signal handlers (graceMs 8000), startup canary.
 
@@ -7756,7 +7104,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 
 ## Phase 5:Web UI (frontend-design) — Web UI (frontend-design)
 
-**Goal:** Author a cohesive professional design system with the `frontend-design` skill, then build the SPA: shared-password `LoginGate`, `deviceId` bootstrap, `useStationState` WS hook, `usePlayerRole` hidden-`<audio>` sink, `PlayerPanel`, and the de-guilded/de-Discorded panels (`AddBar`/`Controls`/`NowPlaying`/`Queue`/`History`/`Playlists`/`Lyrics`/`Settings`) with the station-live/waiting-for-seed status.
+**Goal:** Author a cohesive professional design system with the `frontend-design` skill, then build the SPA: shared-password `LoginGate`, `deviceId` bootstrap, `useStationState` WS hook, `usePlayerRole` hidden-`<audio>` sink, `PlayerPanel`, and the de-guilded/de-Discorded panels (`AddBar`/`Controls`/`NowPlaying`/`Queue`/`History`/`Lyrics`/`Settings`) with the station-live/waiting-for-seed status.
 
 ### Parallelization
 
@@ -7772,7 +7120,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 
 **Environment note (jsdom):** every component/hook test file in this phase begins with the pragma `// @vitest-environment jsdom` on line 1 (vitest.config.ts defaults to the node env; the pragma opts the file into jsdom). Pure-logic test files (`api.test.ts`, `deviceId.test.ts`, `wsReducer.test.ts`) keep the node env unless they touch `localStorage`/`document`/`WebSocket` — those add the pragma too.
 
-**Shared types are imported from `web/src/types.ts` (the Phase 0 web mirror of `src/types/index.ts`).** Use the EXACT names: `StationSnapshot`, `StationStateResponse`, `CurrentItem`, `QueueItem`, `TrackMeta`, `Requester`, `SessionInfo`, `LoginRequest`, `AdminRequest`, `AddResponse`, `PickResponse`, `ControlAction`, `ControlResponse`, `SpeakerAction`, `SpeakerResponse`, `LyricsResult`, `RepeatMode`, `AutoplaySource`, `ServerBroadcastMessage`, `ServerPlayerMessage`, `ClientWsMessage`. ESM/NodeNext: relative imports use the `.js` extension even from `.ts`/`.tsx`.
+**Shared types are imported from `web/src/types.ts` (the Phase 0 web mirror of `src/types/index.ts`).** Use the EXACT names: `StationSnapshot`, `StationStateResponse`, `CurrentItem`, `QueueItem`, `TrackMeta`, `Requester`, `SessionInfo`, `LoginRequest`, `AddResponse`, `PickResponse`, `ControlAction`, `ControlResponse`, `SpeakerAction`, `SpeakerResponse`, `LyricsResult`, `RepeatMode`, `AutoplaySource`, `ServerBroadcastMessage`, `ServerPlayerMessage`, `ClientWsMessage`. ESM/NodeNext: relative imports use the `.js` extension even from `.ts`/`.tsx`.
 
 ---
 
@@ -7788,11 +7136,11 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 
 **Interfaces**
 
-- Consumes: `web/src/types.ts` (Phase 0) — `LoginRequest`, `AdminRequest`, `SessionInfo`, `StationStateResponse`, `AddRequest`, `AddResponse`, `PickRequest`, `PickResponse`, `ControlAction`, `ControlRequest`, `ControlResponse`, `SpeakerAction`, `SpeakerRequest`, `SpeakerResponse`, `LyricsResult`. Spec §6 REST routes.
+- Consumes: `web/src/types.ts` (Phase 0) — `LoginRequest`, `SessionInfo`, `StationStateResponse`, `AddRequest`, `AddResponse`, `PickRequest`, `PickResponse`, `ControlAction`, `ControlRequest`, `ControlResponse`, `SpeakerAction`, `SpeakerRequest`, `SpeakerResponse`, `LyricsResult`. Spec §6 REST routes.
 - Produces:
   - `web/src/index.css` — Tailwind v4 `@theme` design tokens + component classes (`.card`, `.pill`, `.pill-primary`, `.pill-ghost`, `.eyebrow`, `.vu`, `.spinner`, `.reveal`, `.hero-glow`).
   - `class ApiError extends Error` with `readonly status: number`.
-  - `const api` object (flat `/api`, `credentials:"include"`): `login(body:LoginRequest):Promise<SessionInfo>`, `admin(body:AdminRequest):Promise<SessionInfo>`, `logout():Promise<void>`, `state():Promise<StationStateResponse>`, `add(urlOrQuery:string):Promise<AddResponse>`, `pick(candidateId:string):Promise<PickResponse>`, `control(action:ControlAction, value?:ControlRequest["value"]):Promise<ControlResponse>`, `speaker(action:SpeakerAction):Promise<SpeakerResponse>`, `lyrics(trackId:string):Promise<LyricsResult>`, `playlists():Promise<{playlists:PlaylistSummary[]}>`, `savePlaylist(name:string):Promise<{ok:boolean}>`, `loadPlaylist(name:string):Promise<{ok:boolean;queued:number}>`, `deletePlaylist(name:string):Promise<{ok:boolean}>`.
+  - `const api` object (flat `/api`, `credentials:"include"`): `login(body:LoginRequest):Promise<SessionInfo>`, `logout():Promise<void>`, `state():Promise<StationStateResponse>`, `add(urlOrQuery:string):Promise<AddResponse>`, `pick(candidateId:string):Promise<PickResponse>`, `control(action:ControlAction, value?:ControlRequest["value"]):Promise<ControlResponse>`, `speaker(action:SpeakerAction):Promise<SpeakerResponse>`, `lyrics(trackId:string):Promise<LyricsResult>`.
   - `getDeviceId():string`, `getDisplayName():string`, `setDisplayName(name:string):void` (localStorage-backed).
 
 > **Author the design system FIRST.** Invoke the `frontend-design` skill to produce `web/src/index.css` as a cohesive, professional Tailwind v4 `@theme` token set + the component classes listed above. This is the only task that authors `index.css`; it is frozen afterward. There is no automated test for the CSS itself — verify visually later in the README manual checklist. The TDD steps below cover `api.ts` and `deviceId.ts`.
@@ -7883,7 +7231,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 
    describe("api client", () => {
      it("login POSTs the LoginRequest body as JSON with credentials", async () => {
-       const fn = mockOnce(true, { displayName: "Al", deviceId: "d1", isAdmin: false });
+       const fn = mockOnce(true, { displayName: "Al", deviceId: "d1" });
        const s = await api.login({ password: "pw", displayName: "Al", deviceId: "d1" });
        const [url, init] = fn.mock.calls[0]!;
        expect(url).toBe("/api/login");
@@ -7894,16 +7242,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
          displayName: "Al",
          deviceId: "d1",
        });
-       expect(s.isAdmin).toBe(false);
-     });
-     it("admin POSTs the AdminRequest and returns the elevated session", async () => {
-       const fn = mockOnce(true, { displayName: "Al", deviceId: "d1", isAdmin: true });
-       const s = await api.admin({ password: "root" });
-       expect(fn.mock.calls[0]![0]).toBe("/api/admin");
-       expect(JSON.parse(String((fn.mock.calls[0]![1] as RequestInit).body))).toEqual({
-         password: "root",
-       });
-       expect(s.isAdmin).toBe(true);
+       expect(s.deviceId).toBe("d1");
      });
      it("state GETs /api/state with credentials", async () => {
        const fn = mockOnce(true, { current: null, isThisDeviceSpeaker: false });
@@ -7963,24 +7302,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        expect((init as RequestInit).method).toBeUndefined(); // GET
        expect(r.lyrics).toBeNull();
      });
-     it("playlists GETs the summary list; save/load POST the name; delete DELETEs by name", async () => {
-       const list = mockOnce(true, { playlists: [{ name: "mix", trackCount: 2, savedAt: 5 }] });
-       expect((await api.playlists()).playlists[0]?.name).toBe("mix");
-       expect(list.mock.calls[0]![0]).toBe("/api/playlists");
-       const save = mockOnce(true, { ok: true });
-       await api.savePlaylist("road trip");
-       expect(save.mock.calls[0]![0]).toBe("/api/playlists");
-       expect(JSON.parse(String((save.mock.calls[0]![1] as RequestInit).body))).toEqual({
-         name: "road trip",
-       });
-       const load = mockOnce(true, { ok: true, queued: 2 });
-       expect((await api.loadPlaylist("mix")).queued).toBe(2);
-       expect(load.mock.calls[0]![0]).toBe("/api/playlists/load");
-       const del = mockOnce(true, { ok: true });
-       await api.deletePlaylist("mix");
-       expect(del.mock.calls[0]![0]).toBe("/api/playlists/mix");
-       expect((del.mock.calls[0]![1] as RequestInit).method).toBe("DELETE");
-     });
      it("logout resolves on an empty 204 body without parsing JSON", async () => {
        const fn = vi.fn().mockResolvedValue({
          ok: true,
@@ -8030,7 +7351,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    import type {
      AddRequest,
      AddResponse,
-     AdminRequest,
      ControlAction,
      ControlRequest,
      ControlResponse,
@@ -8038,7 +7358,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      LyricsResult,
      PickRequest,
      PickResponse,
-     PlaylistSummary,
      SessionInfo,
      SpeakerAction,
      SpeakerRequest,
@@ -8085,7 +7404,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 
    export const api = {
      login: (body: LoginRequest) => post<SessionInfo>("/api/login", body),
-     admin: (body: AdminRequest) => post<SessionInfo>("/api/admin", body),
      logout: () => post<void>("/api/logout"),
      state: () => req<StationStateResponse>("/api/state"),
      add: (urlOrQuery: string) =>
@@ -8101,12 +7419,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        post<SpeakerResponse>("/api/speaker", { action } satisfies SpeakerRequest),
      lyrics: (trackId: string) =>
        req<LyricsResult>(`/api/lyrics?trackId=${encodeURIComponent(trackId)}`),
-     playlists: () => req<{ playlists: PlaylistSummary[] }>("/api/playlists"),
-     savePlaylist: (name: string) => post<{ ok: boolean }>("/api/playlists", { name }),
-     loadPlaylist: (name: string) =>
-       post<{ ok: boolean; queued: number }>("/api/playlists/load", { name }),
-     deletePlaylist: (name: string) =>
-       req<{ ok: boolean }>(`/api/playlists/${encodeURIComponent(name)}`, { method: "DELETE" }),
    };
    ```
 8. **Run it — expect PASS.** `npx vitest run web/src/lib/api.test.ts web/src/lib/deviceId.test.ts` → all passed.
@@ -8702,9 +8014,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 
 **Interfaces**
 
-- Consumes: 5.1 `api.login`/`api.admin`, `getDeviceId`/`getDisplayName`/`setDisplayName`; 5.3 `usePlayerRole` (audioRef is passed in by App, not created here); Phase 0 `SessionInfo`.
+- Consumes: 5.1 `api.login`, `getDeviceId`/`getDisplayName`/`setDisplayName`; 5.3 `usePlayerRole` (audioRef is passed in by App, not created here); Phase 0 `SessionInfo`.
 - Produces:
-  - `LoginGate({ onAuthed }: { onAuthed: (s: SessionInfo) => void })` — shared-password + displayName form; submits `api.login({ password, displayName, deviceId })`; surfaces the error message on failure; optional admin-unlock sub-form calling `api.admin({ password })` then `onAuthed` with the elevated session.
+  - `LoginGate({ onAuthed }: { onAuthed: (s: SessionInfo) => void })` — shared-password + displayName form; submits `api.login({ password, displayName, deviceId })`; surfaces the error message on failure; calls `onAuthed` with the session. (Single shared password — no admin-unlock form.)
   - `PlayerPanel({ isSpeaker, onRelinquish, audioRef }: { isSpeaker: boolean; onRelinquish: () => void; audioRef: React.RefObject<HTMLAudioElement> })` — "This device is the speaker" + a relinquish button + the managed hidden `<audio>` mount point (`ref={audioRef}`).
 
 #### LoginGate — steps
@@ -8725,7 +8037,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 
    describe("LoginGate", () => {
      it("submits the password + displayName + deviceId and calls onAuthed with the session", async () => {
-       const session = { displayName: "Al", deviceId: expect.any(String), isAdmin: false };
+       const session = { displayName: "Al", deviceId: expect.any(String) };
        const spy = vi.spyOn(api, "login").mockResolvedValue(session as never);
        const onAuthed = vi.fn();
        render(<LoginGate onAuthed={onAuthed} />);
@@ -8954,7 +8266,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 - Modify(port): `web/src/components/NowPlaying.tsx` + Test `NowPlaying.test.tsx`
 - Modify(port): `web/src/components/Queue.tsx` + Test `Queue.test.tsx`
 - Modify(port): `web/src/components/History.tsx` + Test `History.test.tsx`
-- Modify(port): `web/src/components/Playlists.tsx` + Test `Playlists.test.tsx`
 - Modify(port): `web/src/components/Lyrics.tsx` + Test `Lyrics.test.tsx`
 - Modify(port): `web/src/components/Settings.tsx` + Test `Settings.test.tsx`
 - (Verbatim helpers, no test changes needed beyond a smoke render: `Picker.tsx`, `Thumb.tsx`, `Grain.tsx`, `Preparing.tsx`)
@@ -8966,7 +8277,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 - `NowPlaying({ item, paused, receivedAt, canSeek, onSeek }: { item: CurrentItem | null; paused?: boolean; receivedAt?: number; canSeek?: boolean; onSeek?: (positionMs: number) => void | Promise<void> })` — **Visualizer removed; `requester.displayName` only (no avatarUrl); `source` line kept.**
 - `Queue({ items, current, upcomingRadio, onRemove, onReorder, onPlayNext, onJump, onShuffle, onClear, autoplay, autoplaySource, onToggleAutoplay }: { items: QueueItem[]; current: CurrentItem | null; upcomingRadio: QueueItem[]; onRemove: (id: string) => void; onReorder: (id: string, toIndex: number) => void; onPlayNext: (id: string) => void; onJump: (id: string) => void; onShuffle: () => void; onClear: () => void; autoplay: boolean; autoplaySource: AutoplaySource; onToggleAutoplay: (on: boolean) => void })` — adds the AutoDiscover(radio) toggle + an **upcoming-radio preview section** (`fromRadio` items).
 - `History({ history, onRequeue }: { history: QueueItem[]; onRequeue: (videoId: string) => void })`.
-- `Playlists({ playlists, onSave, onLoad, onDelete }: { playlists: PlaylistSummary[]; onSave: (name: string) => void; onLoad: (name: string) => void; onDelete: (name: string) => void })`.
 - `Lyrics({ trackId }: { trackId: string })` — lazy fetch via `api.lyrics(trackId)`.
 - `Settings({ repeat, autoplay, autoplaySource, volume, maxTrackDurationSec, disabled, onChange }: { repeat: RepeatMode; autoplay: boolean; autoplaySource: AutoplaySource; volume: number; maxTrackDurationSec: number; disabled?: boolean; onChange: (patch: Partial<StationSettings>) => void })` — **idle/crossfade/normalize/fx/commandChannel ALL removed.**
 
@@ -9281,10 +8591,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 10. **NowPlaying:** write `NowPlaying.test.tsx` asserting (a) the empty-state "Nothing is playing" renders for `item=null`, (b) for a populated `CurrentItem` the title/channel render and the requester credit shows `requester.displayName` (and `· source`) with **no `<img>` avatar**, (c) the `ProgressBar` is read-only when `canSeek=false` (role `progressbar`) and a slider when `canSeek` + `durationMs>0`, calling `onSeek` on release. Port the bot file but **delete the `Visualizer` import + `<Visualizer/>` line, delete the `<img src={requester.avatarUrl}>` and inline the `displayName`-only credit, delete the embedded `<Lyrics guildId=…/>` call** (Lyrics is now App-driven), import `CurrentItem` from `../types.js`. **Run FAIL → PASS.**
 11. **Queue:** write `Queue.test.tsx` asserting (a) explicit `items` render with remove/reorder/play-next/jump buttons wired, (b) a separate **"Up next on the radio" preview** section renders `upcomingRadio` items tagged from-radio and is read-only (no remove), (c) the AutoDiscover toggle reflects `autoplay` and calls `onToggleAutoplay`, (d) `onShuffle`/`onClear` wired. Port the bot `Queue.tsx`, add the `upcomingRadio` preview block + the autoplay toggle, import `QueueItem`/`CurrentItem`/`AutoplaySource` from `../types.js`. **Run FAIL → PASS.**
 12. **History:** write `History.test.tsx` asserting each `history` entry renders and clicking re-queue calls `onRequeue(videoId)`. Port `History.tsx`, swap the requeue arg to `meta.videoId`, import `QueueItem`. **Run FAIL → PASS.**
-13. **Playlists:** write `Playlists.test.tsx` asserting save (name input → `onSave`), load (`onLoad(name)`), delete (`onDelete(name)`) and that an empty list shows the empty state. Port `Playlists.tsx`, import `PlaylistSummary`. **Run FAIL → PASS.**
-14. **Lyrics:** write `Lyrics.test.tsx` (jsdom) asserting (a) it calls `api.lyrics(trackId)` on expand and renders the returned text, (b) the null branch shows "No lyrics found." Port `Lyrics.tsx` to take `{ trackId }` and call `api.lyrics(trackId)` (drop `guildId`/`videoId`). **Run FAIL → PASS.**
-15. **Helpers smoke:** copy `Picker.tsx`, `Thumb.tsx`, `Grain.tsx`, `Preparing.tsx` verbatim (Picker/Preparing already have ported tests `Picker.test.tsx`/`Preparing.test.tsx` from the bot — copy those too and run them green). **Run** `npx vitest run web/src/components/Picker.test.tsx web/src/components/Preparing.test.tsx` → all passed.
-16. **Run the whole panel set — expect PASS.** `npx vitest run web/src/components/` → all panel tests green.
+13. **Lyrics:** write `Lyrics.test.tsx` (jsdom) asserting (a) it calls `api.lyrics(trackId)` on expand and renders the returned text, (b) the null branch shows "No lyrics found." Port `Lyrics.tsx` to take `{ trackId }` and call `api.lyrics(trackId)` (drop `guildId`/`videoId`). **Run FAIL → PASS.**
+14. **Helpers smoke:** copy `Picker.tsx`, `Thumb.tsx`, `Grain.tsx`, `Preparing.tsx` verbatim (Picker/Preparing already have ported tests `Picker.test.tsx`/`Preparing.test.tsx` from the bot — copy those too and run them green). **Run** `npx vitest run web/src/components/Picker.test.tsx web/src/components/Preparing.test.tsx` → all passed.
+15. **Run the whole panel set — expect PASS.** `npx vitest run web/src/components/` → all panel tests green.
 
 ---
 
@@ -9304,7 +8613,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
   - Station-live vs cold-start banner: when `snapshot.seed === null && snapshot.current === null` show **"Queue a song to start the station."**; otherwise the live station.
   - Optimistic-pause + generation-guard banner system (a monotonic op-generation so a stale WS snapshot can't revert a just-issued pause/skip), and a transient error banner fed by `wsState.lastError`.
   - becomePlayer toggle + auto-speaker: claiming the Player needs the per-socket sink, so it is done over the WS (`usePlayerRole` sends `{type:"becomePlayer"}`), NOT via REST. A local `wantsSpeaker` state flag is what App passes to `usePlayerRole` as `isSpeaker`; when `snapshot.isThisDeviceSpeaker` (from the per-viewer `StationStateResponse`, set by the server when this device is the remembered/auto-selected speaker) is true, App initializes `wantsSpeaker` true so the role auto-engages. A "Play on this device" button sets `wantsSpeaker=true` (→ WS `becomePlayer`); relinquish sets `wantsSpeaker=false` (→ WS `relinquishPlayer`) AND best-effort `api.speaker("release")` to clear the persisted designation. The sink-free `api.speaker("remember"|"forget"|"release")` REST calls back the "Remember this device" / "Forget" / "Relinquish" controls; `api.speaker("claim")` is never sent (the backend 400s it — claim is the WS path).
-  - Lays out `PlayerPanel` + all panels, wiring their handlers to `api.add`/`api.pick`/`api.control`/`api.speaker`/`api.lyrics`/`api.playlists`/`api.savePlaylist`/`api.loadPlaylist`/`api.deletePlaylist`. The `Playlists` panel is backed by real REST (Task 4.2 playlist routes) — App keeps a `playlists` state list refreshed via `api.playlists()` on mount + after save/delete; `onSave`→`api.savePlaylist`, `onLoad`→`api.loadPlaylist`, `onDelete`→`api.deletePlaylist`. The `Lyrics` panel is keyed on `snap?.current?.meta.videoId` and lazy-fetches via `api.lyrics(trackId)`.
+  - Lays out `PlayerPanel` + all panels, wiring their handlers to `api.add`/`api.pick`/`api.control`/`api.speaker`/`api.lyrics`. The `Lyrics` panel is keyed on `snap?.current?.meta.videoId` and lazy-fetches via `api.lyrics(trackId)`.
 
 #### Steps
 
@@ -9399,7 +8708,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 3. **Minimal implementation.** Create `web/src/components/App.tsx`:
    ```tsx
    import { useCallback, useEffect, useState } from "react";
-   import type { PlaylistSummary, SessionInfo, StationStateResponse } from "../types.js";
+   import type { SessionInfo, StationStateResponse } from "../types.js";
    import { api, ApiError } from "../lib/api.js";
    import { getDeviceId } from "../lib/deviceId.js";
    import { useStationState } from "../lib/useStationState.js";
@@ -9411,7 +8720,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    import { NowPlaying } from "./NowPlaying.js";
    import { Queue } from "./Queue.js";
    import { History } from "./History.js";
-   import { Playlists } from "./Playlists.js";
    import { Lyrics } from "./Lyrics.js";
    import { Settings } from "./Settings.js";
    import { Grain } from "./Grain.js";
@@ -9426,13 +8734,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      const [meta, setMeta] = useState<Pick<StationStateResponse, "isThisDeviceSpeaker"> | null>(
        null,
      );
-     const [playlists, setPlaylists] = useState<PlaylistSummary[]>([]);
-     const refreshPlaylists = useCallback(() => {
-       api
-         .playlists()
-         .then((r) => setPlaylists(r.playlists))
-         .catch(() => {});
-     }, []);
      const ws = useStationState();
 
      // Bootstrap: ensure a deviceId exists, then probe the session.
@@ -9445,7 +8746,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
            if (!alive) return;
            setMeta({ isThisDeviceSpeaker: s.isThisDeviceSpeaker });
            setAuth("authed");
-           refreshPlaylists();
          })
          .catch((e) => {
            if (!alive) return;
@@ -9454,7 +8754,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        return () => {
          alive = false;
        };
-     }, [refreshPlaylists]);
+     }, []);
 
      // Auto-engage the speaker role when the server marks this device the remembered
      // speaker; the manual "Play on this device" / relinquish controls toggle this
@@ -9563,12 +8863,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
              onToggleAutoplay={(on) => onControl("settings", { autoplay: on })}
            />
            <History history={snap?.history ?? []} onRequeue={(videoId) => void api.add(videoId)} />
-           <Playlists
-             playlists={playlists}
-             onSave={(name) => void api.savePlaylist(name).then(refreshPlaylists)}
-             onLoad={(name) => void api.loadPlaylist(name)}
-             onDelete={(name) => void api.deletePlaylist(name).then(refreshPlaylists)}
-           />
            {snap?.current?.meta.videoId && <Lyrics trackId={snap.current.meta.videoId} />}
            <Settings
              repeat={snap?.repeat ?? "off"}
@@ -9583,7 +8877,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      );
    }
    ```
-   > Note: the `Playlists` panel is fully `api`-backed by the Task 4.2 playlist REST routes (`api.playlists`/`savePlaylist`/`loadPlaylist`/`deletePlaylist`); `Lyrics` is keyed on the current videoId. The App test above only asserts the auth gate + cold-start banner — the panel wiring is verified by each panel's own test (Task 5.5) plus the full build/typecheck.
+   > Note: `Lyrics` is keyed on the current videoId. The App test above only asserts the auth gate + cold-start banner — the panel wiring is verified by each panel's own test (Task 5.5) plus the full build/typecheck.
 4. **Run it — expect PASS.** `npx vitest run web/src/components/App.test.tsx` → all passed.
 
 ---
@@ -9616,7 +8910,6 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      ✓ web/src/components/NowPlaying.test.tsx
      ✓ web/src/components/Queue.test.tsx
      ✓ web/src/components/History.test.tsx
-     ✓ web/src/components/Playlists.test.tsx
      ✓ web/src/components/Lyrics.test.tsx
      ✓ web/src/components/Picker.test.tsx
      ✓ web/src/components/Preparing.test.tsx
@@ -9648,7 +8941,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    - components: shared-password LoginGate, PlayerPanel (managed audio mount +
      relinquish), de-guilded/de-Discorded AddBar/Controls(no Stop)/NowPlaying
      (no Visualizer, displayName-only credit)/Queue(+radio preview & autoplay
-     toggle)/History/Playlists/Lyrics/Settings(idle/fx/crossfade removed), and
+     toggle)/History/Lyrics/Settings(idle/fx/crossfade removed), and
      the App root: session gate, cold-start "Queue a song to start the station"
      banner, optimistic-pause generation guard, auto-speaker via
      isThisDeviceSpeaker.
@@ -9671,9 +8964,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 
 - **Sequential / shared hubs:** none. There are no shared-hub files in this phase. Every artifact is a standalone leaf.
 - **Parallel-safe (all independent leaves, may be authored concurrently):** `Dockerfile`, `docker-entrypoint.sh`, `.github/workflows/build.yml`, `docker-compose.yml`, `.dockerignore`, `README.md`.
-- **Cross-phase dependencies (must already exist on disk from earlier phases — do NOT create here):** Phase 0 `package.json` scripts (`build`, `start`, `typecheck`, `test`, `lint`); Phase 0 `.dockerignore` baseline (extended in 6.1 if absent); Phase 4 `GET /healthz` route in `src/server/app.ts`; Phase 0 `src/config.ts` env names (`PORT`/`HOST`/`PUBLIC_BASE_URL`/`ALLOWED_WS_ORIGINS`/`TRUST_PROXY`/`VIEWER_PASSWORD`/`ADMIN_PASSWORD`/`SESSION_SECRET`/`CACHE_DIR`/`CACHE_MAX_MB`/`YT_PLAYER_CLIENTS`/`PO_TOKEN_PROVIDER_URL`/`LOG_LEVEL`/`NODE_ENV`/`ALLOW_NO_PASSWORD`).
+- **Cross-phase dependencies (must already exist on disk from earlier phases — do NOT create here):** Phase 0 `package.json` scripts (`build`, `start`, `typecheck`, `test`, `lint`); Phase 0 `.dockerignore` baseline (extended in 6.1 if absent); Phase 4 `GET /healthz` route in `src/server/app.ts`; Phase 0 `src/config.ts` env names (`PORT`/`HOST`/`PUBLIC_BASE_URL`/`ALLOWED_WS_ORIGINS`/`VIEWER_PASSWORD`/`SESSION_SECRET`/`CACHE_DIR`/`CACHE_MAX_MB`/`YT_PLAYER_CLIENTS`/`PO_TOKEN_PROVIDER_URL`/`LOG_LEVEL`/`NODE_ENV`/`ALLOW_NO_PASSWORD`).
 
-> **Testing note for this phase.** Deploy artifacts (Dockerfile, compose, CI YAML, shell entrypoint) are not runtime TypeScript, so they cannot be unit-tested with Vitest in the normal "import-the-function" way. Instead, each task below is driven by a **Vitest spec that asserts on the artifact files as fixtures** — it reads the file off disk and asserts the load-bearing invariants the spec demands (no Discord env, `ALLOWED_WS_ORIGINS == PUBLIC_BASE_URL`, no bundled cloudflared / `TUNNEL_TOKEN` + a localhost-bound published host port for bring-your-own ingress, `TRUST_PROXY=true`, the YTDLP_REFRESH cache-bust wiring, the gosu drop, etc.). These tests live under `src/deploy/` so they run inside the existing `npm test` (vitest `include` already covers `src/**`). They are real, runnable assertions — not placeholders — and they make the "did we de-Discord / did we keep the bring-your-own-ingress invariants" rules regression-proof. Shell/compose/Dockerfile lint is additionally run as a manual command in each task and again in Phase completion.
+> **Testing note for this phase.** Deploy artifacts (Dockerfile, compose, CI YAML, shell entrypoint) are not runtime TypeScript, so they cannot be unit-tested with Vitest in the normal "import-the-function" way. Instead, each task below is driven by a **Vitest spec that asserts on the artifact files as fixtures** — it reads the file off disk and asserts the load-bearing invariants the spec demands (no Discord env, `ALLOWED_WS_ORIGINS == PUBLIC_BASE_URL`, no bundled cloudflared / `TUNNEL_TOKEN` + a localhost-bound published host port for bring-your-own ingress, the YTDLP_REFRESH cache-bust wiring, the gosu drop, etc.). These tests live under `src/deploy/` so they run inside the existing `npm test` (vitest `include` already covers `src/**`). They are real, runnable assertions — not placeholders — and they make the "did we de-Discord / did we keep the bring-your-own-ingress invariants" rules regression-proof. Shell/compose/Dockerfile lint is additionally run as a manual command in each task and again in Phase completion.
 
 ---
 
@@ -10036,11 +9329,11 @@ Produces (CI workflow YAML — no TS symbols):
 Consumes (must already exist):
 
 - Task 6.1 image (`ghcr.io/atvriders/lan-jukebox:latest`) + its `/healthz` healthcheck contract.
-- Phase 0 `src/config.ts` env names: `PORT`, `HOST`, `PUBLIC_BASE_URL`, `ALLOWED_WS_ORIGINS`, `TRUST_PROXY`, `VIEWER_PASSWORD`, `ADMIN_PASSWORD`, `SESSION_SECRET`, `ALLOW_NO_PASSWORD`, `NODE_ENV`, `LOG_LEVEL`, `CACHE_DIR`, `CACHE_MAX_MB`, `HISTORY_MAX_ITEMS`, `SEARCH_RESULT_COUNT`, `PREFETCH_DEPTH`, `MAX_CONCURRENT_DOWNLOADS`, `MAX_TRACK_DURATION_SEC`, `YT_PROXY`, `YT_COOKIES_FILE`, `YT_PLAYER_CLIENTS`, `PO_TOKEN_PROVIDER_URL`.
+- Phase 0 `src/config.ts` env names: `PORT`, `HOST`, `PUBLIC_BASE_URL`, `ALLOWED_WS_ORIGINS`, `VIEWER_PASSWORD`, `SESSION_SECRET`, `ALLOW_NO_PASSWORD`, `NODE_ENV`, `LOG_LEVEL`, `CACHE_DIR`, `CACHE_MAX_MB`, `HISTORY_MAX_ITEMS`, `SEARCH_RESULT_COUNT`, `PREFETCH_DEPTH`, `MAX_CONCURRENT_DOWNLOADS`, `MAX_TRACK_DURATION_SEC`, `YT_PROXY`, `YT_COOKIES_FILE`, `YT_PLAYER_CLIENTS`, `PO_TOKEN_PROVIDER_URL`.
 
 Produces (compose YAML — no TS symbols):
 
-- Service `jukebox`: GHCR image, `pull_policy: always`, env block (NO Discord vars, NO `IDLE_TIMEOUT_SEC`, `TRUST_PROXY: "true"`, `ALLOWED_WS_ORIGINS` == `PUBLIC_BASE_URL`), a **localhost-bound published host port** `ports: ["127.0.0.1:${HOST_PORT:-8080}:8080"]` (for the user's OWN external ingress — their separate cloudflared / nginx / etc.), `volumes: ["cache:/data/cache"]` (holds `station-snapshot.json` + `device-registry.json` + audio cache), `restart: unless-stopped`, `/healthz` healthcheck, json-file logging.
+- Service `jukebox`: GHCR image, `pull_policy: always`, env block (NO Discord vars, NO `IDLE_TIMEOUT_SEC`, no trust-proxy knob — `trustProxy` is hardcoded `true` in the app — and no second/admin password: a single shared `VIEWER_PASSWORD`, `ALLOWED_WS_ORIGINS` == `PUBLIC_BASE_URL`), a **localhost-bound published host port** `ports: ["127.0.0.1:${HOST_PORT:-8080}:8080"]` (for the user's OWN external ingress — their separate cloudflared / nginx / etc.), `volumes: ["cache:/data/cache"]` (holds `station-snapshot.json` + `device-registry.json` + audio cache), `restart: unless-stopped`, `/healthz` healthcheck, json-file logging.
 - Optional `bgutil-pot` sidecar under the `pot` profile.
 - **No bundled tunnel.** The project does NOT install or run `cloudflared` itself — bring your own external ingress.
 - Named `cache:` volume.
@@ -10064,8 +9357,11 @@ Produces (compose YAML — no TS symbols):
        expect(yml).toMatch(/pull_policy:\s*always/);
      });
 
-     it("trusts the proxy and pins WS origins to the public base url", () => {
-       expect(yml).toMatch(/TRUST_PROXY:\s*"true"/);
+     it("pins WS origins to the public base url and exposes no trust-proxy / admin-password knob", () => {
+       // trustProxy is hardcoded true in the app; there is a single shared VIEWER_PASSWORD,
+       // so neither a trust-proxy env var nor a second/admin password var appears in the env block.
+       expect(yml).not.toMatch(new RegExp(["TRUST", "PROXY"].join("_")));
+       expect(yml).not.toMatch(new RegExp(["ADMIN", "PASSWORD"].join("_")));
        // ALLOWED_WS_ORIGINS must equal PUBLIC_BASE_URL — both default to the same placeholder
        const pub = yml.match(/PUBLIC_BASE_URL:\s*"([^"]+)"/)?.[1];
        const ws = yml.match(/ALLOWED_WS_ORIGINS:\s*"([^"]+)"/)?.[1];
@@ -10125,7 +9421,7 @@ Produces (compose YAML — no TS symbols):
    # IMPORTANT: This file contains PLACEHOLDER values.
    # Before running `docker compose up`, fill in your real values for:
    #   PUBLIC_BASE_URL, ALLOWED_WS_ORIGINS (== PUBLIC_BASE_URL), VIEWER_PASSWORD,
-   #   ADMIN_PASSWORD (optional), SESSION_SECRET (>= 32 chars).
+   #   SESSION_SECRET (>= 32 chars).
    # Keep your filled-in copy LOCAL — do NOT commit real secrets to the repo.
    #
    # Ingress: BRING YOUR OWN. This project does NOT bundle or run cloudflared. The
@@ -10158,16 +9454,14 @@ Produces (compose YAML — no TS symbols):
          # rejected by the origin guard and the station UI never goes live.
          ALLOWED_WS_ORIGINS: "https://jukebox.waterburp.com"
          # Your external HTTPS proxy / Cloudflare Tunnel terminates TLS at the edge and
-         # reaches this origin over plain HTTP, sending X-Forwarded-Proto: https.
-         # TRUST_PROXY=true makes the app honor it for correct scheme detection + Secure
-         # session cookies. Required behind any HTTPS proxy/tunnel; only set "false" for
-         # direct LAN exposure with no proxy.
-         TRUST_PROXY: "true"
+         # reaches this origin over plain HTTP, sending X-Forwarded-Proto: https. The app
+         # hardcodes Fastify trustProxy:true so it honors that for correct scheme detection
+         # + Secure session cookies + real client IP — there is no trust-proxy env knob.
 
-         # Auth (shared viewer password required; admin optional). Server refuses to
+         # Auth: a single shared viewer password (required). Anyone authenticated may
+         # control everything — there is no second/admin password. The server refuses to
          # start without VIEWER_PASSWORD unless ALLOW_NO_PASSWORD=true.
          VIEWER_PASSWORD: "CHANGE_ME"
-         ADMIN_PASSWORD: ""
          ALLOW_NO_PASSWORD: "false"
          SESSION_SECRET: "CHANGE_ME_AT_LEAST_32_CHARACTERS_LONG"
 
@@ -10246,14 +9540,14 @@ Produces (compose YAML — no TS symbols):
 
 Consumes (must already exist):
 
-- Tasks 6.1/6.2/6.3 artifacts (image name, env names, profiles, the no-published-port + `TRUST_PROXY` + `ALLOWED_WS_ORIGINS` invariants).
+- Tasks 6.1/6.2/6.3 artifacts (image name, env names, profiles, the no-published-port + `ALLOWED_WS_ORIGINS` invariants).
 - Spec §5 (device memory + auto-select speaker + browser-autoplay caveat), §10 (deployment + cloudflared), §13 (open risks: WS origin/upgrade, autoplay policy).
 
 Produces (docs — no TS symbols):
 
 - An env table covering every `loadConfig()` var the operator sets.
 - GHCR-public + forked-repo `workflow_dispatch` + `--force-recreate` re-pull gotchas.
-- The `ALLOWED_WS_ORIGINS == PUBLIC_BASE_URL` + `TRUST_PROXY=true` behind-an-external-proxy/tunnel rule + a "verify `/ws` upgrades end-to-end" step.
+- The `ALLOWED_WS_ORIGINS == PUBLIC_BASE_URL` rule + a note that Fastify `trustProxy` is hardcoded `true` (fixed behavior behind the external proxy/tunnel) + a "verify `/ws` upgrades end-to-end" step.
 - A one-time speaker-PC autoplay-permission grant + device-memory checklist.
 - A manual-verify `<audio>` playback checklist (spec §11: real playback is manual-verify).
 
@@ -10275,9 +9569,7 @@ Produces (docs — no TS symbols):
        for (const v of [
          "PUBLIC_BASE_URL",
          "ALLOWED_WS_ORIGINS",
-         "TRUST_PROXY",
          "VIEWER_PASSWORD",
-         "ADMIN_PASSWORD",
          "SESSION_SECRET",
          "CACHE_DIR",
          "CACHE_MAX_MB",
@@ -10288,11 +9580,15 @@ Produces (docs — no TS symbols):
        }
        // env table header present
        expect(md).toMatch(/\|\s*Variable\s*\|/i);
+       // no removed knobs: trustProxy is hardcoded true; single shared password (no admin)
+       expect(md).not.toMatch(new RegExp(`\\b${["TRUST", "PROXY"].join("_")}\\b`));
+       expect(md).not.toMatch(new RegExp(`\\b${["ADMIN", "PASSWORD"].join("_")}\\b`));
      });
 
      it("states the ALLOWED_WS_ORIGINS == PUBLIC_BASE_URL invariant", () => {
        expect(md).toMatch(/ALLOWED_WS_ORIGINS[\s\S]{0,80}PUBLIC_BASE_URL/);
-       expect(md).toMatch(/TRUST_PROXY[\s\S]{0,40}true/);
+       // trustProxy is a fixed behavior (hardcoded true), documented as prose not an env row
+       expect(md).toMatch(/trustProxy[\s\S]{0,40}true/i);
      });
 
      it("documents bring-your-own ingress + the WebSocket upgrade gotcha", () => {
@@ -10373,9 +9669,7 @@ Produces (docs — no TS symbols):
    | `HOST`                     | no                 | `0.0.0.0`                    | Bind address.                                                                                 |
    | `PUBLIC_BASE_URL`          | yes                | —                            | The public `https://` subdomain (e.g. `https://jukebox.waterburp.com`).                       |
    | `ALLOWED_WS_ORIGINS`       | yes                | —                            | **MUST equal `PUBLIC_BASE_URL` exactly** (see WebSocket gotcha).                              |
-   | `TRUST_PROXY`              | yes behind a proxy | `false`                      | Set **`true`** behind any HTTPS proxy / tunnel.                                               |
-   | `VIEWER_PASSWORD`          | yes*               | —                            | Shared viewer password. *Server refuses to start unless set, unless `ALLOW_NO_PASSWORD=true`. |
-   | `ADMIN_PASSWORD`           | no                 | —                            | If set, destructive/global actions need an elevated session.                                  |
+   | `VIEWER_PASSWORD`          | yes*               | —                            | Single shared password; anyone authenticated controls everything. *Server refuses to start unless set, unless `ALLOW_NO_PASSWORD=true`. |
    | `ALLOW_NO_PASSWORD`        | no                 | `false`                      | Escape hatch to run with no viewer password (LAN-only).                                       |
    | `SESSION_SECRET`           | yes                | —                            | Cookie-signing secret, **>= 32 chars**.                                                       |
    | `CACHE_DIR`                | no                 | `/data/cache`                | Holds the audio LRU **and** `station-snapshot.json` + `device-registry.json`.                 |
@@ -10409,9 +9703,10 @@ Produces (docs — no TS symbols):
      `ports:` mapping, attach both it and the `jukebox` service to a shared external
      Docker network, and reach the app at `http://jukebox:8080` over that network.
    - **HTTPS is terminated at your edge**; your tunnel/proxy reaches the origin over
-     plain HTTP and should set `X-Forwarded-Proto: https`. Therefore **`TRUST_PROXY=true`
-     is required** for correct scheme detection and `Secure` session cookies — without
-     it, login cookies are dropped behind the proxy.
+     plain HTTP and should set `X-Forwarded-Proto: https`. The app hardcodes Fastify
+     **`trustProxy: true`** (a fixed behavior, not an env knob — it is always behind your
+     HTTPS proxy/tunnel) so it honors that header for correct scheme detection, `Secure`
+     session cookies, and the real client IP.
    - **WebSocket gotcha (verify end-to-end).** Cloudflare Tunnels (and most proxies)
      pass WebSockets through, but the app's origin guard rejects any `/ws` upgrade
      whose `Origin` isn't in `ALLOWED_WS_ORIGINS`. So **`ALLOWED_WS_ORIGINS` must equal
@@ -10517,7 +9812,7 @@ Produces (docs — no TS symbols):
 
 3. **Adversarial multi-agent `/debug` pass.** Fan out finder agents across every file changed/created in this phase — `Dockerfile`, `docker-entrypoint.sh`, `.github/workflows/build.yml`, `docker-compose.yml`, `.dockerignore`, `README.md`, and the four `src/deploy/*.test.ts` specs — each agent assigned a reliability lens:
    - **De-Discord/de-idle lens:** grep every artifact for `discord`, `oauth`, `IDLE_TIMEOUT`, `guild`, `voice`, `DISCORD_TOKEN`, `web,mweb` (default) — any hit is a confirmed bug (spec §1 non-goals, §3.1 deletions).
-   - **Ingress/WS invariant lens:** verify NO `cloudflared` service and NO `TUNNEL_TOKEN` are bundled anywhere (bring-your-own ingress); the `jukebox` service publishes a localhost-bound host port (`ports: ["127.0.0.1:${HOST_PORT:-8080}:8080"]`); `ALLOWED_WS_ORIGINS` literally equals `PUBLIC_BASE_URL` in compose; `TRUST_PROXY: "true"`; README states the `/ws` upgrade + 101 verification (spec §10, §13).
+   - **Ingress/WS invariant lens:** verify NO `cloudflared` service and NO `TUNNEL_TOKEN` are bundled anywhere (bring-your-own ingress); the `jukebox` service publishes a localhost-bound host port (`ports: ["127.0.0.1:${HOST_PORT:-8080}:8080"]`); `ALLOWED_WS_ORIGINS` literally equals `PUBLIC_BASE_URL` in compose; no trust-proxy or second/admin-password env knobs (trustProxy is hardcoded `true` in the app; single shared password); README states the `/ws` upgrade + 101 verification (spec §10, §13).
    - **Secret-hygiene lens:** confirm `.dockerignore` excludes `.env`; compose secrets are `CHANGE_ME` placeholders (no real tokens); `SESSION_SECRET` placeholder is >= 32 chars; README warns to keep the filled copy local.
    - **Persistence lens:** confirm the single `cache:` volume mounts `/data/cache` and is documented to hold `station-snapshot.json` + `device-registry.json`; entrypoint chowns `CACHE_DIR` before the gosu drop so the app user can write all three (spec §4/§5 restart-safe).
    - **Supply-chain lens:** confirm Deno is pinned + SHA256-verified (no `curl|sh`); `YTDLP_REFRESH` cache-bust is wired both in the Dockerfile (`ARG`/`ENV`) and the workflow (`date +%Y%U` → build-arg); `no-cache` on schedule/dispatch; image tags are `:latest` + `:${{ github.sha }}`.
@@ -10537,13 +9832,14 @@ Produces (docs — no TS symbols):
      build/push :latest + :sha, weekly cron + date-keyed YTDLP_REFRESH cache-bust,
      no-cache on schedule/dispatch, concurrency cancel, gha cache mode=max.
    - docker-compose.yml: GHCR pull_policy:always, env block (no Discord, no idle
-     timeout, TRUST_PROXY=true, ALLOWED_WS_ORIGINS==PUBLIC_BASE_URL), a
-     localhost-bound published host port (127.0.0.1:${HOST_PORT:-8080}:8080) for the
-     user's OWN external ingress — NO bundled cloudflared — named cache volume holding
-     the station snapshot + device registry, /healthz healthcheck, optional bgutil-pot.
+     timeout, no trust-proxy or admin-password knobs — trustProxy hardcoded true + single
+     shared VIEWER_PASSWORD, ALLOWED_WS_ORIGINS==PUBLIC_BASE_URL), a localhost-bound
+     published host port (127.0.0.1:${HOST_PORT:-8080}:8080) for the user's OWN external
+     ingress — NO bundled cloudflared — named cache volume holding the station snapshot +
+     device registry, /healthz healthcheck, optional bgutil-pot.
    - README: env table (incl. HOST_PORT), GHCR-public + workflow_dispatch +
-     force-recreate gotchas, bring-your-own-ingress/WS-upgrade + TRUST_PROXY
-     invariants, speaker-PC autoplay-grant + device-memory checklist, manual <audio>
+     force-recreate gotchas, bring-your-own-ingress/WS-upgrade + hardcoded-trustProxy
+     note, speaker-PC autoplay-grant + device-memory checklist, manual <audio>
      playback verification checklist.
    - src/deploy/*.test.ts: fixture-asserting Vitest specs guarding every invariant.
 
@@ -10573,7 +9869,7 @@ Produces (docs — no TS symbols):
   - **External-failure handling** — yt-dlp extraction failure + the player-client fallback ladder, network drops, lyrics 404, bgutil POT sidecar down, expired stream URLs.
   - **Station state-machine invariants** — the station **never stops**; the **no-timeout / no-auto-disconnect** guarantee holds everywhere; the **radio never runs the queue empty** (queue-ahead keeps ≥1 ready); **cold start waits for a seed**; skip advances but never ends the station.
   - **Restart / recovery** — `StationSnapshot` round-trips; resume position; **auto-select of the remembered speaker** on reconnect; cache survives restart.
-  - **Auth / security** — viewer vs admin elevation gating on every destructive/global action; signed/secure/SameSite cookies; `TRUST_PROXY` scheme detection; `ALLOWED_WS_ORIGINS == PUBLIC_BASE_URL`; no auth bypass via WS; `/audio/:id` not an open proxy.
+  - **Auth / security** — single shared password (`requireSession` on every route; any authed user controls everything, no admin/elevation tier); signed/secure/SameSite cookies; hardcoded `trustProxy: true` scheme detection; `ALLOWED_WS_ORIGINS == PUBLIC_BASE_URL`; no auth bypass via WS; `/audio/:id` not an open proxy.
   - **API / WS contract conformance** — every REST DTO and WS frame matches the `## Shared Types` section exactly (names, optionality, discriminants).
   - **Deploy** — entrypoint `gosu` cache-volume chown; env validation refuses to start without `VIEWER_PASSWORD` (unless `ALLOW_NO_PASSWORD`); GHCR image is public; the `/ws` upgrade survives the Cloudflare Tunnel; `pull_policy: always`; healthcheck + graceful shutdown.
   - **UI/UX & a11y** — the Remote/Player panels: keyboard/focus, ARIA on transport controls, the "station live / waiting-for-seed" and "no speaker connected" states, error surfacing.
