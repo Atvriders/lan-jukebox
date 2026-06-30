@@ -131,6 +131,19 @@ describe("AudioCache", () => {
     expect(cache.totalBytes()).toBe(0);
   });
 
+  it("does not register a ghost entry for a 0-byte file (failed/aborted transcode)", async () => {
+    // A failed ffmpeg leaves a 0-byte <id>.transcoded.m4a on disk. register() must skip it:
+    // registering it would make has() report true and get() hand out a path to an empty file
+    // that gets served as audio/* with Content-Length 0 (an unplayable ghost).
+    const cache = new AudioCache(dir, 1000);
+    await cache.init();
+    const empty = await makeFile("aaaaaaaaaaa.transcoded.m4a", 0);
+    cache.register("aaaaaaaaaaa", empty);
+    expect(cache.has("aaaaaaaaaaa")).toBe(false);
+    expect(cache.get("aaaaaaaaaaa")).toBeNull();
+    expect(cache.totalBytes()).toBe(0);
+  });
+
   it("get() returns null for an unknown id", async () => {
     const cache = new AudioCache(dir, 500);
     await cache.init();

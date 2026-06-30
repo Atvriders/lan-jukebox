@@ -42,9 +42,11 @@ export class AudioCache {
 
   register(videoId: string, filePath: string, audio: AudioInfo | null = null): void {
     const stat = statSyncSafe(filePath);
-    // Refuse to register a file that does not exist on disk: inserting a size-0 ghost
-    // entry would make has() report true and get() hand out a path the player can't read.
-    if (stat === null) return;
+    // Refuse to register a file that does not exist OR is 0 bytes on disk: inserting a
+    // size-0 ghost entry would make has() report true and get() hand out a path to an empty
+    // file the player can't read (and serve it as audio/* with Content-Length 0). A 0-byte
+    // file is exactly what a failed/aborted ffmpeg leaves behind, so guard against it here.
+    if (stat === null || stat.size <= 0) return;
     const { size } = stat;
     const oldEntry = this.entries.get(videoId);
     // Free the old entry's accounting UP FRONT (delete from the map; remove its file if the
