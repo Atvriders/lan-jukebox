@@ -4,9 +4,9 @@
 
 **Goal:** Build a self-hosted, browser-based always-playing YouTube radio — a single never-stopping station whose backend streams audio to one browser "Player" while other browsers act as Remotes — by copy-pruning the framework-agnostic reuse modules from `~/discord-yt-music-bot` into a new de-Discorded standalone repo.
 
-**Architecture:** A Dockerized Node/Fastify backend holds the station state (queue + radio engine + orchestrator), serves `GET /audio/:trackId` with HTTP range to the browser `<audio>` sink, fans out `StationSnapshot` over WebSocket to all subscribers, and sends targeted player commands to the one active Player; a React SPA renders the Remote + Player roles; ingress is a Cloudflare Tunnel.
+**Architecture:** A Dockerized Node/Fastify backend holds the station state (queue + radio engine + orchestrator), serves `GET /audio/:trackId` with HTTP range to the browser `<audio>` sink, fans out `StationSnapshot` over WebSocket to all subscribers, and sends targeted player commands to the one active Player; a React SPA renders the Remote + Player roles; ingress is bring-your-own (e.g. a separate Cloudflare Tunnel) — the app only publishes a localhost-bound host port, it does NOT bundle cloudflared.
 
-**Tech Stack:** Node >=22.12 <23, TypeScript (ESM/NodeNext, strict), Fastify 5 + @fastify/{cookie,session,rate-limit,websocket,static}, pino, yt-dlp + ffmpeg + Deno (nsig) + optional bgutil POT; React 19 + Vite 6 + Tailwind v4; Vitest + @testing-library; Docker + GitHub Actions → GHCR + docker-compose + cloudflared.
+**Tech Stack:** Node >=22.12 <23, TypeScript (ESM/NodeNext, strict), Fastify 5 + @fastify/{cookie,session,rate-limit,websocket,static}, pino, yt-dlp + ffmpeg + Deno (nsig) + optional bgutil POT; React 19 + Vite 6 + Tailwind v4; Vitest + @testing-library; Docker + GitHub Actions → GHCR + docker-compose; bring-your-own external ingress (no bundled cloudflared).
 
 ## Global Constraints
 
@@ -18,7 +18,7 @@
 - Device memory: persisted device registry; the remembered speaker (isPreferredSpeaker) is auto-selected as the Player on connect; document the one-time browser autoplay-permission grant.
 - Auth: required shared VIEWER_PASSWORD (signed session cookie); optional ADMIN_PASSWORD elevates destructive/global actions; secure SameSite cookies; TRUST_PROXY=true (Cloudflare Tunnel sets X-Forwarded-Proto); ALLOWED_WS_ORIGINS must equal PUBLIC_BASE_URL.
 - UI: built with the frontend-design skill to a professional, production-grade standard (design system first, then per-component).
-- Deploy: GitHub Actions (Atvriders) -> GHCR (PUBLIC) on push to master + weekly rebuild + yt-dlp cache-bust (+ first-build workflow_dispatch); docker-compose pulls the image (pull_policy: always) with named volumes for cache + persisted device registry/snapshot; ingress via Cloudflare Tunnel (no port-forward); gosu entrypoint chowns the cache volume.
+- Deploy: GitHub Actions (Atvriders) -> GHCR (PUBLIC) on push to master + weekly rebuild + yt-dlp cache-bust (+ first-build workflow_dispatch); docker-compose pulls the image (pull_policy: always) with named volumes for cache + persisted device registry/snapshot; bring-your-own external ingress (the app publishes a localhost-bound host port for the user's OWN separate Cloudflare Tunnel / reverse proxy — NO bundled cloudflared); gosu entrypoint chowns the cache volume.
 - Repo: public, under Atvriders, branch master.
 - TDD throughout. NO per-task commits: each phase ends with full verify (typecheck+lint+build+tests) -> full adversarial multi-agent /debug pass (find->verify->fix) -> EXACTLY ONE squash commit for the phase.
 - Browser audio playback + autoplay behavior is manual-verify, documented in the README with a checklist.
@@ -37,12 +37,7 @@
 // ---------------------------------------------------------------------------
 
 /** YouTube live-status enum. Kept for the live-stream guard in youtube/. */
-export type LiveStatus =
-  | "not_live"
-  | "is_live"
-  | "is_upcoming"
-  | "was_live"
-  | "post_live";
+export type LiveStatus = "not_live" | "is_live" | "is_upcoming" | "was_live" | "post_live";
 
 /** Canonical YouTube track metadata. videoId IS the trackId used by /audio/:trackId. */
 export interface TrackMeta {
@@ -406,8 +401,8 @@ declare module "fastify" {
 ├── .gitignore
 ├── Dockerfile                           # multi-stage Node22 + yt-dlp + ffmpeg + Deno(nsig) + gosu + /healthz HEALTHCHECK
 ├── docker-entrypoint.sh                 # root: mkdir+chown CACHE_DIR, then exec gosu app "$@"
-├── docker-compose.yml                   # GHCR image pull, env block, named volume, healthcheck, optional bgutil-pot + cloudflared
-├── README.md                            # env table, deploy, autoplay-grant + device-memory + cloudflared/WS gotchas
+├── docker-compose.yml                   # GHCR image pull, env block, named volume, healthcheck, optional bgutil-pot; localhost-bound host port for bring-your-own ingress (no bundled cloudflared)
+├── README.md                            # env table, deploy, autoplay-grant + device-memory + bring-your-own-ingress/WS gotchas
 ├── .github
 │   └── workflows
 │       └── build.yml                    # GHCR CI: test gate + build/push :latest+:sha, weekly cron, yt-dlp cache-bust
@@ -533,7 +528,6 @@ declare module "fastify" {
             └── Preparing.test.tsx
 ```
 
-
 ## Phase 0:Scaffold & port reuse — Scaffold & port reuse
 
 **Goal:** Stand up the new standalone `lan-jukebox` repo — `package.json` (no Discord deps), tsconfig/vitest/eslint — and COPY-IN-AND-PRUNE every framework-agnostic reuse module from `~/discord-yt-music-bot` so the codebase typechecks and the ported tests pass; lock the shared-types backbone (`src/types/index.ts` + `web/src/types.ts` mirror) first because everything downstream consumes it.
@@ -553,17 +547,20 @@ declare module "fastify" {
 ### Task 0.1: Author shared types backbone (SEQUENTIAL — land first, alone)
 
 **Files**
+
 - Create: `src/types/index.ts`
 - Create: `web/src/types.ts` (a hand-kept mirror — domain/DTO/WS types only; NOT the config interfaces and NOT the `declare module "fastify"` block)
 - Test: `src/types/index.test.ts` (compile-time + value assertions on the exported consts)
 
 **Interfaces**
+
 - Consumes: nothing.
 - Produces (exact names — single source of truth): `LiveStatus`, `TrackMeta`, `AudioInfo`, `RequestSource`, `Requester`, `AUTOPLAY_REQUESTER`, `QueueItem`, `QueueSnapshot`, `RepeatMode`, `AutoplaySource`, `StationSettings`, `DEFAULT_SETTINGS`, `VOLUME_MAX`, `MAX_TRACK_DURATION_CEILING_SEC`, `PreparingPhase`, `PreparingState`, `SavedPlaylist`, `PlaylistSummary`, `DeviceRecord`, `DeviceRegistryFile`, `CurrentItem`, `StationSnapshot`, `StationStateResponse`, `StationSnapshotFile`, `LoginRequest`, `AdminRequest`, `SessionInfo`, `AddRequest`, `AddResponse`, `PickRequest`, `PickResponse`, `ControlAction`, `ControlRequest`, `ControlResponse`, `SpeakerAction`, `SpeakerRequest`, `SpeakerResponse`, `LyricsResult`, `ApiErrorBody`, `ClientWsMessage`, `ServerBroadcastMessage`, `ServerPlayerMessage`, `ServerWsMessage`, `MediaConfig`, `StationConfig`, `WebConfig`, `AppConfig`, plus the `declare module "fastify"` session augmentation.
 
 **Steps**
 
 1. **Write the FAILING test** — `src/types/index.test.ts`:
+
    ```ts
    import { describe, it, expect } from "vitest";
    import {
@@ -671,6 +668,7 @@ declare module "fastify" {
    Expected failure: `Error: Failed to load url ./index.js` / `Cannot find module './index.js'` (the file does not exist yet).
 
 3. **Minimal implementation** — create `src/types/index.ts` with the EXACT backbone contents from the plan's "BACKBONE shared types" block, verbatim. This is the canonical single source of truth: every `export type` / `export interface` / `export const` listed above, in the same order, including the trailing:
+
    ```ts
    declare module "fastify" {
      interface Session {
@@ -681,6 +679,7 @@ declare module "fastify" {
      }
    }
    ```
+
    (Paste the entire backbone block — TrackMeta through the fastify augmentation — without modification.)
 
 4. **Run it (expect PASS)** — `npx vitest run src/types/index.test.ts`
@@ -693,16 +692,19 @@ declare module "fastify" {
 ### Task 0.2: Repo scaffold + tooling (SEQUENTIAL — land second)
 
 **Files**
+
 - Create: `package.json`, `package-lock.json` (generated), `tsconfig.json`, `tsconfig.test.json`, `vitest.config.ts`, `eslint.config.js`, `.prettierrc`, `.gitignore`, `.dockerignore`
 - Test: none for the config files themselves; the gate is `npm run typecheck` + `npm test` running clean in Task 0.1 onward. Add a smoke test `src/scaffold.smoke.test.ts` to prove vitest + NodeNext ESM resolution works end-to-end.
 
 **Interfaces**
+
 - Consumes: nothing.
 - Produces: npm scripts — `build` = `npm run build:web && tsc -p tsconfig.json`; `build:web` = `vite build web --outDir ../dist/public --emptyOutDir`; `test` = `vitest run`; `test:watch` = `vitest`; `typecheck` = `tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && tsc -p web/tsconfig.json`; `lint` = `eslint . && prettier --check .`; `start` = `node dist/index.js`; `dev` = `tsx watch src/index.ts`; `dev:web` = `vite web`. Deps: `fastify@^5`, `@fastify/{cookie,session,rate-limit,websocket,static}`, `@noble/ciphers`, `pino`. devDeps: `react@^19`, `react-dom@^19`, `@types/react`, `@types/react-dom`, `vite@^6`, `@vitejs/plugin-react`, `tailwindcss@^4`, `@tailwindcss/vite@^4`, `vitest@^4`, `@testing-library/react@^16`, `@testing-library/jest-dom`, `jsdom`, `typescript`, `typescript-eslint`, `eslint`, `@eslint/js`, `eslint-plugin-react-hooks`, `prettier`, `tsx`, `@types/node`, `sharp`. **Explicitly absent: `discord.js`, `@discordjs/voice`, `@discordjs/opus`, `prism-media`.**
 
 **Steps**
 
 1. **Write the FAILING smoke test** — `src/scaffold.smoke.test.ts`:
+
    ```ts
    import { describe, it, expect } from "vitest";
    import { TYPES_OK } from "./scaffold-probe.js";
@@ -713,7 +715,9 @@ declare module "fastify" {
      });
    });
    ```
+
    and a probe `src/scaffold-probe.ts`:
+
    ```ts
    export const TYPES_OK = true;
    ```
@@ -743,6 +747,7 @@ declare module "fastify" {
 ### Task 0.3: Port util + lifecycle + canary verbatim (PARALLEL)
 
 **Files**
+
 - Create: `src/util/logger.ts` + `src/util/logger.test.ts`
 - Create: `src/util/mutex.ts` + `src/util/mutex.test.ts`
 - Create: `src/util/semaphore.ts` + `src/util/semaphore.test.ts`
@@ -750,6 +755,7 @@ declare module "fastify" {
 - Create: `src/canary.ts`
 
 **Interfaces**
+
 - Consumes: 0.2 (vitest/tsconfig). `canary.ts` does `import type { YouTubeService } from "./youtube/index.js"` (type-only — no runtime dep on 0.4).
 - Produces: `class Mutex { runExclusive<T>(fn: () => Promise<T> | T): Promise<T> }`; `class Semaphore { constructor(max: number); run<T>(fn: () => Promise<T> | T): Promise<T> }`; `createLogger(level?: string): Logger`, `setRootLogger(l: Logger): void`, `getRootLogger(): Logger`, `LEVELS`, `isValidLevel(level: string): boolean`, `type LogLevel`; `runShutdown(tasks: Task[], opts: ShutdownOpts): Promise<boolean>`, `installSignalHandlers(tasks, opts, log?): void`, `installCrashHandlers(log, exitFn?): void`, `interface ShutdownOpts { graceMs: number; exitFn?: (code: number) => void }`; `startupCanary(youtube: Pick<YouTubeService, "resolve">, log: Logger): Promise<boolean>`.
 
@@ -759,12 +765,13 @@ declare module "fastify" {
    - `~/discord-yt-music-bot/src/util/{mutex,semaphore,logger}.ts` and their `.test.ts` siblings.
    - `~/discord-yt-music-bot/src/lifecycle.ts` and `src/lifecycle.test.ts`.
    - `~/discord-yt-music-bot/src/canary.ts` (no test file ships for canary in the bot; it is exercised at integration — do NOT invent one here, keep parity).
-   Confirm none import anything Discord-specific: `grep -RniE "discord|guild|voice" src/util src/lifecycle.ts src/canary.ts` must return nothing.
+     Confirm none import anything Discord-specific: `grep -RniE "discord|guild|voice" src/util src/lifecycle.ts src/canary.ts` must return nothing.
 
 2. **Run the ported tests (expect PASS immediately — verbatim port)** — `npx vitest run src/util/mutex.test.ts src/util/semaphore.test.ts src/util/logger.test.ts src/lifecycle.test.ts`
    Expected: all four files green (`Test Files 4 passed`).
 
 3. **Add a focused FAILING test to PROVE the ported behavior locks** (regression anchor for the verbatim port) — append to `src/util/semaphore.test.ts` a max-1-serialization case if not already present; if it already exists in the verbatim file, instead add `src/canary.test.ts` as a NEW failing test:
+
    ```ts
    import { describe, it, expect, vi } from "vitest";
    import { startupCanary } from "./canary.js";
@@ -804,6 +811,7 @@ declare module "fastify" {
 ### Task 0.4: Port youtube subsystem (prune only the config import + per-guild comments) (PARALLEL)
 
 **Files**
+
 - Create: `src/youtube/url-parser.ts` + `src/youtube/url-parser.test.ts`
 - Create: `src/youtube/ytdlp.ts` + `src/youtube/ytdlp.test.ts`
 - Create: `src/youtube/errors.ts` + `src/youtube/errors.test.ts`
@@ -811,6 +819,7 @@ declare module "fastify" {
 - Create: `src/youtube/index.ts` + `src/youtube/index.test.ts`
 
 **Interfaces**
+
 - Consumes: 0.1 (`TrackMeta`, `AudioInfo` from `../types/index.js`); 0.5 (`MediaConfig` re-exported from `../config.js` — already exists as a type in 0.1, so no runtime blocker). `lyrics.ts` re-exports its own `LyricsResult` type that must match the backbone `LyricsResult`.
 - Produces: `parseInput(raw: string): ParsedInput` (`{kind:"video";videoId} | {kind:"query";query} | {kind:"reject";reason}`); `runYtDlp(args: string[], timeoutMs: number, onLine?: (line: string) => void): Promise<YtDlpRun>` (`{stdout;stderr;code}`); `class YouTubeService` with `constructor(cfg: MediaConfig, run?: RunFn)`, `resolve(id): Promise<TrackMeta>`, `search(q, limit?): Promise<TrackMeta[]>`, `related(id): Promise<TrackMeta[]>`, `artistTracks(meta): Promise<TrackMeta[]>`, `download(id, outDir, opts?): Promise<{path: string; audio: AudioInfo | null}>`; `buildClientLadder(configured: string): string[]`; `scaleDownloadTimeout`/`parseAudioInfo`/`parseDownloadProgress`/`DOWNLOAD_PROGRESS_TEMPLATE`; `enum YtErrorKind`, `class YtError`, `classifyYtdlpError(stderr, code): YtError`, `isRetryableAcrossClients(kind): boolean`; `fetchLyrics(meta): Promise<LyricsResult>`, `LYRICS_SOURCE`.
 
@@ -825,11 +834,12 @@ declare module "fastify" {
    - Keep `import type { MediaConfig } from "../config.js";` (config.ts re-exports MediaConfig — Task 0.5).
    - Keep `import type { AudioInfo, TrackMeta } from "../types/index.js";`.
    - Strip any comment phrase mentioning "guild" / "per-guild" / "Discord" if present (the bot's youtube/index.ts is already guild-free; grep to confirm: `grep -niE "guild|discord" src/youtube/index.ts` → expect no hits, so likely a pure copy).
-   No logic changes: `buildClientLadder`, `parseDownloadProgress`, `DOWNLOAD_PROGRESS_TEMPLATE`, `scaleDownloadTimeout`, `parseAudioInfo`, and the `YouTubeService` ladder/download all stay identical.
+     No logic changes: `buildClientLadder`, `parseDownloadProgress`, `DOWNLOAD_PROGRESS_TEMPLATE`, `scaleDownloadTimeout`, `parseAudioInfo`, and the `YouTubeService` ladder/download all stay identical.
 
 4. **Copy `index.test.ts` and PRUNE the import path only** — copy `~/discord-yt-music-bot/src/youtube/index.test.ts`. The only mutation: ensure its config import targets `../config.js` (the bot may import `MediaConfig` from `../types/config-types.js`; rewrite that to `../config.js` since 0.5 re-exports it). All ladder/download/progress test bodies stay verbatim.
 
 5. **Write a FAILING ladder-prune anchor test** — add to `src/youtube/index.test.ts`:
+
    ```ts
    import { buildClientLadder } from "./index.js";
    // ... within a describe("client ladder") block:
@@ -853,16 +863,19 @@ declare module "fastify" {
 ### Task 0.5: Port config.ts as the single env reader (de-Discorded) (PARALLEL)
 
 **Files**
+
 - Create: `src/config.ts`
 - Test: `src/config.test.ts`
 
 **Interfaces**
+
 - Consumes: 0.1 (`MediaConfig`, `StationConfig`, `WebConfig`, `AppConfig` from `./types/index.js`).
 - Produces: `loadConfig(env?: Env): AppConfig` (= `{ media, station, web }`), `loadMediaConfig(env?): MediaConfig`, `loadStationConfig(env?): StationConfig`, `loadWebConfig(env?): WebConfig`, `intEnv`, `strEnv`, plus a re-export `export type { MediaConfig, StationConfig, WebConfig, AppConfig } from "./types/index.js";`. `loadWebConfig` throws unless `VIEWER_PASSWORD` set OR `ALLOW_NO_PASSWORD==="true"`; requires `SESSION_SECRET` length ≥ 32; requires `PUBLIC_BASE_URL` (trailing `/` stripped); `ALLOWED_WS_ORIGINS` defaults to `[publicBaseUrl]`; `TRUST_PROXY==="true"`; `secureCookies = nodeEnv === "production"`. NO Discord token, NO `idleTimeoutMs`, NO `adminUserIds`, NO `clientId`/`clientSecret`/`redirectUri`/`normalizeLoudness`/`sponsorblockRemove`.
 
 **Steps**
 
 1. **Write the FAILING test** — `src/config.test.ts`:
+
    ```ts
    import { describe, it, expect } from "vitest";
    import { loadConfig, loadWebConfig, loadMediaConfig, loadStationConfig } from "./config.js";
@@ -942,6 +955,7 @@ declare module "fastify" {
    Expected failure: `Cannot find module './config.js'`.
 
 3. **Minimal implementation** — `src/config.ts`. Start from `~/discord-yt-music-bot/src/config.ts`, then de-Discord:
+
    ```ts
    import type { MediaConfig, StationConfig, WebConfig, AppConfig } from "./types/index.js";
    import { LEVELS, isValidLevel } from "./util/logger.js";
@@ -1047,6 +1061,7 @@ declare module "fastify" {
      };
    }
    ```
+
    Note vs the bot: removed `loadBotConfig`, `parseAdminIds`, `DISCORD_*`, `idleTimeoutMs`, `normalizeLoudness`, `sponsorblockRemove`, `clientId/secret/redirectUri`; added `viewerPassword`/`allowNoPassword`/`adminPassword` and a `StationConfig` reader.
 
 4. **Run it (expect PASS)** — `npx vitest run src/config.test.ts`
@@ -1057,10 +1072,12 @@ declare module "fastify" {
 ### Task 0.6: Port cache + session-store verbatim (PARALLEL)
 
 **Files**
+
 - Create: `src/cache/index.ts` + `src/cache/index.test.ts`
 - Create: `src/auth/session-store.ts` + `src/auth/session-store.test.ts`
 
 **Interfaces**
+
 - Consumes: 0.1 (`AudioInfo` from `../types/index.js`).
 - Produces: `class AudioCache(dir, maxBytes)` with `init(): Promise<void>`, `has(videoId): boolean`, `get(videoId): string | null`, `getAudio(videoId): AudioInfo | null`, `register(videoId, filePath, audio?)`, `pin(videoId)`, `unpin(videoId)`, `totalBytes(): number`; `class MemorySessionStore(opts?: MemorySessionStoreOpts)` implementing `@fastify/session` `set/get/destroy` + `sweep/size/close` with TTL eviction and an unref'd sweep timer.
 
@@ -1072,6 +1089,7 @@ declare module "fastify" {
    Expected: 2 files green (LRU eviction/pin/register-missing-file; session TTL set/get/destroy/sweep).
 
 3. **Add a FAILING anchor test for the cache LRU contract** — append to `src/cache/index.test.ts` (only if the verbatim file lacks this exact case) a test that registering a non-existent file is a no-op:
+
    ```ts
    it("register() ignores a path that does not exist on disk (no ghost entry)", async () => {
      const cache = new AudioCache("/tmp/lan-jukebox-cache-test-ghost", 1024);
@@ -1090,6 +1108,7 @@ declare module "fastify" {
 ### Task 0.7: Port web reuse leaves + format (PARALLEL)
 
 **Files**
+
 - Create: `web/index.html`, `web/vite.config.ts`, `web/tsconfig.json`, `web/public/favicon.svg`
 - Create: `web/src/main.tsx`, `web/src/vite-env.d.ts`
 - Create: `web/src/lib/format.ts` + `web/src/lib/format.test.ts`
@@ -1099,6 +1118,7 @@ declare module "fastify" {
 - Create: `web/src/components/Preparing.tsx` + `web/src/components/Preparing.test.tsx`
 
 **Interfaces**
+
 - Consumes: 0.1 (`web/src/types.ts` — `TrackMeta`, `AudioInfo`, `PreparingState`).
 - Produces: `fmtTime(totalSec: number | null): string`, `fmtAudio(audio: AudioInfo | null): string | null`; `Thumb({ url: string | null | undefined; size?: number })`; `Grain()`; `Picker({ candidates: TrackMeta[]; onQueueSelected: (videoIds: string[]) => Promise<boolean> | void; onQueued?: () => void; busy?: boolean })`; `Preparing({ preparing: PreparingState | null })`.
 
@@ -1107,6 +1127,7 @@ declare module "fastify" {
 **Steps**
 
 1. **Write the FAILING format test** — `web/src/lib/format.test.ts`:
+
    ```ts
    import { describe, it, expect } from "vitest";
    import { fmtTime, fmtAudio } from "./format.js";
@@ -1125,7 +1146,9 @@ declare module "fastify" {
        expect(fmtAudio({ codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 })).toBe(
          "opus · 160 kbps · 48 kHz",
        );
-       expect(fmtAudio({ codec: "aac", bitrateKbps: 0, sampleRateHz: 44100 })).toBe("aac · 44.1 kHz");
+       expect(fmtAudio({ codec: "aac", bitrateKbps: 0, sampleRateHz: 44100 })).toBe(
+         "aac · 44.1 kHz",
+       );
      });
      it("returns null when given null", () => expect(fmtAudio(null)).toBeNull());
    });
@@ -1198,8 +1221,22 @@ declare module "fastify" {
      import type { TrackMeta } from "../types.js";
 
      const candidates: TrackMeta[] = [
-       { videoId: "aaaaaaaaaaa", title: "One", channel: "C", durationSec: 60, isLive: false, thumbnailUrl: null },
-       { videoId: "bbbbbbbbbbb", title: "Two", channel: "C", durationSec: 90, isLive: false, thumbnailUrl: null },
+       {
+         videoId: "aaaaaaaaaaa",
+         title: "One",
+         channel: "C",
+         durationSec: 60,
+         isLive: false,
+         thumbnailUrl: null,
+       },
+       {
+         videoId: "bbbbbbbbbbb",
+         title: "Two",
+         channel: "C",
+         durationSec: 90,
+         isLive: false,
+         thumbnailUrl: null,
+       },
      ];
 
      describe("Picker", () => {
@@ -1260,20 +1297,23 @@ declare module "fastify" {
 **Steps**
 
 1. **Remove scaffolding scratch files** — delete the Task 0.2 smoke probe + its test so they do not ship:
+
    ```bash
    rm /home/kasm-user/lan-jukebox/src/scaffold-probe.ts /home/kasm-user/lan-jukebox/src/scaffold.smoke.test.ts
    ```
 
 2. **Full verification (must be all-green before debug)** — run from `/home/kasm-user/lan-jukebox`:
+
    ```bash
    npm run typecheck && npm run lint && npm run build && npm test
    ```
+
    Expected output (green):
    - `typecheck`: `tsc -p tsconfig.json --noEmit` clean, `tsc -p tsconfig.test.json --noEmit` clean, `tsc -p web/tsconfig.json` clean — no errors.
    - `lint`: `eslint .` reports 0 problems; `prettier --check .` prints `All matched files use Prettier code style!`.
    - `build`: `vite build web --outDir ../dist/public` emits `dist/public/index.html` + assets; `tsc -p tsconfig.json` emits `dist/**/*.js` for every ported `src/` module with NO errors.
    - `test`: `vitest run` → all Phase-0 files pass. Expected summary roughly `Test Files  ~15 passed`, `Tests  N passed`, `0 failed` (types, util×3, lifecycle, canary, youtube×5, config, cache, session-store, web format + 4 components).
-   If ANY step is red, STOP and fix before proceeding — never commit on red.
+     If ANY step is red, STOP and fix before proceeding — never commit on red.
 
 3. **Adversarial multi-agent debug pass** — invoke the `/debug` (systematic-debugging) workflow across every file changed in this phase. Fan out finder agents over the changed-file set, each on a distinct reliability lens, then adversarially verify each finding before fixing:
    - **Lens A — port fidelity / dead Discord residue:** `grep -RniE "discord|guild|oauth|voice|prism|idle.?timeout|@discordjs" src web` MUST return zero hits (Picker's comment fixed in 0.7; any remaining hit is a confirmed bug).
@@ -1282,7 +1322,7 @@ declare module "fastify" {
    - **Lens D — config invariants (spec §7/§10):** `loadWebConfig` throws on missing `VIEWER_PASSWORD` (unless `ALLOW_NO_PASSWORD=true`), `SESSION_SECRET<32`, missing `PUBLIC_BASE_URL`; `ALLOWED_WS_ORIGINS` defaults to `[publicBaseUrl]`; player-client default is `android_vr,web_embedded,tv` (NOT web/mweb) in BOTH `loadMediaConfig` and `buildClientLadder`. No idle-timeout reader exists.
    - **Lens E — no-discord deps:** `npm ls discord.js @discordjs/voice @discordjs/opus prism-media` shows none present; `package.json` dependencies match the Produces list.
    - **Lens F — test reliability:** no test leaks a real network call (youtube `index.test.ts` injects a fake `RunFn`; canary uses a mocked `resolve`); no unref'd timer keeps vitest alive (session-store sweep `.unref()`'d / `sweepMs:0` in tests); component tests carry the jsdom pragma.
-   For each candidate finding, an adversarial verifier agent reproduces it (re-runs the exact failing command / re-reads the exact lines) before it is accepted; discard unconfirmed findings. Fix every CONFIRMED bug, then re-run step 2's full verification until green again.
+     For each candidate finding, an adversarial verifier agent reproduces it (re-runs the exact failing command / re-reads the exact lines) before it is accepted; discard unconfirmed findings. Fix every CONFIRMED bug, then re-run step 2's full verification until green again.
 
 4. **ONE squash commit for the entire phase** (only after step 2 is green AND step 3 is clean) — this phase produces exactly one commit (overrides the skill's per-task default). On `master` of the new repo:
    ```bash
@@ -1320,7 +1360,7 @@ declare module "fastify" {
 
 ### Parallelization
 
-- **Sequential (shared hub — one editor at a time):** `src/orchestrator/index.ts` (`StationController`). Task 1.5 builds it; Task 1.6 (`RadioEngine`) and Task 1.7 (snapshot) only *consume* its public surface and live in disjoint files, so they may proceed once 1.5's public API is frozen.
+- **Sequential (shared hub — one editor at a time):** `src/orchestrator/index.ts` (`StationController`). Task 1.5 builds it; Task 1.6 (`RadioEngine`) and Task 1.7 (snapshot) only _consume_ its public surface and live in disjoint files, so they may proceed once 1.5's public API is frozen.
 - **Parallel-safe (disjoint files, may run concurrently after types are frozen):** Task 1.1 `src/queue/index.ts`, Task 1.2 `src/orchestrator/settings.ts`, Task 1.3 `src/orchestrator/playlists.ts`, Task 1.4 `src/orchestrator/browser-player-sink.ts`. Task 1.5 depends on all of 1.1–1.4. Task 1.6 `src/radio/index.ts` is fully disjoint from the controller file. Task 1.7 `src/orchestrator/snapshot.ts` is disjoint from the controller file.
 - **Dependency order:** 1.1 → (1.2, 1.3, 1.4 in parallel) → 1.5 → (1.6, 1.7 in parallel) → Phase completion.
 
@@ -1331,10 +1371,12 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 ### Task 1.1: De-guild the pure queue
 
 **Files**
+
 - Create: `src/queue/index.ts`
 - Test: `src/queue/index.test.ts`
 
 **Interfaces**
+
 - Consumes (from `src/types/index.ts`): `QueueItem` (now with `fromRadio: boolean`), `QueueSnapshot`, `Requester`, `TrackMeta`.
 - Produces:
   ```ts
@@ -1363,6 +1405,7 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 **Steps**
 
 1. Write the failing test file `src/queue/index.test.ts`. Real code:
+
    ```ts
    import { describe, it, expect, vi } from "vitest";
    import { Queue } from "./index.js";
@@ -1370,7 +1413,14 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 
    const requester: Requester = { deviceId: "d1", displayName: "u", source: "user" };
    function meta(videoId: string): TrackMeta {
-     return { videoId, title: videoId, channel: "c", durationSec: 100, isLive: false, thumbnailUrl: null };
+     return {
+       videoId,
+       title: videoId,
+       channel: "c",
+       durationSec: 100,
+       isLive: false,
+       thumbnailUrl: null,
+     };
    }
    function newQueue() {
      let n = 0;
@@ -1438,7 +1488,9 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
        await q.add(meta("ccccccccccc"), requester);
        expect(await q.reorder(a.id, 99)).toBe(true);
        expect(q.snapshot().upcoming.map((i) => i.meta.videoId)).toEqual([
-         "bbbbbbbbbbb", "ccccccccccc", "aaaaaaaaaaa",
+         "bbbbbbbbbbb",
+         "ccccccccccc",
+         "aaaaaaaaaaa",
        ]);
      });
 
@@ -1462,7 +1514,10 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
        const n = await q.requeueHistory();
        expect(n).toBe(2);
        expect(q.snapshot().history).toEqual([]);
-       expect(q.snapshot().upcoming.map((i) => i.meta.videoId)).toEqual(["aaaaaaaaaaa", "bbbbbbbbbbb"]);
+       expect(q.snapshot().upcoming.map((i) => i.meta.videoId)).toEqual([
+         "aaaaaaaaaaa",
+         "bbbbbbbbbbb",
+       ]);
        expect(q.current).toBeNull();
      });
 
@@ -1479,12 +1534,15 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    ```
 
 2. Run the test (expected FAIL):
+
    ```
    npx vitest run src/queue/index.test.ts
    ```
+
    Expected failure: `Error: Failed to load url ./index.js` / `Cannot find module './index.js'` (the implementation does not exist yet).
 
 3. Write the minimal implementation `src/queue/index.ts`. Real code (de-guilded copy of the bot's `GuildQueue`):
+
    ```ts
    import { EventEmitter } from "node:events";
    import type { QueueItem, QueueSnapshot, Requester, TrackMeta } from "../types/index.js";
@@ -1644,10 +1702,12 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 ### Task 1.2: Prune settings to surviving fields
 
 **Files**
+
 - Create: `src/orchestrator/settings.ts`
 - Test: `src/orchestrator/settings.test.ts`
 
 **Interfaces**
+
 - Consumes (from `src/types/index.ts`): `StationSettings`, `DEFAULT_SETTINGS`, `RepeatMode`, `AutoplaySource`, `VOLUME_MAX`, `MAX_TRACK_DURATION_CEILING_SEC`.
 - Produces:
   ```ts
@@ -1661,6 +1721,7 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 **Steps**
 
 1. Write the failing test `src/orchestrator/settings.test.ts`:
+
    ```ts
    import { describe, it, expect } from "vitest";
    import { applySettingsPatch } from "./settings.js";
@@ -1679,7 +1740,9 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
        expect(applySettingsPatch(base, { repeat: "all" }).repeat).toBe("all");
        expect(applySettingsPatch(base, { repeat: "bogus" }).repeat).toBe(base.repeat);
        expect(applySettingsPatch(base, { autoplaySource: "artist" }).autoplaySource).toBe("artist");
-       expect(applySettingsPatch(base, { autoplaySource: "x" }).autoplaySource).toBe(base.autoplaySource);
+       expect(applySettingsPatch(base, { autoplaySource: "x" }).autoplaySource).toBe(
+         base.autoplaySource,
+       );
      });
 
      it("clamps + rounds volume to 0..VOLUME_MAX and rejects booleans", () => {
@@ -1706,33 +1769,42 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 
      it("ignores removed fields (idle/crossfade/fx/commandChannel)", () => {
        const out = applySettingsPatch(base, {
-         idleTimeoutSec: 99, crossfadeSec: 5, fx: "bassboost", commandChannelId: "c",
+         idleTimeoutSec: 99,
+         crossfadeSec: 5,
+         fx: "bassboost",
+         commandChannelId: "c",
        } as Partial<Record<keyof StationSettings, unknown>>);
        expect(out).toEqual(base);
-       expect(Object.keys(out).sort()).toEqual(
-         ["autoplay", "autoplaySource", "maxTrackDurationSec", "repeat", "volume"],
-       );
+       expect(Object.keys(out).sort()).toEqual([
+         "autoplay",
+         "autoplaySource",
+         "maxTrackDurationSec",
+         "repeat",
+         "volume",
+       ]);
      });
    });
    ```
 
 2. Run the test (expected FAIL):
+
    ```
    npx vitest run src/orchestrator/settings.test.ts
    ```
+
    Expected failure: `Cannot find module './settings.js'`.
 
 3. Write the minimal implementation `src/orchestrator/settings.ts`:
+
    ```ts
-   import type {
-     AutoplaySource,
-     RepeatMode,
-     StationSettings,
-   } from "../types/index.js";
+   import type { AutoplaySource, RepeatMode, StationSettings } from "../types/index.js";
    import { VOLUME_MAX, MAX_TRACK_DURATION_CEILING_SEC } from "../types/index.js";
 
    const REPEAT_MODES: ReadonlySet<RepeatMode> = new Set<RepeatMode>(["off", "one", "all"]);
-   const AUTOPLAY_SOURCES: ReadonlySet<AutoplaySource> = new Set<AutoplaySource>(["radio", "artist"]);
+   const AUTOPLAY_SOURCES: ReadonlySet<AutoplaySource> = new Set<AutoplaySource>([
+     "radio",
+     "artist",
+   ]);
 
    function clampInt(value: unknown, min: number, max: number, fallback: number): number {
      // Booleans coerce via Number() to 0/1 and would otherwise slip past as "valid" numbers —
@@ -1770,7 +1842,12 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
        maxTrackDurationSec:
          p.maxTrackDurationSec == null
            ? base.maxTrackDurationSec
-           : clampInt(p.maxTrackDurationSec, 0, MAX_TRACK_DURATION_CEILING_SEC, base.maxTrackDurationSec),
+           : clampInt(
+               p.maxTrackDurationSec,
+               0,
+               MAX_TRACK_DURATION_CEILING_SEC,
+               base.maxTrackDurationSec,
+             ),
      };
    }
    ```
@@ -1786,10 +1863,12 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 ### Task 1.3: De-guild PlaylistStore
 
 **Files**
+
 - Create: `src/orchestrator/playlists.ts`
 - Test: `src/orchestrator/playlists.test.ts`
 
 **Interfaces**
+
 - Consumes (from `src/types/index.ts`): `SavedPlaylist`, `PlaylistSummary`, `TrackMeta`; (from `src/util/mutex.js`): `Mutex`.
 - Produces:
   ```ts
@@ -1808,6 +1887,7 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 **Steps**
 
 1. Write the failing test `src/orchestrator/playlists.test.ts`:
+
    ```ts
    import { describe, it, expect, beforeEach, afterEach } from "vitest";
    import { mkdtemp, rm, readFile } from "node:fs/promises";
@@ -1817,11 +1897,22 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    import type { TrackMeta } from "../types/index.js";
 
    function meta(id: string): TrackMeta {
-     return { videoId: id, title: id, channel: "c", durationSec: 10, isLive: false, thumbnailUrl: null };
+     return {
+       videoId: id,
+       title: id,
+       channel: "c",
+       durationSec: 10,
+       isLive: false,
+       thumbnailUrl: null,
+     };
    }
    let dir: string;
-   beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "pl-")); });
-   afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+   beforeEach(async () => {
+     dir = await mkdtemp(join(tmpdir(), "pl-"));
+   });
+   afterEach(async () => {
+     await rm(dir, { recursive: true, force: true });
+   });
 
    describe("PlaylistStore", () => {
      it("saves, lists (newest first), and gets a playlist", async () => {
@@ -1873,12 +1964,15 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    ```
 
 2. Run the test (expected FAIL):
+
    ```
    npx vitest run src/orchestrator/playlists.test.ts
    ```
+
    Expected failure: `Cannot find module './playlists.js'`.
 
 3. Write the minimal implementation `src/orchestrator/playlists.ts`:
+
    ```ts
    import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
    import { join } from "node:path";
@@ -1984,34 +2078,37 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 ### Task 1.4: Browser-player sink adapter (VoiceSession contract over WS)
 
 **Files**
+
 - Create: `src/orchestrator/browser-player-sink.ts`
 - Test: `src/orchestrator/browser-player-sink.test.ts`
 
 **Interfaces**
+
 - Consumes (from `src/types/index.ts`): `ServerPlayerMessage`.
 - Produces:
   ```ts
   export class BrowserPlayerSink extends EventEmitter {
-    play(opts: { audioUrl: string; startMs: number }): void;   // sends {type:"load",...} + {type:"play"}
-    pause(): void;                                              // sends {type:"pause"}
-    resume(): void;                                             // sends {type:"play"}
-    skip(): void;                                               // sends {type:"pause"} (advance is driven by controller, not the sink)
-    seek(ms: number): void;                                     // sends {type:"seek",ms}
-    setVolume(pct: number): void;                               // sends {type:"setVolume",pct}
-    stop(): void;                                               // sends {type:"pause"} (NO teardown — station never ends)
-    relinquish(): void;                                         // sends {type:"pause"} — tells THIS browser it is no longer the speaker (PlayerRegistry calls it on the previous sink, §3.2)
-    destroy(): void;                                            // detaches send; clears listeners
+    play(opts: { audioUrl: string; startMs: number }): void; // sends {type:"load",...} + {type:"play"}
+    pause(): void; // sends {type:"pause"}
+    resume(): void; // sends {type:"play"}
+    skip(): void; // sends {type:"pause"} (advance is driven by controller, not the sink)
+    seek(ms: number): void; // sends {type:"seek",ms}
+    setVolume(pct: number): void; // sends {type:"setVolume",pct}
+    stop(): void; // sends {type:"pause"} (NO teardown — station never ends)
+    relinquish(): void; // sends {type:"pause"} — tells THIS browser it is no longer the speaker (PlayerRegistry calls it on the previous sink, §3.2)
+    destroy(): void; // detaches send; clears listeners
     setSend(send: ((m: ServerPlayerMessage) => void) | null): void;
-    onTrackEnded(): void;                                       // called by ws.ts on client {type:"trackEnded"} → emits 'trackEnd'
-    onPlaybackError(message: string): void;                     // called by ws.ts on client {type:"playbackError"} → emits 'error'
+    onTrackEnded(): void; // called by ws.ts on client {type:"trackEnded"} → emits 'trackEnd'
+    onPlaybackError(message: string): void; // called by ws.ts on client {type:"playbackError"} → emits 'error'
     // events: 'trackEnd'() , 'error'(message: string). NO idle timer / 'idle' event.
   }
   ```
-  This is the `VoiceSession`-shaped sink the controller talks to. Instead of an `@discordjs/voice` `AudioPlayer`, it serializes `ServerPlayerMessage`s through an injectable `send` callback (set by `ws.ts` when a Player connects, `null` when it disconnects). End-of-track and playback-error signals arrive *from the client* (via `onTrackEnded`/`onPlaybackError`) and are re-emitted as `'trackEnd'`/`'error'` for the controller's advance guard — exactly mirroring `VoiceSession`'s `trackEnd`/`error` events. There is deliberately NO idle timer and NO `'idle'` event (spec §3/§4: never stops).
+  This is the `VoiceSession`-shaped sink the controller talks to. Instead of an `@discordjs/voice` `AudioPlayer`, it serializes `ServerPlayerMessage`s through an injectable `send` callback (set by `ws.ts` when a Player connects, `null` when it disconnects). End-of-track and playback-error signals arrive _from the client_ (via `onTrackEnded`/`onPlaybackError`) and are re-emitted as `'trackEnd'`/`'error'` for the controller's advance guard — exactly mirroring `VoiceSession`'s `trackEnd`/`error` events. There is deliberately NO idle timer and NO `'idle'` event (spec §3/§4: never stops).
 
 **Steps**
 
 1. Write the failing test `src/orchestrator/browser-player-sink.test.ts`:
+
    ```ts
    import { describe, it, expect, vi } from "vitest";
    import { BrowserPlayerSink } from "./browser-player-sink.js";
@@ -2098,12 +2195,15 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    ```
 
 2. Run the test (expected FAIL):
+
    ```
    npx vitest run src/orchestrator/browser-player-sink.test.ts
    ```
+
    Expected failure: `Cannot find module './browser-player-sink.js'`.
 
 3. Write the minimal implementation `src/orchestrator/browser-player-sink.ts`:
+
    ```ts
    import { EventEmitter } from "node:events";
    import type { ServerPlayerMessage } from "../types/index.js";
@@ -2194,23 +2294,29 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 ### Task 1.5: StationController (de-guild / de-Discord / no-timeout)
 
 **Files**
+
 - Create: `src/orchestrator/index.ts`
 - Test: `src/orchestrator/index.test.ts`
 - Test: `src/orchestrator/index.playlists.test.ts`
 
 **Interfaces**
+
 - Consumes: 1.1 `Queue`; 1.2 `applySettingsPatch`; 1.3 `PlaylistStore`; 1.4 `BrowserPlayerSink`; (Phase 0) `YouTubeService.download` from `../youtube/index.js`; (Phase 0) `AudioCache` from `../cache/index.js`; (Phase 0) `Mutex`/`Semaphore` from `../util/`; (types) `StationSnapshot`, `CurrentItem`, `PreparingState`, `StationSnapshotFile`, `StationSettings`, `QueueItem`, `TrackMeta`, `Requester`, `AUTOPLAY_REQUESTER`, `DEFAULT_SETTINGS`.
 - Produces:
+
   ```ts
   export interface StationControllerDeps {
     queue?: Queue;
     settings?: Partial<StationSettings>;
-    download: (videoId: string, opts?: { onProgress?: (pct: number) => void }) => Promise<{ path: string }>;
-    pin?: (videoId: string, path: string) => void;     // AudioCache pin/unpin (optional in tests)
+    download: (
+      videoId: string,
+      opts?: { onProgress?: (pct: number) => void },
+    ) => Promise<{ path: string }>;
+    pin?: (videoId: string, path: string) => void; // AudioCache pin/unpin (optional in tests)
     unpin?: (videoId: string) => void;
-    prefetch?: (videoId: string) => Promise<void>;     // best-effort prefetch of the head of upcoming
+    prefetch?: (videoId: string) => Promise<void>; // best-effort prefetch of the head of upcoming
     now?: () => number;
-    onSettingsChanged?: (s: StationSettings) => void;  // host persistence hook
+    onSettingsChanged?: (s: StationSettings) => void; // host persistence hook
   }
   export class StationController extends EventEmitter {
     constructor(deps: StationControllerDeps);
@@ -2219,7 +2325,7 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
     get settings(): StationSettings;
     get seed(): TrackMeta | null;
     get activeSink(): boolean;
-    snapshot(): StationSnapshot;                        // server fills activePlayerPresent/Label + isThisDeviceSpeaker
+    snapshot(): StationSnapshot; // server fills activePlayerPresent/Label + isThisDeviceSpeaker
     enqueue(meta: TrackMeta, requester: Requester): Promise<QueueItem>; // sets seed when requester.source==='user'
     skip(): void;
     pause(): void;
@@ -2232,32 +2338,36 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
     clear(): Promise<void>;
     updateSettings(patch: Partial<Record<keyof StationSettings, unknown>>): StationSettings;
     setVolume(pct: number): StationSettings;
-    attachSink(sink: BrowserPlayerSink): void;          // wires trackEnd/error → advance guard; loads current at position
-    detachSink(): void;                                 // pauses; preserves seed/current/position
-    reportPosition(ms: number): void;                   // Player <audio> telemetry → re-anchor position bookkeeping
+    attachSink(sink: BrowserPlayerSink): void; // wires trackEnd/error → advance guard; loads current at position
+    detachSink(): void; // pauses; preserves seed/current/position
+    reportPosition(ms: number): void; // Player <audio> telemetry → re-anchor position bookkeeping
     setRadioContinuation(fn: (() => Promise<TrackMeta | null>) | null): void; // 1.6 wiring
-    setRadioTopUp(fn: (() => void) | null): void;       // 1.6 proactive top-up on queue 'changed'
-    setUpcomingRadio(items: QueueItem[]): void;         // 1.6 pre-resolved radio buffer for the UI preview
-    listPlaylists(): PlaylistSummary[];                 // delegates to the injected PlaylistStore (Task 1.5 step 7)
-    savePlaylist(name: string): Promise<void>;          // saves current + upcoming metas
+    setRadioTopUp(fn: (() => void) | null): void; // 1.6 proactive top-up on queue 'changed'
+    setUpcomingRadio(items: QueueItem[]): void; // 1.6 pre-resolved radio buffer for the UI preview
+    listPlaylists(): PlaylistSummary[]; // delegates to the injected PlaylistStore (Task 1.5 step 7)
+    savePlaylist(name: string): Promise<void>; // saves current + upcoming metas
     loadPlaylist(name: string, requester: Requester): Promise<number>; // enqueues saved tracks; returns count
     deletePlaylist(name: string): Promise<boolean>;
     restore(file: StationSnapshotFile): Promise<void>;
     // events: 'changed'
   }
   ```
+
   Key behaviors (de-guilded/de-Discorded/no-timeout): single queue (not a guild map); the sink is a `BrowserPlayerSink` not a `VoiceSession`; `enqueue` sets `this._seed = meta` only when `requester.source === "user"`; advance is driven exactly-once off the sink's `'trackEnd'`/`'error'` via a `playGeneration` guard; **there is NO idle timer and NO stop/teardown path** — when the queue drains the controller asks the injected `radioContinuation` (a callback set by `RadioEngine` in 1.6, or a no-op) for the next track and, if none is available, holds in a paused state with `current` preserved. `audioUrl` for the sink is `/audio/${videoId}`.
 
   > **Decoupling note for 1.6:** the controller exposes a settable continuation hook so the radio engine can plug in without a circular import:
+  >
   > ```ts
   > setRadioContinuation(fn: (() => Promise<TrackMeta | null>) | null): void; // returns next radio track, or null
   > setRadioTopUp(fn: (() => void) | null): void; // fire-and-forget proactive top-up on queue 'changed'
   > ```
+  >
   > The default is `null` (no radio) so the controller is fully testable in isolation with a `FakeBrowserPlayer` sink.
 
 **Steps**
 
 1. Write the first failing test `src/orchestrator/index.test.ts` (core/seek/preparing + no-timeout + sink). Real code (abbreviated to the load-bearing cases; FakeBrowserPlayer captures the sink wiring):
+
    ```ts
    import { describe, it, expect, vi } from "vitest";
    import { StationController } from "./index.js";
@@ -2266,7 +2376,14 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 
    const user: Requester = { deviceId: "d1", displayName: "u", source: "user" };
    function meta(id: string, durationSec = 100): TrackMeta {
-     return { videoId: id, title: id, channel: "c", durationSec, isLive: false, thumbnailUrl: null };
+     return {
+       videoId: id,
+       title: id,
+       channel: "c",
+       durationSec,
+       isLive: false,
+       thumbnailUrl: null,
+     };
    }
    function fakeSink() {
      const sent: ServerPlayerMessage[] = [];
@@ -2285,7 +2402,11 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
        const { c } = controller();
        await c.enqueue(meta("aaaaaaaaaaa"), user);
        expect(c.seed?.videoId).toBe("aaaaaaaaaaa");
-       await c.enqueue(meta("bbbbbbbbbbb"), { deviceId: "autoplay", displayName: "Autoplay", source: "autoplay" });
+       await c.enqueue(meta("bbbbbbbbbbb"), {
+         deviceId: "autoplay",
+         displayName: "Autoplay",
+         source: "autoplay",
+       });
        expect(c.seed?.videoId).toBe("aaaaaaaaaaa"); // unchanged by radio adds
      });
 
@@ -2294,9 +2415,13 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
        const { sink, sent } = fakeSink();
        await c.enqueue(meta("aaaaaaaaaaa"), user);
        c.attachSink(sink);
-       await vi.waitFor(() => expect(download).toHaveBeenCalledWith("aaaaaaaaaaa", expect.anything()));
        await vi.waitFor(() =>
-         expect(sent.some((m) => m.type === "load" && m.audioUrl === "/audio/aaaaaaaaaaa")).toBe(true),
+         expect(download).toHaveBeenCalledWith("aaaaaaaaaaa", expect.anything()),
+       );
+       await vi.waitFor(() =>
+         expect(sent.some((m) => m.type === "load" && m.audioUrl === "/audio/aaaaaaaaaaa")).toBe(
+           true,
+         ),
        );
        expect(sent.some((m) => m.type === "play")).toBe(true);
        expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa");
@@ -2381,7 +2506,10 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 
      it("updateSettings clamps via applySettingsPatch and fires onSettingsChanged", async () => {
        const onSettingsChanged = vi.fn();
-       const c = new StationController({ download: vi.fn(async (id) => ({ path: id })), onSettingsChanged });
+       const c = new StationController({
+         download: vi.fn(async (id) => ({ path: id })),
+         onSettingsChanged,
+       });
        const out = c.updateSettings({ volume: 999, repeat: "all" });
        expect(out.volume).toBe(200);
        expect(out.repeat).toBe("all");
@@ -2402,12 +2530,15 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    ```
 
 2. Run the test (expected FAIL):
+
    ```
    npx vitest run src/orchestrator/index.test.ts
    ```
+
    Expected failure: `Cannot find module './index.js'`.
 
 3. Write the minimal implementation `src/orchestrator/index.ts`. Real code:
+
    ```ts
    import { EventEmitter } from "node:events";
    import type {
@@ -2429,7 +2560,10 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    export interface StationControllerDeps {
      queue?: Queue;
      settings?: Partial<StationSettings>;
-     download: (videoId: string, opts?: { onProgress?: (pct: number) => void }) => Promise<{ path: string }>;
+     download: (
+       videoId: string,
+       opts?: { onProgress?: (pct: number) => void },
+     ) => Promise<{ path: string }>;
      pin?: (videoId: string, path: string) => void;
      unpin?: (videoId: string) => void;
      prefetch?: (videoId: string) => Promise<void>;
@@ -2581,16 +2715,26 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
          this.emit("changed");
          return;
        }
-       this.setPreparing({ videoId: item.meta.videoId, title: item.meta.title, phase: "resolving" });
+       this.setPreparing({
+         videoId: item.meta.videoId,
+         title: item.meta.title,
+         phase: "resolving",
+       });
        let path: string;
        try {
          this.setPreparing({
-           videoId: item.meta.videoId, title: item.meta.title, phase: "downloading", percent: 0,
+           videoId: item.meta.videoId,
+           title: item.meta.title,
+           phase: "downloading",
+           percent: 0,
          });
          const res = await this.deps.download(item.meta.videoId, {
            onProgress: (pct) =>
              this.setPreparing({
-               videoId: item.meta.videoId, title: item.meta.title, phase: "downloading", percent: pct,
+               videoId: item.meta.videoId,
+               title: item.meta.title,
+               phase: "downloading",
+               percent: pct,
              }),
          });
          path = res.path;
@@ -2635,7 +2779,8 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
      async seek(positionMs: number): Promise<boolean> {
        const item = this.queue.current;
        if (!item) return false;
-       const max = item.meta.durationSec && item.meta.durationSec > 0 ? item.meta.durationSec * 1000 : 0;
+       const max =
+         item.meta.durationSec && item.meta.durationSec > 0 ? item.meta.durationSec * 1000 : 0;
        if (!Number.isFinite(positionMs) || positionMs < 0 || (max > 0 && positionMs > max)) {
          throw new RangeError("positionMs out of range");
        }
@@ -2732,7 +2877,8 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
          ...(Array.isArray(file.queue) ? file.queue : []),
        ];
        for (const it of items) {
-         if (typeof it?.meta?.videoId !== "string" || typeof it?.requester?.deviceId !== "string") continue;
+         if (typeof it?.meta?.videoId !== "string" || typeof it?.requester?.deviceId !== "string")
+           continue;
          await this.queue.add(it.meta, it.requester, it.fromRadio === true);
        }
        // Promote the first item to "current" without playing (no sink yet on a cold restore).
@@ -2773,12 +2919,15 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    ```
 
 4. Run the test (expected PASS):
+
    ```
    npx vitest run src/orchestrator/index.test.ts
    ```
+
    Expected: `Tests  11 passed (11)` (all core/seek/preparing/no-timeout/sink cases green).
 
 5. Write the failing playlist-delegation test `src/orchestrator/index.playlists.test.ts`. The controller delegates save/load/list/delete to an injected `PlaylistStore`; loading a playlist enqueues its tracks. Add a `playlists?` dep + delegating methods. Real code:
+
    ```ts
    import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
    import { mkdtemp, rm } from "node:fs/promises";
@@ -2790,17 +2939,31 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 
    const user: Requester = { deviceId: "d1", displayName: "u", source: "user" };
    function meta(id: string): TrackMeta {
-     return { videoId: id, title: id, channel: "c", durationSec: 10, isLive: false, thumbnailUrl: null };
+     return {
+       videoId: id,
+       title: id,
+       channel: "c",
+       durationSec: 10,
+       isLive: false,
+       thumbnailUrl: null,
+     };
    }
    let dir: string;
-   beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "stp-")); });
-   afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+   beforeEach(async () => {
+     dir = await mkdtemp(join(tmpdir(), "stp-"));
+   });
+   afterEach(async () => {
+     await rm(dir, { recursive: true, force: true });
+   });
 
    describe("StationController playlists", () => {
      it("savePlaylist captures current+upcoming metas; loadPlaylist enqueues them", async () => {
        const store = new PlaylistStore(dir, () => 1);
        await store.init();
-       const c = new StationController({ download: vi.fn(async (id) => ({ path: id })), playlists: store });
+       const c = new StationController({
+         download: vi.fn(async (id) => ({ path: id })),
+         playlists: store,
+       });
        await c.enqueue(meta("aaaaaaaaaaa"), user);
        await c.enqueue(meta("bbbbbbbbbbb"), user);
        await c.savePlaylist("mix");
@@ -2808,7 +2971,9 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
        await c.clear();
        const n = await c.loadPlaylist("mix", user);
        expect(n).toBe(2);
-       const ids = [c.snapshot().current, ...c.snapshot().upcoming].filter(Boolean).map((i) => i!.meta.videoId);
+       const ids = [c.snapshot().current, ...c.snapshot().upcoming]
+         .filter(Boolean)
+         .map((i) => i!.meta.videoId);
        expect(ids).toContain("aaaaaaaaaaa");
        expect(ids).toContain("bbbbbbbbbbb");
      });
@@ -2816,7 +2981,10 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
      it("deletePlaylist removes it; loadPlaylist of a missing name returns 0", async () => {
        const store = new PlaylistStore(dir, () => 1);
        await store.init();
-       const c = new StationController({ download: vi.fn(async (id) => ({ path: id })), playlists: store });
+       const c = new StationController({
+         download: vi.fn(async (id) => ({ path: id })),
+         playlists: store,
+       });
        await c.enqueue(meta("aaaaaaaaaaa"), user);
        await c.savePlaylist("mix");
        expect(await c.deletePlaylist("mix")).toBe(true);
@@ -2826,12 +2994,15 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    ```
 
 6. Run the test (expected FAIL):
+
    ```
    npx vitest run src/orchestrator/index.playlists.test.ts
    ```
+
    Expected failure: `c.savePlaylist is not a function` (the delegating methods do not exist yet).
 
 7. Add the playlist delegation to `src/orchestrator/index.ts`. Add `playlists?: PlaylistStore;` to `StationControllerDeps` (and `import { PlaylistStore } from "./playlists.js";`), then add these methods to the class:
+
    ```ts
    listPlaylists() {
      return this.deps.playlists ? this.deps.playlists.list() : [];
@@ -2872,10 +3043,12 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 ### Task 1.6: RadioEngine
 
 **Files**
+
 - Create: `src/radio/index.ts`
 - Test: `src/radio/index.test.ts`
 
 **Interfaces**
+
 - Consumes: 1.5 `StationController` (`seed` getter + `enqueue` with `AUTOPLAY_REQUESTER` + `queue`); (Phase 0) `YouTubeService.related`/`artistTracks`; (types) `TrackMeta`, `AutoplaySource`, `QueueItem`, `AUTOPLAY_REQUESTER`.
 - Produces:
   ```ts
@@ -2887,9 +3060,9 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
   }
   export class RadioEngine {
     constructor(deps: RadioDeps);
-    ensureAhead(lowWater?: number): Promise<void>;        // keep >= lowWater (default 1) upcoming; appends radio tracks via station.enqueue(AUTOPLAY_REQUESTER)
-    nextCandidate(): Promise<TrackMeta | null>;           // seed===null → null (cold start); de-dup vs the bounded recent window; never throws
-    reset(): void;                                        // clear the recent window on a new user seed
+    ensureAhead(lowWater?: number): Promise<void>; // keep >= lowWater (default 1) upcoming; appends radio tracks via station.enqueue(AUTOPLAY_REQUESTER)
+    nextCandidate(): Promise<TrackMeta | null>; // seed===null → null (cold start); de-dup vs the bounded recent window; never throws
+    reset(): void; // clear the recent window on a new user seed
   }
   ```
   `youtube.related(videoId)`/`youtube.artistTracks(meta)` return `TrackMeta[]` (best-effort). `nextCandidate()`: returns `null` when `seed === null` (cold start, spec §4), branches the source on `settings().autoplaySource` (`"artist"` → `artistTracks(seed)`, else `related(seed.videoId)`), filters out live tracks and any videoId in the bounded recent-history `Set` (which is seeded from the controller's current/upcoming/history videoIds + everything radio has already picked), adds the chosen id to the window, and never throws (a source error → `null`). No hard chain cap (spec §4: never stops). `reset()` clears the recent `Set` so a fresh user seed gets a clean run.
@@ -2897,6 +3070,7 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 **Steps**
 
 1. Write the failing test `src/radio/index.test.ts`:
+
    ```ts
    import { describe, it, expect, vi } from "vitest";
    import { RadioEngine } from "./index.js";
@@ -2907,18 +3081,27 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    }
    function item(id: string): QueueItem {
      return {
-       id: `q-${id}`, meta: meta(id),
+       id: `q-${id}`,
+       meta: meta(id),
        requester: { deviceId: "d", displayName: "u", source: "user" } as Requester,
-       addedAt: 0, audio: null, fromRadio: false,
+       addedAt: 0,
+       audio: null,
+       fromRadio: false,
      };
    }
-   function fakeStation(seed: TrackMeta | null, snap: { current: QueueItem | null; upcoming: QueueItem[]; history: QueueItem[] }) {
+   function fakeStation(
+     seed: TrackMeta | null,
+     snap: { current: QueueItem | null; upcoming: QueueItem[]; history: QueueItem[] },
+   ) {
      const enqueued: TrackMeta[] = [];
      return {
        station: {
          seed,
          queue: { snapshot: () => snap },
-         enqueue: vi.fn(async (m: TrackMeta) => { enqueued.push(m); return item(m.videoId); }),
+         enqueue: vi.fn(async (m: TrackMeta) => {
+           enqueued.push(m);
+           return item(m.videoId);
+         }),
        },
        enqueued,
      };
@@ -2929,15 +3112,27 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
      it("cold start (seed null) → nextCandidate is null", async () => {
        const related = vi.fn(async () => [meta("rrrrrrrrrrr")]);
        const { station } = fakeStation(null, { current: null, upcoming: [], history: [] });
-       const r = new RadioEngine({ youtube: { related, artistTracks: vi.fn() }, station: station as any, settings: radioSettings });
+       const r = new RadioEngine({
+         youtube: { related, artistTracks: vi.fn() },
+         station: station as any,
+         settings: radioSettings,
+       });
        expect(await r.nextCandidate()).toBeNull();
        expect(related).not.toHaveBeenCalled();
      });
 
      it("radio source pulls related(seed.videoId) and returns the first new non-live track", async () => {
        const related = vi.fn(async () => [meta("sssssssssss"), meta("ttttttttttt")]);
-       const { station } = fakeStation(meta("aaaaaaaaaaa"), { current: null, upcoming: [], history: [] });
-       const r = new RadioEngine({ youtube: { related, artistTracks: vi.fn() }, station: station as any, settings: radioSettings });
+       const { station } = fakeStation(meta("aaaaaaaaaaa"), {
+         current: null,
+         upcoming: [],
+         history: [],
+       });
+       const r = new RadioEngine({
+         youtube: { related, artistTracks: vi.fn() },
+         station: station as any,
+         settings: radioSettings,
+       });
        const c = await r.nextCandidate();
        expect(related).toHaveBeenCalledWith("aaaaaaaaaaa");
        expect(c?.videoId).toBe("sssssssssss");
@@ -2945,9 +3140,14 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 
      it("artist source pulls artistTracks(seed)", async () => {
        const artistTracks = vi.fn(async () => [meta("zzzzzzzzzzz")]);
-       const { station } = fakeStation(meta("aaaaaaaaaaa"), { current: null, upcoming: [], history: [] });
+       const { station } = fakeStation(meta("aaaaaaaaaaa"), {
+         current: null,
+         upcoming: [],
+         history: [],
+       });
        const r = new RadioEngine({
-         youtube: { related: vi.fn(), artistTracks }, station: station as any,
+         youtube: { related: vi.fn(), artistTracks },
+         station: station as any,
          settings: () => ({ autoplay: true, autoplaySource: "artist" }),
        });
        expect((await r.nextCandidate())?.videoId).toBe("zzzzzzzzzzz");
@@ -2955,26 +3155,52 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
      });
 
      it("de-dups vs current/upcoming/history AND skips live tracks", async () => {
-       const related = vi.fn(async () => [meta("aaaaaaaaaaa"), meta("lllllllllll", true), meta("nnnnnnnnnnn")]);
+       const related = vi.fn(async () => [
+         meta("aaaaaaaaaaa"),
+         meta("lllllllllll", true),
+         meta("nnnnnnnnnnn"),
+       ]);
        const { station } = fakeStation(meta("aaaaaaaaaaa"), {
-         current: item("aaaaaaaaaaa"), upcoming: [item("bbbbbbbbbbb")], history: [item("ccccccccccc")],
+         current: item("aaaaaaaaaaa"),
+         upcoming: [item("bbbbbbbbbbb")],
+         history: [item("ccccccccccc")],
        });
-       const r = new RadioEngine({ youtube: { related, artistTracks: vi.fn() }, station: station as any, settings: radioSettings });
+       const r = new RadioEngine({
+         youtube: { related, artistTracks: vi.fn() },
+         station: station as any,
+         settings: radioSettings,
+       });
        expect((await r.nextCandidate())?.videoId).toBe("nnnnnnnnnnn"); // aaa=current, lll=live → skipped
      });
 
      it("does not re-pick the same id across consecutive calls (bounded recent window)", async () => {
        const related = vi.fn(async () => [meta("sssssssssss"), meta("ttttttttttt")]);
-       const { station } = fakeStation(meta("aaaaaaaaaaa"), { current: null, upcoming: [], history: [] });
-       const r = new RadioEngine({ youtube: { related, artistTracks: vi.fn() }, station: station as any, settings: radioSettings });
+       const { station } = fakeStation(meta("aaaaaaaaaaa"), {
+         current: null,
+         upcoming: [],
+         history: [],
+       });
+       const r = new RadioEngine({
+         youtube: { related, artistTracks: vi.fn() },
+         station: station as any,
+         settings: radioSettings,
+       });
        expect((await r.nextCandidate())?.videoId).toBe("sssssssssss");
        expect((await r.nextCandidate())?.videoId).toBe("ttttttttttt");
      });
 
      it("reset() clears the recent window so a fresh seed can re-pick", async () => {
        const related = vi.fn(async () => [meta("sssssssssss")]);
-       const { station } = fakeStation(meta("aaaaaaaaaaa"), { current: null, upcoming: [], history: [] });
-       const r = new RadioEngine({ youtube: { related, artistTracks: vi.fn() }, station: station as any, settings: radioSettings });
+       const { station } = fakeStation(meta("aaaaaaaaaaa"), {
+         current: null,
+         upcoming: [],
+         history: [],
+       });
+       const r = new RadioEngine({
+         youtube: { related, artistTracks: vi.fn() },
+         station: station as any,
+         settings: radioSettings,
+       });
        expect((await r.nextCandidate())?.videoId).toBe("sssssssssss");
        expect(await r.nextCandidate()).toBeNull(); // exhausted (only one candidate, now seen)
        r.reset();
@@ -2982,17 +3208,32 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
      });
 
      it("a source error → null, never throws", async () => {
-       const related = vi.fn(async () => { throw new Error("yt down"); });
-       const { station } = fakeStation(meta("aaaaaaaaaaa"), { current: null, upcoming: [], history: [] });
-       const r = new RadioEngine({ youtube: { related, artistTracks: vi.fn() }, station: station as any, settings: radioSettings });
+       const related = vi.fn(async () => {
+         throw new Error("yt down");
+       });
+       const { station } = fakeStation(meta("aaaaaaaaaaa"), {
+         current: null,
+         upcoming: [],
+         history: [],
+       });
+       const r = new RadioEngine({
+         youtube: { related, artistTracks: vi.fn() },
+         station: station as any,
+         settings: radioSettings,
+       });
        await expect(r.nextCandidate()).resolves.toBeNull();
      });
 
      it("autoplay off → nextCandidate is null (engine idle)", async () => {
        const related = vi.fn(async () => [meta("sssssssssss")]);
-       const { station } = fakeStation(meta("aaaaaaaaaaa"), { current: null, upcoming: [], history: [] });
+       const { station } = fakeStation(meta("aaaaaaaaaaa"), {
+         current: null,
+         upcoming: [],
+         history: [],
+       });
        const r = new RadioEngine({
-         youtube: { related, artistTracks: vi.fn() }, station: station as any,
+         youtube: { related, artistTracks: vi.fn() },
+         station: station as any,
          settings: () => ({ autoplay: false, autoplaySource: "radio" }),
        });
        expect(await r.nextCandidate()).toBeNull();
@@ -3000,27 +3241,52 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
      });
 
      it("ensureAhead(lowWater) appends radio tracks via station.enqueue until upcoming >= lowWater", async () => {
-       const related = vi.fn(async () => [meta("sssssssssss"), meta("ttttttttttt"), meta("uuuuuuuuuuu")]);
-       const snap = { current: item("aaaaaaaaaaa"), upcoming: [] as QueueItem[], history: [] as QueueItem[] };
+       const related = vi.fn(async () => [
+         meta("sssssssssss"),
+         meta("ttttttttttt"),
+         meta("uuuuuuuuuuu"),
+       ]);
+       const snap = {
+         current: item("aaaaaaaaaaa"),
+         upcoming: [] as QueueItem[],
+         history: [] as QueueItem[],
+       };
        const enqueued: TrackMeta[] = [];
        const station = {
          seed: meta("aaaaaaaaaaa"),
          queue: { snapshot: () => snap },
-         enqueue: vi.fn(async (m: TrackMeta) => { enqueued.push(m); snap.upcoming.push(item(m.videoId)); return item(m.videoId); }),
+         enqueue: vi.fn(async (m: TrackMeta) => {
+           enqueued.push(m);
+           snap.upcoming.push(item(m.videoId));
+           return item(m.videoId);
+         }),
        };
-       const r = new RadioEngine({ youtube: { related, artistTracks: vi.fn() }, station: station as any, settings: radioSettings });
+       const r = new RadioEngine({
+         youtube: { related, artistTracks: vi.fn() },
+         station: station as any,
+         settings: radioSettings,
+       });
        await r.ensureAhead(2);
        expect(enqueued.map((m) => m.videoId)).toEqual(["sssssssssss", "ttttttttttt"]);
      });
 
      it("ensureAhead stops cleanly when no new candidate is available", async () => {
        const related = vi.fn(async () => [] as TrackMeta[]);
-       const snap = { current: item("aaaaaaaaaaa"), upcoming: [] as QueueItem[], history: [] as QueueItem[] };
+       const snap = {
+         current: item("aaaaaaaaaaa"),
+         upcoming: [] as QueueItem[],
+         history: [] as QueueItem[],
+       };
        const station = {
-         seed: meta("aaaaaaaaaaa"), queue: { snapshot: () => snap },
+         seed: meta("aaaaaaaaaaa"),
+         queue: { snapshot: () => snap },
          enqueue: vi.fn(async (m: TrackMeta) => item(m.videoId)),
        };
-       const r = new RadioEngine({ youtube: { related, artistTracks: vi.fn() }, station: station as any, settings: radioSettings });
+       const r = new RadioEngine({
+         youtube: { related, artistTracks: vi.fn() },
+         station: station as any,
+         settings: radioSettings,
+       });
        await expect(r.ensureAhead(2)).resolves.toBeUndefined();
        expect(station.enqueue).not.toHaveBeenCalled();
      });
@@ -3028,12 +3294,15 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    ```
 
 2. Run the test (expected FAIL):
+
    ```
    npx vitest run src/radio/index.test.ts
    ```
+
    Expected failure: `Cannot find module './index.js'`.
 
 3. Write the minimal implementation `src/radio/index.ts`:
+
    ```ts
    import type { AutoplaySource, QueueItem, TrackMeta } from "../types/index.js";
    import { AUTOPLAY_REQUESTER } from "../types/index.js";
@@ -3082,7 +3351,9 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
      private seenIds(): Set<string> {
        const seen = new Set<string>(this.recent);
        const snap = this.deps.station.queue.snapshot();
-       const collect = (i: QueueItem | null) => { if (i?.meta?.videoId) seen.add(i.meta.videoId); };
+       const collect = (i: QueueItem | null) => {
+         if (i?.meta?.videoId) seen.add(i.meta.videoId);
+       };
        collect(snap.current);
        snap.upcoming.forEach(collect);
        snap.history.forEach(collect);
@@ -3136,10 +3407,12 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 ### Task 1.7: De-guild snapshot persistence
 
 **Files**
+
 - Create: `src/orchestrator/snapshot.ts`
 - Test: `src/orchestrator/snapshot.test.ts`
 
 **Interfaces**
+
 - Consumes: 1.5 `StationController.snapshot`/`restore`; (types) `StationSnapshotFile`, `QueueItem`, `StationSettings`.
 - Produces:
   ```ts
@@ -3149,8 +3422,8 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
     activePlayerDeviceId: string | null,
     now: number,
   ): StationSnapshotFile;
-  export function writeStationSnapshot(dir: string, file: StationSnapshotFile): Promise<void>;     // atomic tmp+rename
-  export function readStationSnapshot(dir: string): Promise<StationSnapshotFile | null>;            // tolerant/version-guarded
+  export function writeStationSnapshot(dir: string, file: StationSnapshotFile): Promise<void>; // atomic tmp+rename
+  export function readStationSnapshot(dir: string): Promise<StationSnapshotFile | null>; // tolerant/version-guarded
   export function restoreStationSnapshot(
     file: StationSnapshotFile,
     station: { restore(file: StationSnapshotFile): Promise<void> },
@@ -3162,49 +3435,85 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 **Steps**
 
 1. Write the failing test `src/orchestrator/snapshot.test.ts`:
+
    ```ts
    import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
    import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
    import { tmpdir } from "node:os";
    import { join } from "node:path";
    import {
-     collectStationSnapshot, writeStationSnapshot, readStationSnapshot,
-     restoreStationSnapshot, STATION_SNAPSHOT_FILE,
+     collectStationSnapshot,
+     writeStationSnapshot,
+     readStationSnapshot,
+     restoreStationSnapshot,
+     STATION_SNAPSHOT_FILE,
    } from "./snapshot.js";
-   import type { StationSnapshot, StationSettings, TrackMeta, QueueItem, Requester } from "../types/index.js";
+   import type {
+     StationSnapshot,
+     StationSettings,
+     TrackMeta,
+     QueueItem,
+     Requester,
+   } from "../types/index.js";
    import { DEFAULT_SETTINGS } from "../types/index.js";
 
    function meta(id: string): TrackMeta {
-     return { videoId: id, title: id, channel: "c", durationSec: 100, isLive: false, thumbnailUrl: null };
+     return {
+       videoId: id,
+       title: id,
+       channel: "c",
+       durationSec: 100,
+       isLive: false,
+       thumbnailUrl: null,
+     };
    }
    function item(id: string, fromRadio = false): QueueItem {
      return {
-       id: `q-${id}`, meta: meta(id),
+       id: `q-${id}`,
+       meta: meta(id),
        requester: { deviceId: "d", displayName: "u", source: "user" } as Requester,
-       addedAt: 0, audio: null, fromRadio,
+       addedAt: 0,
+       audio: null,
+       fromRadio,
      };
    }
    function fakeStation(snap: Partial<StationSnapshot>): {
-     snapshot(): StationSnapshot; settings: StationSettings; seed: TrackMeta | null;
+     snapshot(): StationSnapshot;
+     settings: StationSettings;
+     seed: TrackMeta | null;
    } {
      const full: StationSnapshot = {
        ...DEFAULT_SETTINGS,
-       current: null, upcoming: [], upcomingRadio: [], history: [],
-       seed: null, paused: false, preparing: null,
-       activePlayerPresent: false, activePlayerLabel: null, ...snap,
+       current: null,
+       upcoming: [],
+       upcomingRadio: [],
+       history: [],
+       seed: null,
+       paused: false,
+       preparing: null,
+       activePlayerPresent: false,
+       activePlayerLabel: null,
+       ...snap,
      };
      return { snapshot: () => full, settings: { ...DEFAULT_SETTINGS }, seed: full.seed };
    }
    let dir: string;
-   beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "snap-")); });
-   afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+   beforeEach(async () => {
+     dir = await mkdtemp(join(tmpdir(), "snap-"));
+   });
+   afterEach(async () => {
+     await rm(dir, { recursive: true, force: true });
+   });
 
    describe("station snapshot persistence", () => {
      it("collectStationSnapshot captures seed/current/position/queue/upcomingRadio/settings + activePlayer", () => {
        const cur = { ...item("aaaaaaaaaaa"), positionMs: 4200, durationMs: 100000 };
        const station = fakeStation({
-         seed: meta("aaaaaaaaaaa"), current: cur,
-         upcoming: [item("bbbbbbbbbbb")], upcomingRadio: [item("rrrrrrrrrrr", true)], history: [item("ccccccccccc")],
+         seed: meta("aaaaaaaaaaa"),
+         current: cur,
+         upcoming: [item("bbbbbbbbbbb")],
+         upcomingRadio: [item("rrrrrrrrrrr", true)],
+         history: [item("ccccccccccc")],
        });
        const file = collectStationSnapshot(station, "dev-7", 999);
        expect(file.version).toBe(1);
@@ -3248,7 +3557,9 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
      });
 
      it("restoreStationSnapshot logs (does not throw) when restore rejects", async () => {
-       const restore = vi.fn(async () => { throw new Error("bad"); });
+       const restore = vi.fn(async () => {
+         throw new Error("bad");
+       });
        const log = { info: vi.fn(), error: vi.fn() };
        const station = fakeStation({});
        const file = collectStationSnapshot(station, null, 1);
@@ -3259,18 +3570,25 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
    ```
 
 2. Run the test (expected FAIL):
+
    ```
    npx vitest run src/orchestrator/snapshot.test.ts
    ```
+
    Expected failure: `Cannot find module './snapshot.js'`.
 
 3. Write the minimal implementation `src/orchestrator/snapshot.ts`:
+
    ```ts
    import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
    import { join } from "node:path";
    import type { Logger } from "pino";
    import type {
-     QueueItem, StationSettings, StationSnapshot, StationSnapshotFile, TrackMeta,
+     QueueItem,
+     StationSettings,
+     StationSnapshot,
+     StationSnapshotFile,
+     TrackMeta,
    } from "../types/index.js";
 
    export const STATION_SNAPSHOT_FILE = "station-snapshot.json";
@@ -3291,8 +3609,12 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
      // strip the live-only positionMs/durationMs off current → a plain QueueItem for persistence.
      const current: QueueItem | null = snap.current
        ? {
-           id: snap.current.id, meta: snap.current.meta, requester: snap.current.requester,
-           addedAt: snap.current.addedAt, audio: snap.current.audio, fromRadio: snap.current.fromRadio,
+           id: snap.current.id,
+           meta: snap.current.meta,
+           requester: snap.current.requester,
+           addedAt: snap.current.addedAt,
+           audio: snap.current.audio,
+           fromRadio: snap.current.fromRadio,
          }
        : null;
      return {
@@ -3309,7 +3631,10 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
      };
    }
 
-   export async function writeStationSnapshot(dir: string, file: StationSnapshotFile): Promise<void> {
+   export async function writeStationSnapshot(
+     dir: string,
+     file: StationSnapshotFile,
+   ): Promise<void> {
      await mkdir(dir, { recursive: true });
      const tmp = join(dir, `${STATION_SNAPSHOT_FILE}.${process.pid}.tmp`);
      await writeFile(tmp, JSON.stringify(file));
@@ -3334,7 +3659,10 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
      try {
        await station.restore(file);
        log.info(
-         { tracks: (file.queue?.length ?? 0) + (file.current ? 1 : 0), seed: file.seed?.videoId ?? null },
+         {
+           tracks: (file.queue?.length ?? 0) + (file.current ? 1 : 0),
+           seed: file.seed?.videoId ?? null,
+         },
          "restored station",
        );
      } catch (err) {
@@ -3354,15 +3682,19 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 ### Task 1.8: Phase completion — full verification, adversarial debug, single squash commit
 
 **Files**
+
 - No new source files; this task verifies and commits all of Phase 1 (Tasks 1.1–1.7).
 
 **Steps**
 
 1. Run the full verification suite from the repo root (`/home/kasm-user/lan-jukebox`):
+
    ```
    npm run typecheck && npm run lint && npm run build && npm test
    ```
+
    Expected green output (shape):
+
    ```
    > tsc -p tsconfig.json --noEmit        # typecheck: no errors
    > eslint .                              # lint: no problems
@@ -3379,6 +3711,7 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
     Test Files  8 passed (8)
          Tests  55 passed (55)
    ```
+
    If anything is red, fix it before proceeding — do NOT commit on red.
 
 2. Run a full adversarial multi-agent `/debug` pass over the Phase 1 changed files. Fan out finder agents across:
@@ -3427,8 +3760,9 @@ All backend code is ESM/NodeNext: every relative import ends in `.js`. Shared ty
 **Goal:** Serve `GET /audio/:trackId` with correct HTTP range/206 semantics — resolve `trackId` (= `videoId`) to a cached file (downloading + transcoding/remuxing first via `YouTubeService.download` + `AudioCache` if missing), choose `Content-Type` from the file's `AudioInfo`, and support full (200) + partial (206) responses with `Accept-Ranges` / `Content-Range` / `Content-Length`, 404 on unresolvable, 416 on an unsatisfiable range.
 
 **Parallelization:**
+
 - **Parallel-safe (fully disjoint, no shared-hub edits):** `src/audio/format.ts` (+ `src/audio/format.test.ts`) and `src/audio/index.ts` (+ `src/audio/index.test.ts`). The whole `src/audio/` module is a standalone Fastify plugin; nothing else in the tree imports it until `server/app.ts` registers it in Phase 4.
-- **Sequential *within* this phase:** Task 2.2 consumes `chooseDelivery` from Task 2.1, so author 2.1 before 2.2. There are no shared hub files to edit in this phase (`sharedHubFiles: none`).
+- **Sequential _within_ this phase:** Task 2.2 consumes `chooseDelivery` from Task 2.1, so author 2.1 before 2.2. There are no shared hub files to edit in this phase (`sharedHubFiles: none`).
 - Both tasks only import from the already-frozen backbone: `src/types/index.ts` (Task 0.1), `src/cache/index.ts` (Task 0.6), `src/youtube/index.ts` (Task 0.4), `src/util/semaphore.ts` (Task 0.3). Those modules must exist (Phase 0/1) before this phase runs.
 
 ESM/NodeNext: every relative import uses the `.js` extension. `noUncheckedIndexedAccess` and `strict` are on. Tests are Vitest (node env), run with `npx vitest run <path>`.
@@ -3440,24 +3774,27 @@ ESM/NodeNext: every relative import uses the `.js` extension. `noUncheckedIndexe
 Pure, dependency-free decision function: given the file's real `AudioInfo` (or `null` when unknown) plus the on-disk file extension, decide the HTTP `Content-Type` and whether the file must be transcoded before serving. Per spec §8: opus/webm and aac/m4a are broadly browser-playable → serve as-is; anything else → transcode to AAC `.m4a` (`audio/mp4`). Also exposes a transcode helper that remuxes/transcodes a source file to a clean `.m4a` via ffmpeg.
 
 **Files**
+
 - Create: `src/audio/format.ts`
 - Test: `src/audio/format.test.ts`
 
 **Interfaces**
 
 Consumes (Task 0.1, `src/types/index.ts`):
+
 ```ts
 export interface AudioInfo {
-  codec: string;        // yt-dlp acodec, e.g. "opus", "aac", "mp4a.40.2", "vorbis", "mp3", "ac-3"
+  codec: string; // yt-dlp acodec, e.g. "opus", "aac", "mp4a.40.2", "vorbis", "mp3", "ac-3"
   bitrateKbps: number;
   sampleRateHz: number;
 }
 ```
 
 Produces (`src/audio/format.ts`):
+
 ```ts
 export interface Delivery {
-  contentType: string;   // a value from MIME_BY_EXT or "audio/mp4" for the transcode target
+  contentType: string; // a value from MIME_BY_EXT or "audio/mp4" for the transcode target
   needsTranscode: boolean;
 }
 
@@ -3494,15 +3831,11 @@ export function transcodeToM4a(
 **Steps**
 
 1. **Write the failing test — extension + codec matrix.** Create `src/audio/format.test.ts`:
+
 ```ts
 import { describe, it, expect, vi } from "vitest";
 import { EventEmitter } from "node:events";
-import {
-  chooseDelivery,
-  transcodeToM4a,
-  MIME_BY_EXT,
-  TRANSCODE_CONTENT_TYPE,
-} from "./format.js";
+import { chooseDelivery, transcodeToM4a, MIME_BY_EXT, TRANSCODE_CONTENT_TYPE } from "./format.js";
 import type { AudioInfo } from "../types/index.js";
 
 const opus: AudioInfo = { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 };
@@ -3585,6 +3918,7 @@ describe("chooseDelivery", () => {
    Expected: `Error: Failed to resolve import "./format.js"` (module does not exist yet) — the whole suite errors / fails to collect.
 
 3. **Minimal implementation — the decision function.** Create `src/audio/format.ts`:
+
 ```ts
 import type { AudioInfo } from "../types/index.js";
 
@@ -3643,6 +3977,7 @@ export function chooseDelivery(audio: AudioInfo | null, ext: string): Delivery {
    Expected: the `chooseDelivery` tests pass, but the import of `transcodeToM4a` is still unresolved if you reference it — at this point the file does not export `transcodeToM4a`, so collection fails with `transcodeToM4a is not a function` (or an unresolved named import). Proceed to step 5.
 
 5. **Write the failing test — transcode spawns ffmpeg with the right args.** Append to `src/audio/format.test.ts`:
+
 ```ts
 describe("transcodeToM4a", () => {
   function fakeFf(exitCode: number) {
@@ -3665,7 +4000,9 @@ describe("transcodeToM4a", () => {
 
   it("invokes ffmpeg with -c:a aac, faststart, mp4 muxer and resolves on exit 0", async () => {
     const { spawnFn } = fakeFf(0);
-    await expect(transcodeToM4a("/in/a.mp3", "/out/a.m4a", spawnFn as never)).resolves.toBeUndefined();
+    await expect(
+      transcodeToM4a("/in/a.mp3", "/out/a.m4a", spawnFn as never),
+    ).resolves.toBeUndefined();
     expect(spawnFn).toHaveBeenCalledTimes(1);
     const [cmd, args] = spawnFn.mock.calls[0]!;
     expect(cmd).toBe("ffmpeg");
@@ -3679,9 +4016,9 @@ describe("transcodeToM4a", () => {
 
   it("rejects with the ffmpeg stderr tail on a non-zero exit", async () => {
     const { spawnFn } = fakeFf(1);
-    await expect(
-      transcodeToM4a("/in/a.mp3", "/out/a.m4a", spawnFn as never),
-    ).rejects.toThrow(/ffmpeg/i);
+    await expect(transcodeToM4a("/in/a.mp3", "/out/a.m4a", spawnFn as never)).rejects.toThrow(
+      /ffmpeg/i,
+    );
   });
 });
 ```
@@ -3690,6 +4027,7 @@ describe("transcodeToM4a", () => {
    Expected: `TypeError: transcodeToM4a is not a function` (not yet exported).
 
 7. **Minimal implementation — the transcode helper.** Append to `src/audio/format.ts`:
+
 ```ts
 import { spawn as nodeSpawn } from "node:child_process";
 
@@ -3730,6 +4068,7 @@ export function transcodeToM4a(
   });
 }
 ```
+
 Move the `import { spawn as nodeSpawn } from "node:child_process";` to the top of the file with the other imports (one import block).
 
 8. **Run it (expect PASS).** `npx vitest run src/audio/format.test.ts`
@@ -3742,12 +4081,14 @@ Move the `import { spawn as nodeSpawn } from "node:child_process";` to the top o
 The streaming route. Validates the `trackId` (= a YouTube `videoId`), ensures the audio file exists in the cache (download-if-missing through the semaphore, register + pin), decides delivery via `chooseDelivery`, transcodes once if needed (caching the transcoded `.m4a`), parses the `Range` header, and streams 200 (full) or 206 (partial) with `Accept-Ranges: bytes`, `Content-Length`, and (for 206) `Content-Range`. 404 when the track can't be resolved/downloaded; 416 on an unsatisfiable range.
 
 **Files**
+
 - Create: `src/audio/index.ts`
 - Test: `src/audio/index.test.ts`
 
 **Interfaces**
 
 Consumes:
+
 - Task 0.6 `src/cache/index.ts` — `AudioCache`:
   ```ts
   has(videoId: string): boolean;
@@ -3766,6 +4107,7 @@ Consumes:
 - Task 0.1 `src/types/index.ts` — `trackId` is a `videoId`; `AudioInfo`.
 
 Produces (`src/audio/index.ts`):
+
 ```ts
 import type { FastifyInstance } from "fastify";
 import type { AudioCache } from "../cache/index.js";
@@ -3793,6 +4135,7 @@ export function parseRange(
 **Steps**
 
 1. **Write the failing test — `parseRange` unit.** Create `src/audio/index.test.ts`:
+
 ```ts
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
@@ -3845,6 +4188,7 @@ describe("parseRange", () => {
    Expected: `Failed to resolve import "./index.js"` — the module / `parseRange` export does not exist.
 
 3. **Minimal implementation — `parseRange`.** Create `src/audio/index.ts` (just the parser + imports for now):
+
 ```ts
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
@@ -3901,6 +4245,7 @@ export function parseRange(
    Expected: the `parseRange` describe block passes (`8 passed`). The route tests below don't exist yet.
 
 5. **Write the failing test — bad trackId → 404 / 400, route registers.** Append the route harness + first test to `src/audio/index.test.ts`:
+
 ```ts
 describe("GET /audio/:trackId", () => {
   let dir: string;
@@ -3954,6 +4299,7 @@ describe("GET /audio/:trackId", () => {
    Expected: `TypeError: registerAudioRoute ... is not a function` or `404` assertions fail because the route is not registered (Fastify returns 404 with no handler, but `download.not.toHaveBeenCalled` may pass by accident; the second test fails because download is never wired). Net: at least the second test fails / collection errors on the missing route logic.
 
 7. **Implement — `ensureFile` + route skeleton (404 paths).** Append to `src/audio/index.ts`:
+
 ```ts
 /**
  * Resolve a videoId to a ready-to-serve file path + Content-Type.
@@ -4019,7 +4365,9 @@ export function registerAudioRoute(app: FastifyInstance, deps: AudioRouteDeps): 
   });
 }
 ```
+
 Add a temporary stub so the file compiles:
+
 ```ts
 async function serveFile(
   reply: FastifyReply,
@@ -4035,33 +4383,35 @@ async function serveFile(
    Expected: both 404 tests pass; `parseRange` still green.
 
 9. **Write the failing test — full body (200) + content-type from a cached opus/webm file.** Append inside the `describe("GET /audio/:trackId")` block:
+
 ```ts
-  async function seedCached(id: string, ext: string, body: Buffer, codec = "opus") {
-    const p = join(dir, `${id}.${ext}`);
-    await writeFile(p, body);
-    cache.register(id, p, { codec, bitrateKbps: 160, sampleRateHz: 48000 });
-  }
+async function seedCached(id: string, ext: string, body: Buffer, codec = "opus") {
+  const p = join(dir, `${id}.${ext}`);
+  await writeFile(p, body);
+  cache.register(id, p, { codec, bitrateKbps: 160, sampleRateHz: 48000 });
+}
 
-  it("serves the full body (200) with Accept-Ranges + Content-Length + Content-Type", async () => {
-    const body = Buffer.from("0123456789abcdef"); // 16 bytes
-    await seedCached(ID, "webm", body);
-    const download = vi.fn(); // must NOT be called — already cached
-    build({ download });
+it("serves the full body (200) with Accept-Ranges + Content-Length + Content-Type", async () => {
+  const body = Buffer.from("0123456789abcdef"); // 16 bytes
+  await seedCached(ID, "webm", body);
+  const download = vi.fn(); // must NOT be called — already cached
+  build({ download });
 
-    const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
-    expect(res.statusCode).toBe(200);
-    expect(res.headers["accept-ranges"]).toBe("bytes");
-    expect(res.headers["content-type"]).toBe("audio/webm");
-    expect(res.headers["content-length"]).toBe("16");
-    expect(res.rawPayload.equals(body)).toBe(true);
-    expect(download).not.toHaveBeenCalled();
-  });
+  const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
+  expect(res.statusCode).toBe(200);
+  expect(res.headers["accept-ranges"]).toBe("bytes");
+  expect(res.headers["content-type"]).toBe("audio/webm");
+  expect(res.headers["content-length"]).toBe("16");
+  expect(res.rawPayload.equals(body)).toBe(true);
+  expect(download).not.toHaveBeenCalled();
+});
 ```
 
 10. **Run it (expect FAIL).** `npx vitest run src/audio/index.test.ts -t "serves the full body"`
     Expected: `expected 500 to be 200` (the `serveFile` stub returns 500).
 
 11. **Implement — `serveFile` full-body path.** Replace the `serveFile` stub in `src/audio/index.ts`:
+
 ```ts
 async function serveFile(
   reply: FastifyReply,
@@ -4105,76 +4455,82 @@ async function serveFile(
     Expected: 200 test green (correct content-type, length, body, no download).
 
 13. **Write the failing test — partial body (206) + Content-Range; and 416 on a bad range.** Append:
+
 ```ts
-  it("serves a partial body (206) with Content-Range for a Range request", async () => {
-    const body = Buffer.from("0123456789abcdef"); // 16 bytes
-    await seedCached(ID, "webm", body);
-    build({ download: vi.fn() });
+it("serves a partial body (206) with Content-Range for a Range request", async () => {
+  const body = Buffer.from("0123456789abcdef"); // 16 bytes
+  await seedCached(ID, "webm", body);
+  build({ download: vi.fn() });
 
-    const res = await app.inject({
-      method: "GET",
-      url: `/audio/${ID}`,
-      headers: { range: "bytes=4-9" },
-    });
-    expect(res.statusCode).toBe(206);
-    expect(res.headers["content-range"]).toBe("bytes 4-9/16");
-    expect(res.headers["content-length"]).toBe("6");
-    expect(res.headers["accept-ranges"]).toBe("bytes");
-    expect(res.rawPayload.equals(Buffer.from("456789"))).toBe(true);
+  const res = await app.inject({
+    method: "GET",
+    url: `/audio/${ID}`,
+    headers: { range: "bytes=4-9" },
   });
+  expect(res.statusCode).toBe(206);
+  expect(res.headers["content-range"]).toBe("bytes 4-9/16");
+  expect(res.headers["content-length"]).toBe("6");
+  expect(res.headers["accept-ranges"]).toBe("bytes");
+  expect(res.rawPayload.equals(Buffer.from("456789"))).toBe(true);
+});
 
-  it("416s with Content-Range bytes */size on an unsatisfiable range", async () => {
-    const body = Buffer.from("0123456789abcdef"); // 16 bytes
-    await seedCached(ID, "webm", body);
-    build({ download: vi.fn() });
+it("416s with Content-Range bytes */size on an unsatisfiable range", async () => {
+  const body = Buffer.from("0123456789abcdef"); // 16 bytes
+  await seedCached(ID, "webm", body);
+  build({ download: vi.fn() });
 
-    const res = await app.inject({
-      method: "GET",
-      url: `/audio/${ID}`,
-      headers: { range: "bytes=100-200" },
-    });
-    expect(res.statusCode).toBe(416);
-    expect(res.headers["content-range"]).toBe("bytes */16");
+  const res = await app.inject({
+    method: "GET",
+    url: `/audio/${ID}`,
+    headers: { range: "bytes=100-200" },
   });
+  expect(res.statusCode).toBe(416);
+  expect(res.headers["content-range"]).toBe("bytes */16");
+});
 ```
 
 14. **Run it (expect PASS — logic already implemented in step 11).** `npx vitest run src/audio/index.test.ts -t "partial body"` then `-t "unsatisfiable range"`
     Expected: both green. (These exercise the 206 + 416 branches already written; if either fails, the bug is in `serveFile`, fix there.)
 
 15. **Write the failing test — download-if-missing path (resolve → register → pin → serve).** Append:
-```ts
-  it("downloads, registers + pins, then serves when the track is not cached", async () => {
-    const body = Buffer.from("transcode-me-not-opus"); // arbitrary bytes
-    // download() writes the file into cacheDir and returns its real path + AudioInfo
-    const download = vi.fn(async (videoId: string, outDir: string) => {
-      const p = join(outDir, `${videoId}.webm`);
-      await writeFile(p, body);
-      return { path: p, audio: { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 } };
-    });
-    build({ download });
 
-    expect(cache.has(ID)).toBe(false);
-    const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
-    expect(res.statusCode).toBe(200);
-    expect(res.headers["content-type"]).toBe("audio/webm");
-    expect(res.rawPayload.equals(body)).toBe(true);
-    expect(download).toHaveBeenCalledTimes(1);
-    expect(download).toHaveBeenCalledWith(ID, dir);
-    // registered + pinned: a second request must NOT re-download.
-    expect(cache.has(ID)).toBe(true);
-    const res2 = await app.inject({ method: "GET", url: `/audio/${ID}` });
-    expect(res2.statusCode).toBe(200);
-    expect(download).toHaveBeenCalledTimes(1);
+```ts
+it("downloads, registers + pins, then serves when the track is not cached", async () => {
+  const body = Buffer.from("transcode-me-not-opus"); // arbitrary bytes
+  // download() writes the file into cacheDir and returns its real path + AudioInfo
+  const download = vi.fn(async (videoId: string, outDir: string) => {
+    const p = join(outDir, `${videoId}.webm`);
+    await writeFile(p, body);
+    return { path: p, audio: { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 } };
   });
+  build({ download });
+
+  expect(cache.has(ID)).toBe(false);
+  const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
+  expect(res.statusCode).toBe(200);
+  expect(res.headers["content-type"]).toBe("audio/webm");
+  expect(res.rawPayload.equals(body)).toBe(true);
+  expect(download).toHaveBeenCalledTimes(1);
+  expect(download).toHaveBeenCalledWith(ID, dir);
+  // registered + pinned: a second request must NOT re-download.
+  expect(cache.has(ID)).toBe(true);
+  const res2 = await app.inject({ method: "GET", url: `/audio/${ID}` });
+  expect(res2.statusCode).toBe(200);
+  expect(download).toHaveBeenCalledTimes(1);
+});
 ```
 
 16. **Run it (expect PASS — `ensureFile` already implements this in step 7).** `npx vitest run src/audio/index.test.ts -t "downloads, registers"`
     Expected: green — confirms the download-once + register + pin + second-request-from-cache behavior.
 
 17. **Write the failing test — transcode path: non-playable source served as audio/mp4.** Append (inject a fake `transcodeToM4a` by spying on the module is heavy; instead seed a cached source whose codec forces a transcode and assert the route invokes ffmpeg via a mock at the `format` boundary). Use `vi.mock`:
+
 ```ts
+
 ```
+
 Add at the TOP of `src/audio/index.test.ts` (module-level), before the imports of `./index.js`:
+
 ```ts
 vi.mock("./format.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./format.js")>();
@@ -4189,33 +4545,35 @@ vi.mock("./format.js", async (importOriginal) => {
   };
 });
 ```
+
 Then append the test:
+
 ```ts
-  it("transcodes a non-playable source and serves it as audio/mp4", async () => {
-    const body = Buffer.from("fake-mp3-bytes");
-    // mp3 codec in an mp3 container -> chooseDelivery returns needsTranscode:true
-    await seedCached(ID, "mp3", body, "mp3");
-    build({ download: vi.fn() });
+it("transcodes a non-playable source and serves it as audio/mp4", async () => {
+  const body = Buffer.from("fake-mp3-bytes");
+  // mp3 codec in an mp3 container -> chooseDelivery returns needsTranscode:true
+  await seedCached(ID, "mp3", body, "mp3");
+  build({ download: vi.fn() });
 
-    const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
-    expect(res.statusCode).toBe(200);
-    expect(res.headers["content-type"]).toBe("audio/mp4");
-    // body is the copied-through transcode output (our mock copies bytes 1:1)
-    expect(res.rawPayload.equals(body)).toBe(true);
+  const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
+  expect(res.statusCode).toBe(200);
+  expect(res.headers["content-type"]).toBe("audio/mp4");
+  // body is the copied-through transcode output (our mock copies bytes 1:1)
+  expect(res.rawPayload.equals(body)).toBe(true);
 
-    const { transcodeToM4a } = await import("./format.js");
-    expect(transcodeToM4a).toHaveBeenCalledTimes(1);
+  const { transcodeToM4a } = await import("./format.js");
+  expect(transcodeToM4a).toHaveBeenCalledTimes(1);
 
-    // second request reuses the cached transcode (no second ffmpeg call)
-    const res2 = await app.inject({
-      method: "GET",
-      url: `/audio/${ID}`,
-      headers: { range: "bytes=0-3" },
-    });
-    expect(res2.statusCode).toBe(206);
-    expect(res2.headers["content-type"]).toBe("audio/mp4");
-    expect((transcodeToM4a as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+  // second request reuses the cached transcode (no second ffmpeg call)
+  const res2 = await app.inject({
+    method: "GET",
+    url: `/audio/${ID}`,
+    headers: { range: "bytes=0-3" },
   });
+  expect(res2.statusCode).toBe(206);
+  expect(res2.headers["content-type"]).toBe("audio/mp4");
+  expect((transcodeToM4a as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+});
 ```
 
 18. **Run it (expect PASS — transcode branch already implemented in step 7).** `npx vitest run src/audio/index.test.ts -t "transcodes a non-playable"`
@@ -4231,28 +4589,32 @@ Then append the test:
 This single task closes the phase: one full verification, one adversarial debug pass, one squash commit. **Do NOT commit in any earlier task.**
 
 1. **Full verification (expect all green).** Run from the repo root:
+
 ```bash
 npm run typecheck && npm run lint && npm run build && npm test
 ```
-   Expected output (shape):
-   - `tsc --noEmit` (typecheck) — no errors.
-   - `eslint .` — no errors/warnings (the `noUncheckedIndexedAccess` non-null assertions in `format.ts`/`index.ts` are intentional and pass).
-   - `tsc -p tsconfig.json` / `vite build` (build) — emits `dist/` with no errors.
-   - `vitest run` — `src/audio/format.test.ts` + `src/audio/index.test.ts` both pass; full suite green, e.g. `Test Files N passed`, `Tests M passed`.
-   If anything is red, fix it before continuing — do not commit on red.
+
+Expected output (shape):
+
+- `tsc --noEmit` (typecheck) — no errors.
+- `eslint .` — no errors/warnings (the `noUncheckedIndexedAccess` non-null assertions in `format.ts`/`index.ts` are intentional and pass).
+- `tsc -p tsconfig.json` / `vite build` (build) — emits `dist/` with no errors.
+- `vitest run` — `src/audio/format.test.ts` + `src/audio/index.test.ts` both pass; full suite green, e.g. `Test Files N passed`, `Tests M passed`.
+  If anything is red, fix it before continuing — do not commit on red.
 
 2. **Adversarial multi-agent debug pass.** Invoke the `/debug` flow over the files changed in this phase:
    - **Changed files:** `src/audio/format.ts`, `src/audio/format.test.ts`, `src/audio/index.ts`, `src/audio/index.test.ts`.
    - **Fan out finder agents**, one per file plus these reliability lenses applied across all four:
-     - *Range/HTTP correctness:* off-by-one in `Content-Range`/`Content-Length` (end inclusive), suffix-range `bytes=-N` with `N > size`, `bytes=0-` open range, `bytes=0-0` (1 byte), zero-length file, `start === size` boundary, multi-range rejection, header casing.
-     - *Resource leaks:* `createReadStream` not destroyed when the client aborts mid-stream; ffmpeg child not killed on a failed/abandoned transcode; partial `.transcoded.m4a` left on disk after a transcode error (should not be registered — verify `register` skips a missing/0-byte file per `statSyncSafe`).
-     - *Concurrency:* two simultaneous requests for the same uncached `trackId` both calling `download` (thundering herd) — is a per-videoId in-flight guard needed, or is double-download tolerable because `register` is idempotent? Confirm `Semaphore` bounds concurrency but does NOT dedupe; decide + document.
-     - *Cache/path safety:* `trackId` path traversal (guarded by `VIDEO_ID_RE` — verify the regex is anchored `^...$`), `extname` on a dotless filename, transcoded key (`<id>.m4a`) colliding with a real `videoId` cache key.
-     - *Error mapping:* `YtError` from `download` → 404 (not 500); `stat` race (file evicted between `cache.get` and `stat`) → 404 not a 500 crash.
+     - _Range/HTTP correctness:_ off-by-one in `Content-Range`/`Content-Length` (end inclusive), suffix-range `bytes=-N` with `N > size`, `bytes=0-` open range, `bytes=0-0` (1 byte), zero-length file, `start === size` boundary, multi-range rejection, header casing.
+     - _Resource leaks:_ `createReadStream` not destroyed when the client aborts mid-stream; ffmpeg child not killed on a failed/abandoned transcode; partial `.transcoded.m4a` left on disk after a transcode error (should not be registered — verify `register` skips a missing/0-byte file per `statSyncSafe`).
+     - _Concurrency:_ two simultaneous requests for the same uncached `trackId` both calling `download` (thundering herd) — is a per-videoId in-flight guard needed, or is double-download tolerable because `register` is idempotent? Confirm `Semaphore` bounds concurrency but does NOT dedupe; decide + document.
+     - _Cache/path safety:_ `trackId` path traversal (guarded by `VIDEO_ID_RE` — verify the regex is anchored `^...$`), `extname` on a dotless filename, transcoded key (`<id>.m4a`) colliding with a real `videoId` cache key.
+     - _Error mapping:_ `YtError` from `download` → 404 (not 500); `stat` race (file evicted between `cache.get` and `stat`) → 404 not a 500 crash.
    - **Adversarially verify each finding** with a failing test before fixing (write the red test, confirm it reproduces, then fix, then green). Reject findings that can't be reproduced.
    - **Fix all confirmed bugs**, re-running `npx vitest run src/audio/` after each fix, then re-run the full verification command from step 1 to confirm still-green.
 
 3. **One squash commit for the whole phase.** After verification is green and all confirmed debug findings are fixed:
+
 ```bash
 git add src/audio/format.ts src/audio/format.test.ts src/audio/index.ts src/audio/index.test.ts
 git commit -m "$(cat <<'EOF'
@@ -4274,7 +4636,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
 EOF
 )"
 ```
-   Per the one-commit-per-phase rule (overrides the skill's per-task default): exactly this one commit closes Phase 2. Do not push unless the user asks.
+
+Per the one-commit-per-phase rule (overrides the skill's per-task default): exactly this one commit closes Phase 2. Do not push unless the user asks.
 
 ---
 
@@ -4293,10 +4656,12 @@ EOF
 ### Task 3.1: Device registry persistence
 
 **Files**
+
 - Create: `src/players/persist.ts`
 - Test: covered indirectly by `src/players/registry.test.ts` (3.2) and directly by inline cases added below; create `src/players/persist.test.ts`
 
 **Interfaces**
+
 - Consumes (from §0.1 `src/types/index.ts`):
   - `interface DeviceRecord { deviceId: string; label: string; lastSeen: number; isPreferredSpeaker: boolean }`
   - `interface DeviceRegistryFile { version: 1; savedAt: number; devices: DeviceRecord[] }`
@@ -4308,17 +4673,14 @@ EOF
 **Steps**
 
 1. **Write the FAILING test (round-trip).** Create `src/players/persist.test.ts`:
+
    ```ts
    import { mkdtemp, readFile, rm } from "node:fs/promises";
    import { tmpdir } from "node:os";
    import { join } from "node:path";
    import { afterEach, beforeEach, describe, expect, it } from "vitest";
    import type { DeviceRegistryFile } from "../types/index.js";
-   import {
-     DEVICE_REGISTRY_FILE,
-     readDeviceRegistry,
-     writeDeviceRegistry,
-   } from "./persist.js";
+   import { DEVICE_REGISTRY_FILE, readDeviceRegistry, writeDeviceRegistry } from "./persist.js";
 
    let dir: string;
    beforeEach(async () => {
@@ -4355,6 +4717,7 @@ EOF
 2. **Run it — expect FAIL.** Command: `npx vitest run src/players/persist.test.ts`. Expected failure: `Failed to resolve import "./persist.js"` / `Cannot find module './persist.js'` (file does not exist yet).
 
 3. **Minimal implementation (write + filename).** Create `src/players/persist.ts`:
+
    ```ts
    import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
    import { join } from "node:path";
@@ -4363,10 +4726,7 @@ EOF
    export const DEVICE_REGISTRY_FILE = "device-registry.json";
 
    /** Atomic write: stage to a tmp sibling, then rename over the target. */
-   export async function writeDeviceRegistry(
-     dir: string,
-     file: DeviceRegistryFile,
-   ): Promise<void> {
+   export async function writeDeviceRegistry(dir: string, file: DeviceRegistryFile): Promise<void> {
      await mkdir(dir, { recursive: true });
      const target = join(dir, DEVICE_REGISTRY_FILE);
      const tmp = `${target}.tmp`;
@@ -4374,9 +4734,7 @@ EOF
      await rename(tmp, target); // atomic swap
    }
 
-   export async function readDeviceRegistry(
-     _dir: string,
-   ): Promise<DeviceRegistryFile | null> {
+   export async function readDeviceRegistry(_dir: string): Promise<DeviceRegistryFile | null> {
      return null;
    }
    ```
@@ -4384,10 +4742,9 @@ EOF
 4. **Run it — round-trip still fails, filename passes.** Command: `npx vitest run src/players/persist.test.ts`. Expected: the "writes to the documented filename" test PASSES; the "writes then reads back" test FAILS with `expected null to deeply equal { version: 1, ... }` (read is stubbed to `null`).
 
 5. **Implement the tolerant, version-guarded read.** Replace the `readDeviceRegistry` body in `src/players/persist.ts`:
+
    ```ts
-   export async function readDeviceRegistry(
-     dir: string,
-   ): Promise<DeviceRegistryFile | null> {
+   export async function readDeviceRegistry(dir: string): Promise<DeviceRegistryFile | null> {
      try {
        const raw = await readFile(join(dir, DEVICE_REGISTRY_FILE), "utf8");
        const parsed = JSON.parse(raw) as DeviceRegistryFile;
@@ -4402,6 +4759,7 @@ EOF
 6. **Run it — expect PASS.** Command: `npx vitest run src/players/persist.test.ts`. Expected: both tests PASS (`2 passed`).
 
 7. **Write FAILING tolerance tests (missing file, corrupt JSON, wrong version).** Append to `src/players/persist.test.ts`:
+
    ```ts
    import { writeFile } from "node:fs/promises";
 
@@ -4432,10 +4790,12 @@ EOF
 ### Task 3.2: DeviceRegistry + PlayerStateMachine
 
 **Files**
+
 - Create: `src/players/registry.ts`
 - Test: `src/players/registry.test.ts`
 
 **Interfaces**
+
 - Consumes:
   - 3.1: `writeDeviceRegistry(dir, file)`, `readDeviceRegistry(dir)`.
   - §0.1: `DeviceRecord`, `DeviceRegistryFile`, `AUTOPLAY_REQUESTER` (not used here), `StationSnapshot`.
@@ -4457,27 +4817,29 @@ EOF
   }
   class PlayerRegistry {
     constructor(deps: PlayerRegistryDeps);
-    init(): Promise<void>;                       // load persisted registry from dir
+    init(): Promise<void>; // load persisted registry from dir
     touch(deviceId: string, label: string): void; // upsert lastSeen + label
     get activePlayerDeviceId(): string | null;
-    get activePlayerLabel(): string | null;       // label of the active device, or null
+    get activePlayerLabel(): string | null; // label of the active device, or null
     claim(deviceId: string, sink: BrowserPlayerSink): void; // manual designate (WS path — needs the socket sink)
-    release(deviceId: string): { activePlayerDeviceId: string | null };  // active device steps down (REST-callable, no sink)
+    release(deviceId: string): { activePlayerDeviceId: string | null }; // active device steps down (REST-callable, no sink)
     remember(deviceId: string): { activePlayerDeviceId: string | null }; // isPreferredSpeaker = true, persist (REST-callable)
-    forget(deviceId: string): { activePlayerDeviceId: string | null };   // isPreferredSpeaker = false, persist (REST-callable)
+    forget(deviceId: string): { activePlayerDeviceId: string | null }; // isPreferredSpeaker = false, persist (REST-callable)
     onConnect(deviceId: string, sink: BrowserPlayerSink): void; // auto-select if preferred & none active
-    onDisconnect(deviceId: string): void;         // active -> null, station preserved paused
+    onDisconnect(deviceId: string): void; // active -> null, station preserved paused
     isSpeaker(deviceId: string): boolean;
   }
   ```
   > `claim` requires the per-socket `BrowserPlayerSink`, so it is reachable only from the WS `becomePlayer` handler (Task 3.4) — NOT from REST (`/api/speaker` has no socket sink). `release`/`remember`/`forget` need no sink and return `{ activePlayerDeviceId }`, so they back BOTH the WS handler and the REST `/api/speaker` route (Task 4.2). The REST "claim" action is therefore satisfied by the UI sending the WS `becomePlayer` frame, not a REST call.
   ```ts
+
   ```
   **Invariant:** at most one active player. Every `claim`/`onConnect`-that-auto-selects first relinquishes the previous active sink (`prevSink.relinquish()`) and calls `station.detachSink()` before `station.attachSink(newSink)`.
 
 **Steps**
 
 1. **Write FAILING test — touch upserts a device.** Create `src/players/registry.test.ts`:
+
    ```ts
    import { mkdtemp, rm } from "node:fs/promises";
    import { tmpdir } from "node:os";
@@ -4524,12 +4886,9 @@ EOF
 2. **Run it — expect FAIL.** Command: `npx vitest run src/players/registry.test.ts`. Expected: `Cannot find module './registry.js'`.
 
 3. **Minimal implementation — constructor/init/touch + persist.** Create `src/players/registry.ts`:
+
    ```ts
-   import type {
-     DeviceRecord,
-     DeviceRegistryFile,
-     StationSnapshot,
-   } from "../types/index.js";
+   import type { DeviceRecord, DeviceRegistryFile, StationSnapshot } from "../types/index.js";
    import { readDeviceRegistry, writeDeviceRegistry } from "./persist.js";
 
    /** Per-socket audio sink the registry forwards to the station + can relinquish. */
@@ -4567,9 +4926,7 @@ EOF
 
      async init(): Promise<void> {
        const file = await readDeviceRegistry(this.dir);
-       this.devices = new Map(
-         (file?.devices ?? []).map((d) => [d.deviceId, { ...d }]),
-       );
+       this.devices = new Map((file?.devices ?? []).map((d) => [d.deviceId, { ...d }]));
      }
 
      private toFile(): DeviceRegistryFile {
@@ -4626,11 +4983,13 @@ EOF
      }
    }
    ```
+
    > Note: `BrowserPlayerSink` (§1.4) is structurally compatible with `RegistrySink` (it exposes `relinquish()`); 3.4 passes the real sink. `persist()` is fire-and-forget (`void`) so `touch` stays synchronous per the interface.
 
 4. **Run it — expect PASS.** Command: `npx vitest run src/players/registry.test.ts`. Expected: the touch test PASSES (`1 passed`).
 
 5. **Write FAILING test — manual `claim` designates and loads.** Append:
+
    ```ts
    describe("PlayerRegistry.claim (manual designate)", () => {
      it("attaches the new sink, resumes, and exposes the active device + label", async () => {
@@ -4667,6 +5026,7 @@ EOF
 6. **Run it — expect FAIL.** Command: `npx vitest run src/players/registry.test.ts`. Expected: FAIL — `expected "spy" to be called with arguments: [ {...} ]` / `expected null to be 'd1'` (claim is a no-op stub).
 
 7. **Implement `claim`.** Replace the `claim` stub in `src/players/registry.ts`:
+
    ```ts
      claim(deviceId: string, sink: RegistrySink): void {
        if (this._activeDeviceId === deviceId && this.activeSink === sink) {
@@ -4691,6 +5051,7 @@ EOF
 8. **Run it — expect PASS.** Command: `npx vitest run src/players/registry.test.ts`. Expected: all claim tests PASS.
 
 9. **Write FAILING test — `release` clears + preserves paused, `remember`/`forget` persist.** Append:
+
    ```ts
    describe("PlayerRegistry.release / remember / forget", () => {
      it("release clears the active player and pauses the station (preserved)", async () => {
@@ -4733,6 +5094,7 @@ EOF
 10. **Run it — expect FAIL.** Command: `npx vitest run src/players/registry.test.ts`. Expected: FAIL — `expected "spy" to be called` (pause/detach not invoked) and `expected undefined to be true` (remember is a stub).
 
 11. **Implement `release`, `remember`, `forget`.** Replace those three stubs in `src/players/registry.ts`:
+
     ```ts
       release(deviceId: string): { activePlayerDeviceId: string | null } {
         if (this._activeDeviceId !== deviceId) return { activePlayerDeviceId: this._activeDeviceId };
@@ -4760,11 +5122,13 @@ EOF
         return { activePlayerDeviceId: this._activeDeviceId };
       }
     ```
+
     > The return value powers the REST `/api/speaker` response (`SpeakerResponse { ok, activePlayerDeviceId }`, Task 4.2); the WS handler ignores it. `remember`/`forget` of an unknown device is a no-op that still reports the current active player.
 
 12. **Run it — expect PASS.** Command: `npx vitest run src/players/registry.test.ts`. Expected: all release/remember/forget tests PASS.
 
 13. **Write FAILING test — `onConnect` auto-selects a remembered speaker only when none active.** Append:
+
     ```ts
     describe("PlayerRegistry.onConnect (auto-select device memory)", () => {
       it("auto-designates a preferred speaker when no player is active", async () => {
@@ -4825,6 +5189,7 @@ EOF
 14. **Run it — expect FAIL.** Command: `npx vitest run src/players/registry.test.ts`. Expected: FAIL — `expected null to be 'd1'` (onConnect is a no-op stub).
 
 15. **Implement `onConnect`.** Replace the stub in `src/players/registry.ts`:
+
     ```ts
       onConnect(deviceId: string, sink: RegistrySink): void {
         const rec = this.devices.get(deviceId);
@@ -4838,6 +5203,7 @@ EOF
 16. **Run it — expect PASS.** Command: `npx vitest run src/players/registry.test.ts`. Expected: all onConnect tests PASS.
 
 17. **Write FAILING test — `onDisconnect` nulls the active player and preserves a paused station.** Append:
+
     ```ts
     describe("PlayerRegistry.onDisconnect", () => {
       it("active player disconnect -> null + station paused (preserved)", async () => {
@@ -4878,6 +5244,7 @@ EOF
 18. **Run it — expect FAIL.** Command: `npx vitest run src/players/registry.test.ts`. Expected: FAIL — `expected 'd1' to be null` (onDisconnect is a no-op stub).
 
 19. **Implement `onDisconnect`.** Replace the stub in `src/players/registry.ts`:
+
     ```ts
       onDisconnect(deviceId: string): void {
         if (this._activeDeviceId !== deviceId) return;
@@ -4896,10 +5263,12 @@ EOF
 ### Task 3.3: StationBroadcaster + targeted player send
 
 **Files**
+
 - Create: `src/server/ws.ts` (the broadcaster portion only; the `/ws` handler is added in 3.4)
 - Test: `src/server/ws.test.ts` (broadcaster unit cases; the `boot()` WS integration cases come in 3.4)
 
 **Interfaces**
+
 - Consumes:
   - §0.1: `StationSnapshot`, `ServerBroadcastMessage` (`{type:'state',state}` | `{type:'trackError',...}`), `ServerPlayerMessage` (`load`/`play`/`pause`/`seek`/`setVolume`), `ServerWsMessage = ServerBroadcastMessage | ServerPlayerMessage`.
   - §1.5: `StationController` — emits `'changed'` and exposes `snapshot(): StationSnapshot`.
@@ -4910,8 +5279,8 @@ EOF
   export class StationBroadcaster {
     subscribe(send: Send): void;
     unsubscribe(send: Send): void;
-    broadcast(msg: ServerBroadcastMessage): void;        // to all subscribers
-    attach(station: StationLike): void;                   // wire station 'changed' -> broadcast state
+    broadcast(msg: ServerBroadcastMessage): void; // to all subscribers
+    attach(station: StationLike): void; // wire station 'changed' -> broadcast state
   }
   ```
   Targeted player send is NOT a broadcaster method — a single active Player's `Send` is held by the registry's sink (3.2/3.4); `ServerPlayerMessage`s go straight down that one socket. The broadcaster only fans out `ServerBroadcastMessage`.
@@ -4919,6 +5288,7 @@ EOF
 **Steps**
 
 1. **Write FAILING test — origin allow-list helper.** Create `src/server/ws.test.ts`:
+
    ```ts
    import { describe, expect, it, vi } from "vitest";
    import type { StationSnapshot } from "../types/index.js";
@@ -4943,7 +5313,9 @@ EOF
 
    describe("isAllowedOrigin", () => {
      it("accepts an exact match", () => {
-       expect(isAllowedOrigin("https://radio.waterburp.com", ["https://radio.waterburp.com"])).toBe(true);
+       expect(isAllowedOrigin("https://radio.waterburp.com", ["https://radio.waterburp.com"])).toBe(
+         true,
+       );
      });
      it("rejects a mismatch and undefined", () => {
        expect(isAllowedOrigin("https://evil.example", ["https://radio.waterburp.com"])).toBe(false);
@@ -4955,6 +5327,7 @@ EOF
 2. **Run it — expect FAIL.** Command: `npx vitest run src/server/ws.test.ts`. Expected: `Cannot find module './ws.js'`.
 
 3. **Minimal implementation — origin helper + empty broadcaster.** Create `src/server/ws.ts`:
+
    ```ts
    import type {
      ServerBroadcastMessage,
@@ -4990,6 +5363,7 @@ EOF
 4. **Run it — expect PASS.** Command: `npx vitest run src/server/ws.test.ts`. Expected: both `isAllowedOrigin` tests PASS.
 
 5. **Write FAILING test — subscribe/broadcast/unsubscribe fan-out.** Append:
+
    ```ts
    describe("StationBroadcaster fan-out", () => {
      it("broadcasts to every subscriber and stops after unsubscribe", () => {
@@ -4999,7 +5373,12 @@ EOF
        b.subscribe(a);
        b.subscribe(c);
        b.broadcast({ type: "trackError", videoId: "v1", title: "T", reason: "blocked" });
-       expect(a).toHaveBeenCalledWith({ type: "trackError", videoId: "v1", title: "T", reason: "blocked" });
+       expect(a).toHaveBeenCalledWith({
+         type: "trackError",
+         videoId: "v1",
+         title: "T",
+         reason: "blocked",
+       });
        expect(c).toHaveBeenCalledTimes(1);
        b.unsubscribe(a);
        b.broadcast({ type: "trackError", videoId: "v2", title: "T2", reason: "x" });
@@ -5012,6 +5391,7 @@ EOF
 6. **Run it — expect FAIL.** Command: `npx vitest run src/server/ws.test.ts`. Expected: FAIL — `expected "spy" to be called with arguments` (subscribe/broadcast are no-ops).
 
 7. **Implement subscribe/unsubscribe/broadcast.** Replace those three method bodies in `src/server/ws.ts`:
+
    ```ts
      subscribe(send: Send): void {
        this.subs.add(send);
@@ -5027,6 +5407,7 @@ EOF
 8. **Run it — expect PASS.** Command: `npx vitest run src/server/ws.test.ts`. Expected: fan-out test PASSES.
 
 9. **Write FAILING test — `attach` wires `'changed'` to a state broadcast, once.** Append:
+
    ```ts
    import { EventEmitter } from "node:events";
 
@@ -5049,6 +5430,7 @@ EOF
 10. **Run it — expect FAIL.** Command: `npx vitest run src/server/ws.test.ts`. Expected: FAIL — `expected "spy" to be called 1 times, but got 0` (attach is a no-op).
 
 11. **Implement `attach` (idempotent).** Replace the `attach` body in `src/server/ws.ts`:
+
     ```ts
       attach(station: StationLike): void {
         if (this.attached) return;
@@ -5066,10 +5448,12 @@ EOF
 ### Task 3.4: /ws handler wiring protocol to registry + sink
 
 **Files**
+
 - Modify: `src/server/ws.ts` (add `registerWebsocket`)
 - Test: `src/server/ws.test.ts` (add `boot()` integration cases against a mock Player)
 
 **Interfaces**
+
 - Consumes:
   - 3.3: `StationBroadcaster`, `isAllowedOrigin`, `Send`.
   - 3.2: `PlayerRegistry` (`touch`/`onConnect`/`claim`/`release`/`onDisconnect`/`isSpeaker`/`activePlayerDeviceId`).
@@ -5092,6 +5476,7 @@ EOF
 **Steps**
 
 1. **Write FAILING test — origin 403 + unauthenticated close.** Append to `src/server/ws.test.ts` a `boot()` helper that builds a minimal Fastify app with `@fastify/websocket` registered, a fake session decorator, the broadcaster/registry/sink wired, then opens a real client socket via the `ws` package:
+
    ```ts
    import Fastify, { type FastifyInstance } from "fastify";
    import fastifyWebsocket from "@fastify/websocket";
@@ -5102,7 +5487,11 @@ EOF
 
    // Minimal sink stub matching BrowserPlayerSink's structural surface used by the handler.
    function makeFakeSinkFactory() {
-     const sinks: Array<{ send: Send; emit: ReturnType<typeof vi.fn>; relinquish: ReturnType<typeof vi.fn> }> = [];
+     const sinks: Array<{
+       send: Send;
+       emit: ReturnType<typeof vi.fn>;
+       relinquish: ReturnType<typeof vi.fn>;
+     }> = [];
      const factory = (send: Send) => {
        const sink = { send, emit: vi.fn(), relinquish: vi.fn(), setSend: vi.fn() };
        sinks.push(sink);
@@ -5116,7 +5505,9 @@ EOF
      await app.register(fastifyWebsocket);
      // fake session: decorate request.session before the ws handler runs
      app.addHook("onRequest", async (req) => {
-       (req as { session?: { authed?: boolean; deviceId?: string; displayName?: string } }).session = {
+       (
+         req as { session?: { authed?: boolean; deviceId?: string; displayName?: string } }
+       ).session = {
          authed: opts.authed,
          deviceId: "d1",
          displayName: "PC",
@@ -5179,6 +5570,7 @@ EOF
 2. **Run it — expect FAIL.** Command: `npx vitest run src/server/ws.test.ts`. Expected: FAIL — `registerWebsocket is not a function` / `Cannot read properties of undefined` (the export does not exist yet).
 
 3. **Minimal implementation — exports, origin guard, auth gate.** Add to `src/server/ws.ts` the imports and the skeleton handler:
+
    ```ts
    import type { FastifyInstance, FastifyRequest } from "fastify";
    import type { WebSocket as WsWebSocket } from "@fastify/websocket";
@@ -5207,8 +5599,7 @@ EOF
 
      app.get("/ws", { websocket: true }, (socket: WsWebSocket, req: FastifyRequest) => {
        const session = req.session as
-         | { authed?: boolean; deviceId?: string; displayName?: string }
-         | undefined;
+         { authed?: boolean; deviceId?: string; displayName?: string } | undefined;
        if (!session?.authed) {
          socket.close(1008, "unauthenticated");
          return;
@@ -5260,11 +5651,13 @@ EOF
      });
    }
    ```
+
    > `BrowserPlayerSink` (§1.4) extends `EventEmitter`, so `sink.emit("trackEnd")` / `sink.emit("error", err)` are the documented sink events. The composition root supplies `makeSink` so the sink can target the per-socket `send`.
 
 4. **Run it — expect PASS (guard + auth tests).** Command: `npx vitest run src/server/ws.test.ts`. Expected: the 403 and 1008 tests PASS (broadcaster unit tests from 3.3 still PASS).
 
 5. **Write FAILING test — `hello` touches + auto-selects + sends initial state.** Append inside the integration `describe`:
+
    ```ts
    function openHello(url: string): Promise<WebSocket> {
      return new Promise((resolve, reject) => {
@@ -5333,6 +5726,7 @@ EOF
 6. **Run it — expect PASS.** Command: `npx vitest run src/server/ws.test.ts`. Expected: all integration tests PASS — the step-3 implementation already covers `hello`/`becomePlayer`/`trackEnded`/`position`/`close`. If `becomePlayer` fails because the sink instance differs, confirm `makeSink` is called once per socket (cache the sink in the handler closure, as written).
 
 7. **Write FAILING test — `relinquishPlayer` releases.** Append:
+
    ```ts
    it("relinquishPlayer releases the active player back to null", async () => {
      h = await boot({ authed: true });
@@ -5350,6 +5744,7 @@ EOF
 8. **Run it — expect PASS.** Command: `npx vitest run src/server/ws.test.ts`. Expected: PASS (the `relinquishPlayer` case in the step-3 switch already calls `registry.release`). This case exists to lock the behavior against regressions.
 
 9. **Write FAILING test — no revalidation interval leaks a timer.** Append:
+
    ```ts
    it("registers no recurring interval (no 30s revalidation)", async () => {
      const spy = vi.spyOn(global, "setInterval");
@@ -5373,29 +5768,32 @@ EOF
 ### Task 3.5: Phase completion — full verification, adversarial /debug, single squash commit
 
 **Files**
+
 - No new source files. Final gate + one commit for the whole phase.
 
 **Steps**
 
 1. **Run the full verification suite.** Command:
+
    ```bash
    npm run typecheck && npm run lint && npm run build && npm test
    ```
+
    Expected green output (shape):
    - `tsc --noEmit -p tsconfig.json` → no output, exit 0.
    - `eslint .` → no output (or `0 problems`), exit 0.
    - `tsc -p tsconfig.json` + `vite build` → `dist/` emitted, web bundle written, exit 0.
    - `vitest run` → all suites pass, e.g. `Test Files  N passed (N)` / `Tests  M passed (M)`, exit 0.
-   If any step fails, fix it and re-run the FULL command before proceeding — do not commit on a partial pass.
+     If any step fails, fix it and re-run the FULL command before proceeding — do not commit on a partial pass.
 
 2. **Run an adversarial multi-agent `/debug` pass over the phase's changed files.** Fan out finder agents across `src/players/persist.ts`, `src/players/registry.ts`, `src/server/ws.ts` (and their tests), one agent per reliability lens, then adversarially verify every finding before fixing. Lenses to assign:
-   - **Single-active-player invariant:** can two sockets ever both be the active player? Check the `claim` while a different device is already active (must `stepDownActive` first), `onConnect` racing a `becomePlayer`, and same-device re-claim with a *new* socket/sink (a page reload: same `deviceId`, fresh `send`/sink — `claim` must replace the stale sink, not early-return on the `deviceId === active` branch while the sink differs).
+   - **Single-active-player invariant:** can two sockets ever both be the active player? Check the `claim` while a different device is already active (must `stepDownActive` first), `onConnect` racing a `becomePlayer`, and same-device re-claim with a _new_ socket/sink (a page reload: same `deviceId`, fresh `send`/sink — `claim` must replace the stale sink, not early-return on the `deviceId === active` branch while the sink differs).
    - **Disconnect/relinquish asymmetry:** `onDisconnect` must NOT call `sink.relinquish()` (socket already gone), but `claim`/`release` MUST relinquish the previous/own sink. Verify `release` of a non-active device and double-`onDisconnect` are no-ops.
    - **Persistence durability:** `writeDeviceRegistry` atomicity (tmp+rename on the same filesystem/dir), `readDeviceRegistry` tolerance (missing/corrupt/wrong-version → null), and that fire-and-forget `persist()` in `touch`/`remember`/`forget` cannot drop a write under rapid successive calls (last-write-wins is acceptable; a lost `remember` is not — verify the in-memory map is updated synchronously so a later read after `init()` reflects it).
    - **WS auth/origin ordering:** origin 403 guard fires for `/ws` before the upgrade; the `1008` close path runs when `session.authed` is falsy; the subscribe-after-close race (close handler runs `unsubscribe`; ensure no orphaned `send` remains in the broadcaster if the socket closes during/just after `hello`).
    - **Broadcast safety:** iterating `this.subs` while a `send` throws (one dead socket must not abort the fan-out to the rest); `attach` idempotency (no double-wired `'changed'` listener leaking duplicate state frames).
    - **Resource/lifecycle:** no `setInterval`/timer left running per socket (the deleted 30s revalidation); listeners on the per-socket sink are cleaned up on close so a long-lived station EventEmitter doesn't accumulate dead sink listeners.
-   For each confirmed bug, write a failing regression test first, then fix, then re-run that test plus `npm test`. Discard findings that adversarial verification cannot reproduce. Re-run the full step-1 command after all fixes; it must be green.
+     For each confirmed bug, write a failing regression test first, then fix, then re-run that test plus `npm test`. Discard findings that adversarial verification cannot reproduce. Re-run the full step-1 command after all fixes; it must be green.
 
 3. **Make EXACTLY ONE squash commit for the entire phase** (per the project's one-commit-per-phase-after-debug rule; this overrides the skill's per-task commit default). Commands:
    ```bash
@@ -5436,26 +5834,34 @@ All backend files are ESM/NodeNext: relative imports use the `.js` extension. St
 ### Task 4.1: Shared-password auth
 
 **Files**
+
 - Create: `src/auth/password.ts`
 - Test: `src/auth/password.test.ts`
 
 **Interfaces**
 
 Consumes:
+
 - `WebConfig` from `../config.js` — fields used: `viewerPassword: string`, `adminPassword: string | null`, `allowNoPassword: boolean`.
 - `MemorySessionStore` from `./session-store.js` (already verbatim from Phase 0.6) — only relevant here because `req.sessionStore.destroy(oldId, cb)` is called after `regenerate()`.
 - From `../types/index.js`: `LoginRequest { password; displayName; deviceId }`, `AdminRequest { password }`, `SessionInfo { displayName; deviceId; isAdmin }`, and the `declare module "fastify"` Session augmentation (`authed?`, `isAdmin?`, `displayName?`, `deviceId?`).
 
 Produces (exact signatures):
+
 ```ts
 export function verifyPassword(input: string, expected: string): boolean;
 export function registerAuthRoutes(app: FastifyInstance, cfg: WebConfig): void;
 export async function requireSession(req: FastifyRequest, reply: FastifyReply): Promise<boolean>;
-export async function requireAdmin(req: FastifyRequest, reply: FastifyReply, cfg: WebConfig): Promise<boolean>;
+export async function requireAdmin(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  cfg: WebConfig,
+): Promise<boolean>;
 export function sessionInfo(req: FastifyRequest): SessionInfo | null;
 ```
 
 Behavior:
+
 - `POST /api/login` `{ password, displayName, deviceId }` → verify against `cfg.viewerPassword` (timing-safe). On success: `await req.session.regenerate()` (fixation fix), destroy the old store entry, set `session.authed = true`, `session.displayName`, `session.deviceId`. Returns `SessionInfo`.
 - `POST /api/admin` `{ password }` → must already be `authed`; verify against `cfg.adminPassword`; set `session.isAdmin = true`. Returns `SessionInfo`.
 - `POST /api/logout` → `await req.session.destroy()`, clear the `sid` cookie, `204`.
@@ -5466,6 +5872,7 @@ Behavior:
 #### Steps
 
 1. **Write failing test — `verifyPassword` is correct and length-guarded.** Create `src/auth/password.test.ts`:
+
    ```ts
    import { describe, it, expect } from "vitest";
    import { verifyPassword } from "./password.js";
@@ -5490,6 +5897,7 @@ Behavior:
    Expected: fails to resolve / `Cannot find module './password.js'` (file does not exist yet).
 
 3. **Minimal implementation — `verifyPassword`.** Create `src/auth/password.ts`:
+
    ```ts
    import { timingSafeEqual } from "node:crypto";
    import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
@@ -5513,6 +5921,7 @@ Behavior:
    Expected: 4 passed.
 
 5. **Write failing test — login verifies, regenerates, sets session.** Append to `password.test.ts`. Use a real Fastify app wired exactly like `buildApp` will wire it (cookie + session + the routes) so the session roundtrip is real:
+
    ```ts
    import Fastify, { type FastifyInstance } from "fastify";
    import cookie from "@fastify/cookie";
@@ -5611,6 +6020,7 @@ Behavior:
    Expected: the `verifyPassword` block still passes; the new block fails — `registerAuthRoutes is not a function` / `requireSession is not exported`.
 
 7. **Implement `registerAuthRoutes` + `sessionInfo` + `requireSession`/`requireAdmin`.** Append to `password.ts`:
+
    ```ts
    export function sessionInfo(req: FastifyRequest): SessionInfo | null {
      const s = req.session;
@@ -5618,7 +6028,10 @@ Behavior:
      return { displayName: s.displayName, deviceId: s.deviceId, isAdmin: s.isAdmin === true };
    }
 
-   export async function requireSession(req: FastifyRequest, reply: FastifyReply): Promise<boolean> {
+   export async function requireSession(
+     req: FastifyRequest,
+     reply: FastifyReply,
+   ): Promise<boolean> {
      if (req.session.authed === true) return true;
      await reply.code(401).send({ error: "unauthenticated" });
      return false;
@@ -5697,6 +6110,7 @@ Behavior:
    Expected: all login + verifyPassword tests pass.
 
 9. **Write failing test — admin elevation + guards + logout.** Append:
+
    ```ts
    describe("/api/admin + guards", () => {
      async function login(app: FastifyInstance, c = cfg()): Promise<string> {
@@ -5755,7 +6169,11 @@ Behavior:
        const cookie = await login(app);
        const out = await app.inject({ method: "POST", url: "/api/logout", headers: { cookie } });
        expect(out.statusCode).toBe(204);
-       const after = await app.inject({ method: "GET", url: "/probe/session", headers: { cookie } });
+       const after = await app.inject({
+         method: "GET",
+         url: "/probe/session",
+         headers: { cookie },
+       });
        expect(after.statusCode).toBe(401);
        await app.close();
      });
@@ -5770,12 +6188,14 @@ Behavior:
 ### Task 4.2: Flat REST routes
 
 **Files**
+
 - Create: `src/server/rest.ts`
 - Test: `src/server/rest.test.ts`
 
 **Interfaces**
 
 Consumes:
+
 - `requireSession`, `requireAdmin`, `sessionInfo` from `../auth/password.js` (4.1).
 - `StationController` from `../orchestrator/index.js` (1.5) — methods used (exact names per Task 1.5): `snapshot(): StationSnapshot`, `enqueue(meta, requester): Promise<QueueItem>` (returns the QueueItem whose `.id` the route surfaces), `pause()`, `resume()`, `skip()`, `seek(ms): Promise<boolean>`, `setVolume(pct): StationSettings`, `shuffle(rng?): Promise<void>`, `clear(): Promise<void>`, `remove(itemId): Promise<boolean>`, `reorder(itemId, toIndex): Promise<boolean>`, `jump(itemId): Promise<boolean>`, `updateSettings(patch): StationSettings` (repeat is set via `updateSettings({ repeat })` — there is NO separate `setRepeat`). The seed is set inside `enqueue` for `source:"user"` adds (there is no `setSeed`).
 - `RadioEngine` from `../radio/index.js` (1.6) — `reset(): void` (clears the recent-history de-dup window; invoked when a user adds a track so the fresh seed gets a clean run). There is NO `reseed` method — the seed itself is set inside `StationController.enqueue` for `source:"user"` adds; the REST layer only triggers the radio's window `reset()`.
@@ -5785,6 +6205,7 @@ Consumes:
 - `WebConfig` from `../config.js` (for `cfg.adminPassword` admin-gating).
 
 Produces (exact signature):
+
 ```ts
 export interface RestDeps {
   station: StationController;
@@ -5798,6 +6219,7 @@ export function registerRest(app: FastifyInstance, deps: RestDeps): void;
 ```
 
 Routes & error idioms (preserved from the bot):
+
 - `GET /api/state` → `StationStateResponse` = `station.snapshot()` + `isThisDeviceSpeaker: registry.isSpeaker(session.deviceId)`.
 - `POST /api/add` `{ urlOrQuery }`: `input.length > 2000` → `400`; `parseInput` → `reject` → `400 { error: reason }`; `query` → `{ candidates }` (YtError → `400 { error: kind }`); `link` → resolve+enqueue (the seed is set inside `enqueue`; then `radio.reset()` clears the de-dup window) → `{ queued: { id, title } }`. Resolve YtError → `400 { error: kind }`; enqueue YtError → `400 { error: message }`; other enqueue failure → `500 { error: "enqueue_failed" }`.
 - `POST /api/pick` `{ candidateId }`: validate 11-char videoId else `400`; enqueue (same idioms as add-link).
@@ -5812,6 +6234,7 @@ Routes & error idioms (preserved from the bot):
 #### Steps
 
 1. **Write failing test — state requires a session and returns the snapshot + isThisDeviceSpeaker.** Create `src/server/rest.test.ts` with a fake controller/registry, mounted behind a real session so the auth guards run:
+
    ```ts
    import { describe, it, expect, vi, beforeEach } from "vitest";
    import Fastify, { type FastifyInstance } from "fastify";
@@ -5824,35 +6247,67 @@ Routes & error idioms (preserved from the bot):
    import type { WebConfig } from "../config.js";
 
    const meta = (id: string, title = id) => ({
-     videoId: id, title, channel: "c", durationSec: 100, isLive: false, thumbnailUrl: null,
+     videoId: id,
+     title,
+     channel: "c",
+     durationSec: 100,
+     isLive: false,
+     thumbnailUrl: null,
    });
 
    function cfg(over: Partial<WebConfig> = {}): WebConfig {
      return {
-       publicBaseUrl: "https://j", viewerPassword: "letmein", adminPassword: null,
-       allowNoPassword: false, sessionSecret: "x".repeat(32), port: 8080, host: "0.0.0.0",
-       trustProxy: true, allowedWsOrigins: ["https://j"], nodeEnv: "test",
-       secureCookies: false, ...over,
+       publicBaseUrl: "https://j",
+       viewerPassword: "letmein",
+       adminPassword: null,
+       allowNoPassword: false,
+       sessionSecret: "x".repeat(32),
+       port: 8080,
+       host: "0.0.0.0",
+       trustProxy: true,
+       allowedWsOrigins: ["https://j"],
+       nodeEnv: "test",
+       secureCookies: false,
+       ...over,
      };
    }
 
    function fakeStation() {
      return {
        snapshot: vi.fn(() => ({
-         repeat: "off", autoplay: true, autoplaySource: "radio", volume: 100,
-         maxTrackDurationSec: 0, current: null, upcoming: [], upcomingRadio: [], history: [],
-         seed: null, paused: false, preparing: null, activePlayerPresent: false,
+         repeat: "off",
+         autoplay: true,
+         autoplaySource: "radio",
+         volume: 100,
+         maxTrackDurationSec: 0,
+         current: null,
+         upcoming: [],
+         upcomingRadio: [],
+         history: [],
+         seed: null,
+         paused: false,
+         preparing: null,
+         activePlayerPresent: false,
          activePlayerLabel: null,
        })),
        enqueue: vi.fn(async () => ({ id: "i1" })),
-       pause: vi.fn(), resume: vi.fn(), skip: vi.fn(),
-       seek: vi.fn(async () => true), setVolume: vi.fn(),
-       shuffle: vi.fn(async () => {}), clear: vi.fn(async () => {}),
-       remove: vi.fn(async () => true), reorder: vi.fn(async () => true),
+       pause: vi.fn(),
+       resume: vi.fn(),
+       skip: vi.fn(),
+       seek: vi.fn(async () => true),
+       setVolume: vi.fn(),
+       shuffle: vi.fn(async () => {}),
+       clear: vi.fn(async () => {}),
+       remove: vi.fn(async () => true),
+       reorder: vi.fn(async () => true),
        jump: vi.fn(async () => true),
        updateSettings: vi.fn((p: Record<string, unknown>) => ({
-         repeat: "off", autoplay: true, autoplaySource: "radio", volume: 100,
-         maxTrackDurationSec: 0, ...p,
+         repeat: "off",
+         autoplay: true,
+         autoplaySource: "radio",
+         volume: 100,
+         maxTrackDurationSec: 0,
+         ...p,
        })),
      };
    }
@@ -5866,28 +6321,45 @@ Routes & error idioms (preserved from the bot):
        forget: vi.fn(() => ({ activePlayerDeviceId: null })),
      };
    }
-   function fakeRadio() { return { reset: vi.fn() }; }
+   function fakeRadio() {
+     return { reset: vi.fn() };
+   }
 
    async function build(over: Partial<RestDeps> = {}, c = cfg()) {
      const station = fakeStation();
      const registry = fakeRegistry();
-     const youtube = { resolve: vi.fn(async (id: string) => meta(id)), search: vi.fn(async () => [meta("aaaaaaaaaaa")]) };
+     const youtube = {
+       resolve: vi.fn(async (id: string) => meta(id)),
+       search: vi.fn(async () => [meta("aaaaaaaaaaa")]),
+     };
      const app = Fastify({ logger: false });
      await app.register(cookie);
      await app.register(session, {
-       secret: c.sessionSecret, cookieName: "sid", store: new MemorySessionStore({ sweepMs: 0 }) as never,
-       saveUninitialized: false, rolling: true,
+       secret: c.sessionSecret,
+       cookieName: "sid",
+       store: new MemorySessionStore({ sweepMs: 0 }) as never,
+       saveUninitialized: false,
+       rolling: true,
        cookie: { path: "/", httpOnly: true, secure: false, sameSite: "lax", maxAge: 1000 },
      });
      registerAuthRoutes(app, c);
-     const deps = { station, youtube, registry, radio: fakeRadio(), searchLimit: 5, cfg: c, ...over } as unknown as RestDeps;
+     const deps = {
+       station,
+       youtube,
+       registry,
+       radio: fakeRadio(),
+       searchLimit: 5,
+       cfg: c,
+       ...over,
+     } as unknown as RestDeps;
      registerRest(app, deps);
      return { app, station, registry, youtube, deps };
    }
 
    async function login(app: FastifyInstance, c = cfg(), deviceId = "dev-1"): Promise<string> {
      const res = await app.inject({
-       method: "POST", url: "/api/login",
+       method: "POST",
+       url: "/api/login",
        payload: { password: c.viewerPassword, displayName: "Ada", deviceId },
      });
      const set = res.headers["set-cookie"];
@@ -5919,6 +6391,7 @@ Routes & error idioms (preserved from the bot):
    Expected: `Cannot find module './rest.js'` / `registerRest is not a function`.
 
 3. **Implement the skeleton + `GET /api/state`.** Create `src/server/rest.ts`:
+
    ```ts
    import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
    import { parseInput } from "../youtube/url-parser.js";
@@ -5931,9 +6404,16 @@ Routes & error idioms (preserved from the bot):
    import type { PlayerRegistry } from "../players/registry.js";
    import type { WebConfig } from "../config.js";
    import {
-     AUTOPLAY_REQUESTER, VOLUME_MAX, type Requester, type TrackMeta, type RepeatMode,
-     type StationSettings, type ControlAction, type SpeakerAction,
-     type SpeakerResponse, type StationStateResponse,
+     AUTOPLAY_REQUESTER,
+     VOLUME_MAX,
+     type Requester,
+     type TrackMeta,
+     type RepeatMode,
+     type StationSettings,
+     type ControlAction,
+     type SpeakerAction,
+     type SpeakerResponse,
+     type StationStateResponse,
    } from "../types/index.js";
 
    export interface RestDeps {
@@ -5964,33 +6444,42 @@ Routes & error idioms (preserved from the bot):
      });
    }
    ```
+
    (Subsequent steps add routes INSIDE `registerRest`, before its closing brace; the `enqueue` helper and per-action validators are nested functions.)
 
 4. **Run it — expect PASS.** `npx vitest run src/server/rest.test.ts`
    Expected: the two state tests pass.
 
 5. **Write failing test — add (link / query / too-long / reject / YtError).** Append:
+
    ```ts
    describe("POST /api/add", () => {
      it("queues a YouTube link, resets the radio de-dup window, returns queued", async () => {
        const { app, station, youtube, deps } = await build();
        const c = await login(app);
        const res = await app.inject({
-         method: "POST", url: "/api/add", headers: { cookie: c },
+         method: "POST",
+         url: "/api/add",
+         headers: { cookie: c },
          payload: { urlOrQuery: "https://youtu.be/dQw4w9WgXcQ" },
        });
        expect(res.statusCode).toBe(200);
        expect(res.json().queued).toEqual({ id: "i1", title: "dQw4w9WgXcQ" });
        expect(youtube.resolve).toHaveBeenCalledWith("dQw4w9WgXcQ");
        expect(station.enqueue).toHaveBeenCalledOnce();
-       expect((deps as unknown as { radio: { reset: ReturnType<typeof vi.fn> } }).radio.reset).toHaveBeenCalledOnce();
+       expect(
+         (deps as unknown as { radio: { reset: ReturnType<typeof vi.fn> } }).radio.reset,
+       ).toHaveBeenCalledOnce();
        await app.close();
      });
      it("returns search candidates for a free-text query", async () => {
        const { app } = await build();
        const c = await login(app);
        const res = await app.inject({
-         method: "POST", url: "/api/add", headers: { cookie: c }, payload: { urlOrQuery: "lofi beats" },
+         method: "POST",
+         url: "/api/add",
+         headers: { cookie: c },
+         payload: { urlOrQuery: "lofi beats" },
        });
        expect(res.statusCode).toBe(200);
        expect(Array.isArray(res.json().candidates)).toBe(true);
@@ -6000,7 +6489,9 @@ Routes & error idioms (preserved from the bot):
        const { app } = await build();
        const c = await login(app);
        const res = await app.inject({
-         method: "POST", url: "/api/add", headers: { cookie: c },
+         method: "POST",
+         url: "/api/add",
+         headers: { cookie: c },
          payload: { urlOrQuery: "x".repeat(2001) },
        });
        expect(res.statusCode).toBe(400);
@@ -6009,14 +6500,17 @@ Routes & error idioms (preserved from the bot):
      it("400s a search YtError with the kind (not stderr)", async () => {
        const { app } = await build();
        const c = await login(app);
-       (await (async () => {})());
+       await (async () => {})();
        const { youtube } = await build({}, cfg());
        youtube.search.mockRejectedValueOnce(new YtError("private", "raw stderr"));
        // rebuild with this youtube so the route uses it:
        const b = await build({ youtube });
        const bc = await login(b.app);
        const res = await b.app.inject({
-         method: "POST", url: "/api/add", headers: { cookie: bc }, payload: { urlOrQuery: "anything" },
+         method: "POST",
+         url: "/api/add",
+         headers: { cookie: bc },
+         payload: { urlOrQuery: "anything" },
        });
        expect(res.statusCode).toBe(400);
        expect(res.json().error).toBe("private");
@@ -6025,69 +6519,81 @@ Routes & error idioms (preserved from the bot):
      });
    });
    ```
+
    (Note: adjust `YtError` constructor args to the verbatim signature from Phase 0 — `kind` first, message second, per `youtube/errors.ts`.)
 
 6. **Run it — expect FAIL.** `npx vitest run src/server/rest.test.ts`
    Expected: add tests fail — `POST /api/add` returns 404 (route not registered).
 
 7. **Implement `POST /api/add` + the `enqueueVideo` helper.** Add inside `registerRest`:
-   ```ts
-     async function enqueueVideo(req: FastifyRequest, reply: FastifyReply, videoId: string) {
-       const info = sessionInfo(req);
-       if (!info) return reply.code(401).send({ error: "unauthenticated" });
-       let meta: TrackMeta;
-       try {
-         meta = await deps.youtube.resolve(videoId);
-       } catch (err) {
-         return reply.code(400).send({ error: err instanceof YtError ? err.kind : "resolve_failed" });
-       }
-       const requester: Requester = { deviceId: info.deviceId, displayName: info.displayName, source: "user" };
-       let item: { id: string };
-       try {
-         item = await deps.station.enqueue(meta, requester);
-       } catch (err) {
-         if (err instanceof YtError) return reply.code(400).send({ error: err.message });
-         return reply.code(500).send({ error: "enqueue_failed" });
-       }
-       // A user add is the new station seed (set inside enqueue); clear the radio's recent-history
-       // de-dup window so the fresh seed's related/artist run starts clean.
-       deps.radio.reset();
-       return reply.send({ queued: { id: item.id, title: meta.title } });
-     }
 
-     app.post<{ Body: { urlOrQuery?: string } }>(
-       "/api/add",
-       { config: { rateLimit: { max: 15, timeWindow: "1 minute" } } },
-       async (req, reply) => {
-         if (!(await requireSession(req, reply))) return;
-         const input = (req.body?.urlOrQuery ?? "").toString();
-         if (input.length > 2000) return reply.code(400).send({ error: "input too long" });
-         const parsed = parseInput(input);
-         if (parsed.kind === "reject") return reply.code(400).send({ error: parsed.reason });
-         if (parsed.kind === "query") {
-           try {
-             return reply.send({ candidates: await deps.youtube.search(parsed.query, deps.searchLimit) });
-           } catch (err) {
-             if (err instanceof YtError) return reply.code(400).send({ error: err.kind });
-             throw err;
-           }
+   ```ts
+   async function enqueueVideo(req: FastifyRequest, reply: FastifyReply, videoId: string) {
+     const info = sessionInfo(req);
+     if (!info) return reply.code(401).send({ error: "unauthenticated" });
+     let meta: TrackMeta;
+     try {
+       meta = await deps.youtube.resolve(videoId);
+     } catch (err) {
+       return reply.code(400).send({ error: err instanceof YtError ? err.kind : "resolve_failed" });
+     }
+     const requester: Requester = {
+       deviceId: info.deviceId,
+       displayName: info.displayName,
+       source: "user",
+     };
+     let item: { id: string };
+     try {
+       item = await deps.station.enqueue(meta, requester);
+     } catch (err) {
+       if (err instanceof YtError) return reply.code(400).send({ error: err.message });
+       return reply.code(500).send({ error: "enqueue_failed" });
+     }
+     // A user add is the new station seed (set inside enqueue); clear the radio's recent-history
+     // de-dup window so the fresh seed's related/artist run starts clean.
+     deps.radio.reset();
+     return reply.send({ queued: { id: item.id, title: meta.title } });
+   }
+
+   app.post<{ Body: { urlOrQuery?: string } }>(
+     "/api/add",
+     { config: { rateLimit: { max: 15, timeWindow: "1 minute" } } },
+     async (req, reply) => {
+       if (!(await requireSession(req, reply))) return;
+       const input = (req.body?.urlOrQuery ?? "").toString();
+       if (input.length > 2000) return reply.code(400).send({ error: "input too long" });
+       const parsed = parseInput(input);
+       if (parsed.kind === "reject") return reply.code(400).send({ error: parsed.reason });
+       if (parsed.kind === "query") {
+         try {
+           return reply.send({
+             candidates: await deps.youtube.search(parsed.query, deps.searchLimit),
+           });
+         } catch (err) {
+           if (err instanceof YtError) return reply.code(400).send({ error: err.kind });
+           throw err;
          }
-         return enqueueVideo(req, reply, parsed.videoId);
-       },
-     );
+       }
+       return enqueueVideo(req, reply, parsed.videoId);
+     },
+   );
    ```
 
 8. **Run it — expect PASS.** `npx vitest run src/server/rest.test.ts`
    Expected: state + add tests pass. (Confirm the `parseInput` discriminant fields — `kind: "link" | "query" | "reject"`, `videoId`, `query`, `reason` — match Phase 0's verbatim `url-parser.ts`; adjust `parsed.videoId`/`parsed.kind === "link"` accordingly if the verbatim union names the link case differently.)
 
 9. **Write failing test — pick validates the candidateId.** Append:
+
    ```ts
    describe("POST /api/pick", () => {
      it("400s a malformed candidateId", async () => {
        const { app } = await build();
        const c = await login(app);
        const res = await app.inject({
-         method: "POST", url: "/api/pick", headers: { cookie: c }, payload: { candidateId: "nope" },
+         method: "POST",
+         url: "/api/pick",
+         headers: { cookie: c },
+         payload: { candidateId: "nope" },
        });
        expect(res.statusCode).toBe(400);
        await app.close();
@@ -6096,7 +6602,10 @@ Routes & error idioms (preserved from the bot):
        const { app, station } = await build();
        const c = await login(app);
        const res = await app.inject({
-         method: "POST", url: "/api/pick", headers: { cookie: c }, payload: { candidateId: "dQw4w9WgXcQ" },
+         method: "POST",
+         url: "/api/pick",
+         headers: { cookie: c },
+         payload: { candidateId: "dQw4w9WgXcQ" },
        });
        expect(res.statusCode).toBe(200);
        expect(res.json().queued.id).toBe("i1");
@@ -6107,28 +6616,36 @@ Routes & error idioms (preserved from the bot):
    ```
 
 10. **Run it — expect FAIL, then implement `POST /api/pick`.** Run `npx vitest run src/server/rest.test.ts` (pick tests 404). Add inside `registerRest`:
+
     ```ts
-      app.post<{ Body: { candidateId?: string } }>(
-        "/api/pick",
-        { config: { rateLimit: { max: 15, timeWindow: "1 minute" } } },
-        async (req, reply) => {
-          if (!(await requireSession(req, reply))) return;
-          const candidateId = (req.body?.candidateId ?? "").toString();
-          if (!VIDEO_ID.test(candidateId)) return reply.code(400).send({ error: "bad candidateId" });
-          return enqueueVideo(req, reply, candidateId);
-        },
-      );
+    app.post<{ Body: { candidateId?: string } }>(
+      "/api/pick",
+      { config: { rateLimit: { max: 15, timeWindow: "1 minute" } } },
+      async (req, reply) => {
+        if (!(await requireSession(req, reply))) return;
+        const candidateId = (req.body?.candidateId ?? "").toString();
+        if (!VIDEO_ID.test(candidateId)) return reply.code(400).send({ error: "bad candidateId" });
+        return enqueueVideo(req, reply, candidateId);
+      },
+    );
     ```
+
     Re-run — expect PASS.
 
 11. **Write failing test — control (pause/skip ok; seek 409/400; volume/repeat validation; admin-gate).** Append:
+
     ```ts
     describe("POST /api/control", () => {
       it("pause/resume/skip return ok and call the station", async () => {
         const { app, station } = await build();
         const c = await login(app);
         for (const action of ["pause", "play", "skip"] as const) {
-          const res = await app.inject({ method: "POST", url: "/api/control", headers: { cookie: c }, payload: { action } });
+          const res = await app.inject({
+            method: "POST",
+            url: "/api/control",
+            headers: { cookie: c },
+            payload: { action },
+          });
           expect(res.statusCode).toBe(200);
           expect(res.json().ok).toBe(true);
         }
@@ -6141,7 +6658,10 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build();
         const c = await login(app);
         const res = await app.inject({
-          method: "POST", url: "/api/control", headers: { cookie: c }, payload: { action: "seek", value: 1000 },
+          method: "POST",
+          url: "/api/control",
+          headers: { cookie: c },
+          payload: { action: "seek", value: 1000 },
         });
         expect(res.statusCode).toBe(409);
         await app.close();
@@ -6149,16 +6669,37 @@ Routes & error idioms (preserved from the bot):
       it("seek 400s past the track duration", async () => {
         const station = fakeStation();
         station.snapshot.mockReturnValue({
-          repeat: "off", autoplay: true, autoplaySource: "radio", volume: 100, maxTrackDurationSec: 0,
-          current: { id: "x", meta: meta("vvvvvvvvvvv"), requester: { deviceId: "d", displayName: "n", source: "user" },
-            addedAt: 0, audio: null, fromRadio: false, positionMs: 0, durationMs: 100000 },
-          upcoming: [], upcomingRadio: [], history: [], seed: null, paused: false, preparing: null,
-          activePlayerPresent: true, activePlayerLabel: "PC",
+          repeat: "off",
+          autoplay: true,
+          autoplaySource: "radio",
+          volume: 100,
+          maxTrackDurationSec: 0,
+          current: {
+            id: "x",
+            meta: meta("vvvvvvvvvvv"),
+            requester: { deviceId: "d", displayName: "n", source: "user" },
+            addedAt: 0,
+            audio: null,
+            fromRadio: false,
+            positionMs: 0,
+            durationMs: 100000,
+          },
+          upcoming: [],
+          upcomingRadio: [],
+          history: [],
+          seed: null,
+          paused: false,
+          preparing: null,
+          activePlayerPresent: true,
+          activePlayerLabel: "PC",
         });
         const { app } = await build({ station } as never);
         const c = await login(app);
         const res = await app.inject({
-          method: "POST", url: "/api/control", headers: { cookie: c }, payload: { action: "seek", value: 999999 },
+          method: "POST",
+          url: "/api/control",
+          headers: { cookie: c },
+          payload: { action: "seek", value: 999999 },
         });
         expect(res.statusCode).toBe(400);
         await app.close();
@@ -6167,7 +6708,10 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build();
         const c = await login(app);
         const res = await app.inject({
-          method: "POST", url: "/api/control", headers: { cookie: c }, payload: { action: "volume", value: 9999 },
+          method: "POST",
+          url: "/api/control",
+          headers: { cookie: c },
+          payload: { action: "volume", value: 9999 },
         });
         expect(res.statusCode).toBe(400);
         await app.close();
@@ -6176,7 +6720,10 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build();
         const c = await login(app);
         const res = await app.inject({
-          method: "POST", url: "/api/control", headers: { cookie: c }, payload: { action: "repeat", value: "weird" },
+          method: "POST",
+          url: "/api/control",
+          headers: { cookie: c },
+          payload: { action: "repeat", value: "weird" },
         });
         expect(res.statusCode).toBe(400);
         await app.close();
@@ -6185,7 +6732,12 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build();
         const c = await login(app);
         for (const action of ["remove", "jump"] as const) {
-          const res = await app.inject({ method: "POST", url: "/api/control", headers: { cookie: c }, payload: { action } });
+          const res = await app.inject({
+            method: "POST",
+            url: "/api/control",
+            headers: { cookie: c },
+            payload: { action },
+          });
           expect(res.statusCode).toBe(400);
         }
         await app.close();
@@ -6195,7 +6747,10 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build({}, c);
         const cookie = await login(app, c);
         const res = await app.inject({
-          method: "POST", url: "/api/control", headers: { cookie }, payload: { action: "skip" },
+          method: "POST",
+          url: "/api/control",
+          headers: { cookie },
+          payload: { action: "skip" },
         });
         expect(res.statusCode).toBe(403);
         await app.close();
@@ -6204,99 +6759,105 @@ Routes & error idioms (preserved from the bot):
     ```
 
 12. **Run it — expect FAIL, then implement `POST /api/control`.** Run the suite (control tests 404/403-missing). Add inside `registerRest`:
+
     ```ts
-      app.post<{ Body: { action?: ControlAction; value?: unknown } }>(
-        "/api/control",
-        async (req, reply) => {
-          // Destructive/global control is admin-gated only when an admin password is configured;
-          // otherwise any authed user can control (requireAdmin returns true for null adminPassword).
-          if (!(await requireAdmin(req, reply, deps.cfg))) return;
-          const action = req.body?.action;
-          const value = req.body?.value;
-          const station = deps.station;
-          switch (action) {
-            case "play":
-              station.resume();
-              return reply.send({ ok: true });
-            case "pause":
-              station.pause();
-              return reply.send({ ok: true });
-            case "skip":
-              station.skip();
-              return reply.send({ ok: true });
-            case "shuffle":
-              await station.shuffle();
-              return reply.send({ ok: true });
-            case "clear":
-              await station.clear();
-              return reply.send({ ok: true });
-            case "seek": {
-              const ms = Number(value);
-              if (!Number.isFinite(ms) || ms < 0) {
-                return reply.code(400).send({ error: "seek value must be a non-negative number" });
-              }
-              const current = station.snapshot().current;
-              if (!current) return reply.code(409).send({ error: "nothing is playing" });
-              if (current.durationMs > 0 && ms > current.durationMs) {
-                return reply.code(400).send({ error: "seek exceeds track duration" });
-              }
-              const ok = await station.seek(Math.round(ms));
-              return reply.send({ ok });
+    app.post<{ Body: { action?: ControlAction; value?: unknown } }>(
+      "/api/control",
+      async (req, reply) => {
+        // Destructive/global control is admin-gated only when an admin password is configured;
+        // otherwise any authed user can control (requireAdmin returns true for null adminPassword).
+        if (!(await requireAdmin(req, reply, deps.cfg))) return;
+        const action = req.body?.action;
+        const value = req.body?.value;
+        const station = deps.station;
+        switch (action) {
+          case "play":
+            station.resume();
+            return reply.send({ ok: true });
+          case "pause":
+            station.pause();
+            return reply.send({ ok: true });
+          case "skip":
+            station.skip();
+            return reply.send({ ok: true });
+          case "shuffle":
+            await station.shuffle();
+            return reply.send({ ok: true });
+          case "clear":
+            await station.clear();
+            return reply.send({ ok: true });
+          case "seek": {
+            const ms = Number(value);
+            if (!Number.isFinite(ms) || ms < 0) {
+              return reply.code(400).send({ error: "seek value must be a non-negative number" });
             }
-            case "volume": {
-              const pct = Number(value);
-              if (!Number.isFinite(pct) || pct < 0 || pct > VOLUME_MAX) {
-                return reply.code(400).send({ error: `volume must be 0..${VOLUME_MAX}` });
-              }
-              station.setVolume(Math.round(pct));
-              return reply.send({ ok: true });
+            const current = station.snapshot().current;
+            if (!current) return reply.code(409).send({ error: "nothing is playing" });
+            if (current.durationMs > 0 && ms > current.durationMs) {
+              return reply.code(400).send({ error: "seek exceeds track duration" });
             }
-            case "repeat": {
-              if (typeof value !== "string" || !REPEAT_MODES.has(value)) {
-                return reply.code(400).send({ error: "invalid repeat mode" });
-              }
-              station.updateSettings({ repeat: value as RepeatMode });
-              return reply.send({ ok: true });
-            }
-            case "remove":
-            case "jump": {
-              const itemId = (value as { itemId?: string } | undefined)?.itemId;
-              if (!itemId) return reply.code(400).send({ error: "itemId is required" });
-              const ok = action === "remove" ? await station.remove(itemId) : await station.jump(itemId);
-              return reply.send({ ok });
-            }
-            case "reorder": {
-              const v = value as { itemId?: string; toIndex?: number } | undefined;
-              if (!v?.itemId) return reply.code(400).send({ error: "itemId is required" });
-              if (!Number.isInteger(v.toIndex) || (v.toIndex as number) < 0) {
-                return reply.code(400).send({ error: "toIndex must be a non-negative integer" });
-              }
-              const ok = await station.reorder(v.itemId, v.toIndex as number);
-              return reply.send({ ok });
-            }
-            case "settings": {
-              const patch = (value ?? {}) as Partial<StationSettings>;
-              station.updateSettings(patch as Record<string, unknown>);
-              return reply.send({ ok: true });
-            }
-            default:
-              return reply.code(400).send({ error: "unknown action" });
+            const ok = await station.seek(Math.round(ms));
+            return reply.send({ ok });
           }
-        },
-      );
+          case "volume": {
+            const pct = Number(value);
+            if (!Number.isFinite(pct) || pct < 0 || pct > VOLUME_MAX) {
+              return reply.code(400).send({ error: `volume must be 0..${VOLUME_MAX}` });
+            }
+            station.setVolume(Math.round(pct));
+            return reply.send({ ok: true });
+          }
+          case "repeat": {
+            if (typeof value !== "string" || !REPEAT_MODES.has(value)) {
+              return reply.code(400).send({ error: "invalid repeat mode" });
+            }
+            station.updateSettings({ repeat: value as RepeatMode });
+            return reply.send({ ok: true });
+          }
+          case "remove":
+          case "jump": {
+            const itemId = (value as { itemId?: string } | undefined)?.itemId;
+            if (!itemId) return reply.code(400).send({ error: "itemId is required" });
+            const ok =
+              action === "remove" ? await station.remove(itemId) : await station.jump(itemId);
+            return reply.send({ ok });
+          }
+          case "reorder": {
+            const v = value as { itemId?: string; toIndex?: number } | undefined;
+            if (!v?.itemId) return reply.code(400).send({ error: "itemId is required" });
+            if (!Number.isInteger(v.toIndex) || (v.toIndex as number) < 0) {
+              return reply.code(400).send({ error: "toIndex must be a non-negative integer" });
+            }
+            const ok = await station.reorder(v.itemId, v.toIndex as number);
+            return reply.send({ ok });
+          }
+          case "settings": {
+            const patch = (value ?? {}) as Partial<StationSettings>;
+            station.updateSettings(patch as Record<string, unknown>);
+            return reply.send({ ok: true });
+          }
+          default:
+            return reply.code(400).send({ error: "unknown action" });
+        }
+      },
+    );
     ```
 
 13. **Run it — expect PASS.** `npx vitest run src/server/rest.test.ts`
     Expected: control tests pass.
 
 14. **Write failing test — speaker + lyrics.** Append:
+
     ```ts
     describe("POST /api/speaker", () => {
       it("remember returns ok + the active player id, keyed on the session device", async () => {
         const { app, registry } = await build();
         const c = await login(app, cfg(), "dev-9");
         const res = await app.inject({
-          method: "POST", url: "/api/speaker", headers: { cookie: c }, payload: { action: "remember" },
+          method: "POST",
+          url: "/api/speaker",
+          headers: { cookie: c },
+          payload: { action: "remember" },
         });
         expect(res.statusCode).toBe(200);
         expect(res.json()).toEqual({ ok: true, activePlayerDeviceId: "dev-9" });
@@ -6308,7 +6869,10 @@ Routes & error idioms (preserved from the bot):
         const c = await login(app, cfg(), "dev-9");
         for (const action of ["release", "forget"] as const) {
           const res = await app.inject({
-            method: "POST", url: "/api/speaker", headers: { cookie: c }, payload: { action },
+            method: "POST",
+            url: "/api/speaker",
+            headers: { cookie: c },
+            payload: { action },
           });
           expect(res.statusCode).toBe(200);
           expect(res.json().ok).toBe(true);
@@ -6321,7 +6885,10 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build();
         const c = await login(app);
         const res = await app.inject({
-          method: "POST", url: "/api/speaker", headers: { cookie: c }, payload: { action: "claim" },
+          method: "POST",
+          url: "/api/speaker",
+          headers: { cookie: c },
+          payload: { action: "claim" },
         });
         expect(res.statusCode).toBe(400);
         await app.close();
@@ -6330,7 +6897,10 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build();
         const c = await login(app);
         const res = await app.inject({
-          method: "POST", url: "/api/speaker", headers: { cookie: c }, payload: { action: "zonk" },
+          method: "POST",
+          url: "/api/speaker",
+          headers: { cookie: c },
+          payload: { action: "zonk" },
         });
         expect(res.statusCode).toBe(400);
         await app.close();
@@ -6341,7 +6911,11 @@ Routes & error idioms (preserved from the bot):
       it("returns {lyrics:null} when nothing is playing", async () => {
         const { app } = await build();
         const c = await login(app);
-        const res = await app.inject({ method: "GET", url: "/api/lyrics?trackId=abc", headers: { cookie: c } });
+        const res = await app.inject({
+          method: "GET",
+          url: "/api/lyrics?trackId=abc",
+          headers: { cookie: c },
+        });
         expect(res.statusCode).toBe(200);
         expect(res.json()).toEqual({ lyrics: null, source: "lyrics.ovh" });
         await app.close();
@@ -6349,16 +6923,38 @@ Routes & error idioms (preserved from the bot):
       it("calls the injected lyrics resolver for the current track", async () => {
         const station = fakeStation();
         station.snapshot.mockReturnValue({
-          repeat: "off", autoplay: true, autoplaySource: "radio", volume: 100, maxTrackDurationSec: 0,
-          current: { id: "x", meta: meta("vvvvvvvvvvv", "Song"), requester: { deviceId: "d", displayName: "n", source: "user" },
-            addedAt: 0, audio: null, fromRadio: false, positionMs: 0, durationMs: 1000 },
-          upcoming: [], upcomingRadio: [], history: [], seed: null, paused: false, preparing: null,
-          activePlayerPresent: true, activePlayerLabel: "PC",
+          repeat: "off",
+          autoplay: true,
+          autoplaySource: "radio",
+          volume: 100,
+          maxTrackDurationSec: 0,
+          current: {
+            id: "x",
+            meta: meta("vvvvvvvvvvv", "Song"),
+            requester: { deviceId: "d", displayName: "n", source: "user" },
+            addedAt: 0,
+            audio: null,
+            fromRadio: false,
+            positionMs: 0,
+            durationMs: 1000,
+          },
+          upcoming: [],
+          upcomingRadio: [],
+          history: [],
+          seed: null,
+          paused: false,
+          preparing: null,
+          activePlayerPresent: true,
+          activePlayerLabel: "PC",
         });
         const lyrics = vi.fn(async () => ({ lyrics: "la la", source: "lyrics.ovh" }));
         const { app } = await build({ station, lyrics } as never);
         const c = await login(app);
-        const res = await app.inject({ method: "GET", url: "/api/lyrics?trackId=vvvvvvvvvvv", headers: { cookie: c } });
+        const res = await app.inject({
+          method: "GET",
+          url: "/api/lyrics?trackId=vvvvvvvvvvv",
+          headers: { cookie: c },
+        });
         expect(res.statusCode).toBe(200);
         expect(res.json().lyrics).toBe("la la");
         expect(lyrics).toHaveBeenCalledWith(expect.objectContaining({ videoId: "vvvvvvvvvvv" }));
@@ -6368,52 +6964,58 @@ Routes & error idioms (preserved from the bot):
     ```
 
 15. **Run it — expect FAIL, then implement `POST /api/speaker` + `GET /api/lyrics`.** Run the suite (speaker/lyrics 404). Add inside `registerRest`:
-    ```ts
-      app.post<{ Body: { action?: SpeakerAction } }>("/api/speaker", async (req, reply) => {
-        if (!(await requireSession(req, reply))) return;
-        const info = sessionInfo(req);
-        if (!info) return reply.code(401).send({ error: "unauthenticated" });
-        const action = req.body?.action;
-        let result: { activePlayerDeviceId: string | null };
-        switch (action) {
-          // "claim" is intentionally NOT handled here: designating the Player needs the per-socket
-          // BrowserPlayerSink, which only the WS becomePlayer handler (Task 3.4) holds. The UI
-          // sends { type: "becomePlayer" } over /ws to claim; REST only does the sink-free actions.
-          case "release":
-            result = deps.registry.release(info.deviceId);
-            break;
-          case "remember":
-            result = deps.registry.remember(info.deviceId);
-            break;
-          case "forget":
-            result = deps.registry.forget(info.deviceId);
-            break;
-          case "claim":
-            return reply.code(400).send({ error: "claim is performed over the websocket (becomePlayer)" });
-          default:
-            return reply.code(400).send({ error: "unknown speaker action" });
-        }
-        const body: SpeakerResponse = { ok: true, activePlayerDeviceId: result.activePlayerDeviceId };
-        return reply.send(body);
-      });
 
-      app.get<{ Querystring: { trackId?: string } }>(
-        "/api/lyrics",
-        { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } },
-        async (req, reply) => {
-          if (!(await requireSession(req, reply))) return;
-          const current = deps.station.snapshot().current;
-          if (!current) return reply.send({ lyrics: null, source: "lyrics.ovh" } satisfies LyricsResult);
-          return reply.send(await lyricsOf(current.meta));
-        },
-      );
+    ```ts
+    app.post<{ Body: { action?: SpeakerAction } }>("/api/speaker", async (req, reply) => {
+      if (!(await requireSession(req, reply))) return;
+      const info = sessionInfo(req);
+      if (!info) return reply.code(401).send({ error: "unauthenticated" });
+      const action = req.body?.action;
+      let result: { activePlayerDeviceId: string | null };
+      switch (action) {
+        // "claim" is intentionally NOT handled here: designating the Player needs the per-socket
+        // BrowserPlayerSink, which only the WS becomePlayer handler (Task 3.4) holds. The UI
+        // sends { type: "becomePlayer" } over /ws to claim; REST only does the sink-free actions.
+        case "release":
+          result = deps.registry.release(info.deviceId);
+          break;
+        case "remember":
+          result = deps.registry.remember(info.deviceId);
+          break;
+        case "forget":
+          result = deps.registry.forget(info.deviceId);
+          break;
+        case "claim":
+          return reply
+            .code(400)
+            .send({ error: "claim is performed over the websocket (becomePlayer)" });
+        default:
+          return reply.code(400).send({ error: "unknown speaker action" });
+      }
+      const body: SpeakerResponse = { ok: true, activePlayerDeviceId: result.activePlayerDeviceId };
+      return reply.send(body);
+    });
+
+    app.get<{ Querystring: { trackId?: string } }>(
+      "/api/lyrics",
+      { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } },
+      async (req, reply) => {
+        if (!(await requireSession(req, reply))) return;
+        const current = deps.station.snapshot().current;
+        if (!current)
+          return reply.send({ lyrics: null, source: "lyrics.ovh" } satisfies LyricsResult);
+        return reply.send(await lyricsOf(current.meta));
+      },
+    );
     ```
+
     Re-run — expect PASS. (`AUTOPLAY_REQUESTER` is imported for type-completeness of the requester surface; if eslint flags it as unused after wiring, remove it from the import — radio adds use it inside the engine, not here.)
 
 16. **Run the whole file — expect PASS.** `npx vitest run src/server/rest.test.ts`
     Expected: every state/add/pick/control/speaker/lyrics test green.
 
 17. **Write failing test — playlists list/save/load/delete (spec §6 playlists surface).** The `StationController` already delegates to a `PlaylistStore` via `listPlaylists()`/`savePlaylist(name)`/`loadPlaylist(name, requester)`/`deletePlaylist(name)` (Task 1.5). Expose them over REST so the `Playlists.tsx` panel (Task 5.5) is functional — not a stub. Extend `fakeStation()` with the four playlist methods, then append:
+
     ```ts
     describe("playlist REST", () => {
       function withPlaylists() {
@@ -6433,7 +7035,11 @@ Routes & error idioms (preserved from the bot):
       it("GET /api/playlists returns the PlaylistSummary list", async () => {
         const { app } = await build({ station: withPlaylists() } as never);
         const c = await login(app);
-        const res = await app.inject({ method: "GET", url: "/api/playlists", headers: { cookie: c } });
+        const res = await app.inject({
+          method: "GET",
+          url: "/api/playlists",
+          headers: { cookie: c },
+        });
         expect(res.statusCode).toBe(200);
         expect(res.json().playlists).toEqual([{ name: "mix", trackCount: 2, savedAt: 5 }]);
         await app.close();
@@ -6443,7 +7049,10 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build({ station } as never);
         const c = await login(app);
         const res = await app.inject({
-          method: "POST", url: "/api/playlists", headers: { cookie: c }, payload: { name: "road trip" },
+          method: "POST",
+          url: "/api/playlists",
+          headers: { cookie: c },
+          payload: { name: "road trip" },
         });
         expect(res.statusCode).toBe(200);
         expect(res.json().ok).toBe(true);
@@ -6454,7 +7063,10 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build({ station: withPlaylists() } as never);
         const c = await login(app);
         const res = await app.inject({
-          method: "POST", url: "/api/playlists", headers: { cookie: c }, payload: { name: "  " },
+          method: "POST",
+          url: "/api/playlists",
+          headers: { cookie: c },
+          payload: { name: "  " },
         });
         expect(res.statusCode).toBe(400);
         await app.close();
@@ -6464,7 +7076,10 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build({ station } as never);
         const c = await login(app, cfg(), "dev-5");
         const res = await app.inject({
-          method: "POST", url: "/api/playlists/load", headers: { cookie: c }, payload: { name: "mix" },
+          method: "POST",
+          url: "/api/playlists/load",
+          headers: { cookie: c },
+          payload: { name: "mix" },
         });
         expect(res.statusCode).toBe(200);
         expect(res.json()).toEqual({ ok: true, queued: 2 });
@@ -6480,7 +7095,10 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build({ station } as never);
         const c = await login(app);
         const res = await app.inject({
-          method: "POST", url: "/api/playlists/load", headers: { cookie: c }, payload: { name: "ghost" },
+          method: "POST",
+          url: "/api/playlists/load",
+          headers: { cookie: c },
+          payload: { name: "ghost" },
         });
         expect(res.statusCode).toBe(404);
         await app.close();
@@ -6490,7 +7108,9 @@ Routes & error idioms (preserved from the bot):
         const { app } = await build({ station } as never);
         const c = await login(app);
         const res = await app.inject({
-          method: "DELETE", url: "/api/playlists/mix", headers: { cookie: c },
+          method: "DELETE",
+          url: "/api/playlists/mix",
+          headers: { cookie: c },
         });
         expect(res.statusCode).toBe(200);
         expect(res.json().ok).toBe(true);
@@ -6501,48 +7121,54 @@ Routes & error idioms (preserved from the bot):
     ```
 
 18. **Run it — expect FAIL, then implement the playlist routes.** Run the suite (playlist routes 404). Add inside `registerRest`:
+
     ```ts
-      app.get("/api/playlists", async (req, reply) => {
-        if (!(await requireSession(req, reply))) return;
-        return reply.send({ playlists: deps.station.listPlaylists() });
-      });
+    app.get("/api/playlists", async (req, reply) => {
+      if (!(await requireSession(req, reply))) return;
+      return reply.send({ playlists: deps.station.listPlaylists() });
+    });
 
-      app.post<{ Body: { name?: string } }>("/api/playlists", async (req, reply) => {
-        if (!(await requireSession(req, reply))) return;
-        const name = (req.body?.name ?? "").toString().trim();
-        if (!name) return reply.code(400).send({ error: "playlist name is required" });
-        try {
-          await deps.station.savePlaylist(name);
-        } catch (err) {
-          return reply.code(400).send({ error: err instanceof Error ? err.message : "save_failed" });
-        }
-        return reply.send({ ok: true });
-      });
+    app.post<{ Body: { name?: string } }>("/api/playlists", async (req, reply) => {
+      if (!(await requireSession(req, reply))) return;
+      const name = (req.body?.name ?? "").toString().trim();
+      if (!name) return reply.code(400).send({ error: "playlist name is required" });
+      try {
+        await deps.station.savePlaylist(name);
+      } catch (err) {
+        return reply.code(400).send({ error: err instanceof Error ? err.message : "save_failed" });
+      }
+      return reply.send({ ok: true });
+    });
 
-      app.post<{ Body: { name?: string } }>("/api/playlists/load", async (req, reply) => {
-        if (!(await requireSession(req, reply))) return;
-        const info = sessionInfo(req);
-        if (!info) return reply.code(401).send({ error: "unauthenticated" });
-        const name = (req.body?.name ?? "").toString().trim();
-        if (!name) return reply.code(400).send({ error: "playlist name is required" });
-        const requester: Requester = { deviceId: info.deviceId, displayName: info.displayName, source: "user" };
-        const queued = await deps.station.loadPlaylist(name, requester);
-        if (queued === 0) return reply.code(404).send({ error: "playlist not found or empty" });
-        // Loading a playlist re-seeds off the user's adds; clear the radio de-dup window.
-        deps.radio.reset();
-        return reply.send({ ok: true, queued });
-      });
+    app.post<{ Body: { name?: string } }>("/api/playlists/load", async (req, reply) => {
+      if (!(await requireSession(req, reply))) return;
+      const info = sessionInfo(req);
+      if (!info) return reply.code(401).send({ error: "unauthenticated" });
+      const name = (req.body?.name ?? "").toString().trim();
+      if (!name) return reply.code(400).send({ error: "playlist name is required" });
+      const requester: Requester = {
+        deviceId: info.deviceId,
+        displayName: info.displayName,
+        source: "user",
+      };
+      const queued = await deps.station.loadPlaylist(name, requester);
+      if (queued === 0) return reply.code(404).send({ error: "playlist not found or empty" });
+      // Loading a playlist re-seeds off the user's adds; clear the radio de-dup window.
+      deps.radio.reset();
+      return reply.send({ ok: true, queued });
+    });
 
-      // Deleting is a destructive/global action: admin-gated when ADMIN_PASSWORD is set,
-      // otherwise any authed user (requireAdmin returns true for a null adminPassword).
-      app.delete<{ Params: { name: string } }>("/api/playlists/:name", async (req, reply) => {
-        if (!(await requireAdmin(req, reply, deps.cfg))) return;
-        const name = decodeURIComponent(req.params.name).trim();
-        if (!name) return reply.code(400).send({ error: "playlist name is required" });
-        const ok = await deps.station.deletePlaylist(name);
-        return reply.send({ ok });
-      });
+    // Deleting is a destructive/global action: admin-gated when ADMIN_PASSWORD is set,
+    // otherwise any authed user (requireAdmin returns true for a null adminPassword).
+    app.delete<{ Params: { name: string } }>("/api/playlists/:name", async (req, reply) => {
+      if (!(await requireAdmin(req, reply, deps.cfg))) return;
+      const name = decodeURIComponent(req.params.name).trim();
+      if (!name) return reply.code(400).send({ error: "playlist name is required" });
+      const ok = await deps.station.deletePlaylist(name);
+      return reply.send({ ok });
+    });
     ```
+
     Add the four playlist methods to the `StationController` slice consumed by `RestDeps` (they exist on the real controller per Task 1.5): `listPlaylists(): PlaylistSummary[]`, `savePlaylist(name): Promise<void>`, `loadPlaylist(name, requester): Promise<number>`, `deletePlaylist(name): Promise<boolean>`. Re-run — expect PASS.
 
 19. **Run the whole file — expect PASS.** `npx vitest run src/server/rest.test.ts`
@@ -6553,12 +7179,14 @@ Routes & error idioms (preserved from the bot):
 ### Task 4.3: buildApp wiring
 
 **Files**
+
 - Create: `src/server/app.ts`
 - Test: `src/server/app.test.ts`
 
 **Interfaces**
 
 Consumes:
+
 - `WebConfig` from `../config.js` (0.5).
 - `MemorySessionStore` from `../auth/session-store.js` (0.6).
 - `registerAuthRoutes` from `../auth/password.js` (4.1).
@@ -6568,6 +7196,7 @@ Consumes:
 - `StationController` (1.5), `YouTubeService` (0.4), `PlayerRegistry` (3.2), `AudioCache` (0.6), `Semaphore` (0.3).
 
 Produces (exact signature):
+
 ```ts
 export interface AppDeps {
   cfg: WebConfig;
@@ -6589,6 +7218,7 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
 #### Steps
 
 1. **Write failing test — /healthz, login-guard, SPA fallback, error handler.** Create `src/server/app.test.ts`:
+
    ```ts
    import { describe, it, expect, vi } from "vitest";
    import { EventEmitter } from "node:events";
@@ -6597,10 +7227,18 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
 
    function cfg(over: Partial<WebConfig> = {}): WebConfig {
      return {
-       publicBaseUrl: "https://j", viewerPassword: "letmein", adminPassword: null,
-       allowNoPassword: false, sessionSecret: "x".repeat(32), port: 8080, host: "0.0.0.0",
-       trustProxy: true, allowedWsOrigins: ["https://j"], nodeEnv: "test",
-       secureCookies: false, ...over,
+       publicBaseUrl: "https://j",
+       viewerPassword: "letmein",
+       adminPassword: null,
+       allowNoPassword: false,
+       sessionSecret: "x".repeat(32),
+       port: 8080,
+       host: "0.0.0.0",
+       trustProxy: true,
+       allowedWsOrigins: ["https://j"],
+       nodeEnv: "test",
+       secureCookies: false,
+       ...over,
      };
    }
 
@@ -6609,17 +7247,49 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
        cfg: cfg(),
        station: Object.assign(new EventEmitter(), {
          snapshot: vi.fn(() => ({
-           repeat: "off", autoplay: true, autoplaySource: "radio", volume: 100, maxTrackDurationSec: 0,
-           current: null, upcoming: [], upcomingRadio: [], history: [], seed: null, paused: false,
-           preparing: null, activePlayerPresent: false, activePlayerLabel: null,
+           repeat: "off",
+           autoplay: true,
+           autoplaySource: "radio",
+           volume: 100,
+           maxTrackDurationSec: 0,
+           current: null,
+           upcoming: [],
+           upcomingRadio: [],
+           history: [],
+           seed: null,
+           paused: false,
+           preparing: null,
+           activePlayerPresent: false,
+           activePlayerLabel: null,
          })),
          reportPosition: vi.fn(),
          listPlaylists: vi.fn(() => []),
        }),
        youtube: { resolve: vi.fn(), search: vi.fn(), download: vi.fn() },
-       registry: { isSpeaker: vi.fn(() => false), activePlayerDeviceId: null, touch: vi.fn(), claim: vi.fn(), release: vi.fn(() => ({ activePlayerDeviceId: null })), remember: vi.fn(() => ({ activePlayerDeviceId: null })), forget: vi.fn(() => ({ activePlayerDeviceId: null })), onConnect: vi.fn(), onDisconnect: vi.fn() },
-       broadcaster: { attach: vi.fn(), broadcast: vi.fn(), subscribe: vi.fn(), unsubscribe: vi.fn() },
-       cache: { get: vi.fn(() => null), getAudio: vi.fn(() => null), has: vi.fn(() => false), register: vi.fn(), pin: vi.fn() },
+       registry: {
+         isSpeaker: vi.fn(() => false),
+         activePlayerDeviceId: null,
+         touch: vi.fn(),
+         claim: vi.fn(),
+         release: vi.fn(() => ({ activePlayerDeviceId: null })),
+         remember: vi.fn(() => ({ activePlayerDeviceId: null })),
+         forget: vi.fn(() => ({ activePlayerDeviceId: null })),
+         onConnect: vi.fn(),
+         onDisconnect: vi.fn(),
+       },
+       broadcaster: {
+         attach: vi.fn(),
+         broadcast: vi.fn(),
+         subscribe: vi.fn(),
+         unsubscribe: vi.fn(),
+       },
+       cache: {
+         get: vi.fn(() => null),
+         getAudio: vi.fn(() => null),
+         has: vi.fn(() => false),
+         register: vi.fn(),
+         pin: vi.fn(),
+       },
        cacheDir: "/tmp/lan-jukebox-test-cache",
        downloads: { run: vi.fn(async (f: () => Promise<unknown>) => f()) },
        radio: { reset: vi.fn() },
@@ -6645,7 +7315,8 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
      it("login then /api/state returns 200 through the real session", async () => {
        const app = await buildApp(deps());
        const login = await app.inject({
-         method: "POST", url: "/api/login",
+         method: "POST",
+         url: "/api/login",
          payload: { password: "letmein", displayName: "Ada", deviceId: "dev-1" },
        });
        expect(login.statusCode).toBe(200);
@@ -6672,12 +7343,14 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
      });
    });
    ```
+
    (If `index.html` is absent in the test cwd, `sendFile` 404s with Fastify's default body, not `{error:"not_found"}` — the assertion above tolerates that; the SPA-vs-API divergence is the real contract under test.)
 
 2. **Run it — expect FAIL.** `npx vitest run src/server/app.test.ts`
    Expected: `Cannot find module './app.js'`.
 
 3. **Implement `buildApp`.** Create `src/server/app.ts`:
+
    ```ts
    import Fastify, { type FastifyInstance, type FastifyError } from "fastify";
    import cookie from "@fastify/cookie";
@@ -6707,7 +7380,7 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
      registry: PlayerRegistry;
      broadcaster: StationBroadcaster;
      cache: AudioCache;
-     cacheDir: string;            // = media.cacheDir; the audio route downloads/transcodes into it
+     cacheDir: string; // = media.cacheDir; the audio route downloads/transcodes into it
      downloads: Semaphore;
      lyrics?: RestDeps["lyrics"];
      radio: RestDeps["radio"];
@@ -6805,6 +7478,7 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
      return app;
    }
    ```
+
    (Match `registerAudioRoute` / `registerWebsocket` argument shapes to whatever Phases 2.2 and 3.3/3.4 actually produced; the names above mirror this plan's backbone — adjust the deps object keys if those tasks named them differently.)
 
 4. **Run it — expect PASS.** `npx vitest run src/server/app.test.ts`
@@ -6815,12 +7489,14 @@ Behavior: register `@fastify/cookie`, `@fastify/session` (`MemorySessionStore`, 
 ### Task 4.4: Composition root main()
 
 **Files**
+
 - Create: `src/index.ts`
 - Test: none (composition root; verified by typecheck + build + the canary path being exercised in 0.3 tests). The phase verification (`npm run build` + the full suite) is the gate.
 
 **Interfaces**
 
 Consumes:
+
 - `loadConfig` from `./config.js` (0.5) → `AppConfig { media, station, web }`.
 - `createLogger`, `setRootLogger` from `./util/logger.js`; `installCrashHandlers`, `installSignalHandlers` from `./lifecycle.js`; `startupCanary` from `./canary.js` (0.3).
 - `YouTubeService` (0.4), `AudioCache` (0.6), `Semaphore` (0.3), `StationController` (1.5), `RadioEngine` (1.6), `PlaylistStore` (1.3), snapshot helpers `collectStationSnapshot`/`writeStationSnapshot`/`readStationSnapshot`/`restoreStationSnapshot` (1.7), `PlayerRegistry` (3.2), `StationBroadcaster` (3.3), `buildApp` (4.3).
@@ -6832,6 +7508,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 #### Steps
 
 1. **Write `src/index.ts`.** (No unit test; the build + typecheck verify wiring. Each consumed symbol is real from earlier phases.) Create:
+
    ```ts
    import { loadConfig } from "./config.js";
    import { YouTubeService } from "./youtube/index.js";
@@ -6991,6 +7668,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      process.exit(1);
    });
    ```
+
    (The constructor/option shapes above are reconciled with the exact exports of Phases 1.5/1.6/1.7/3.2/3.3: `StationControllerDeps` = `{ download, pin?, unpin?, prefetch?, settings?, onSettingsChanged?, now?, queue? }`; `RadioDeps` = `{ youtube, station, settings, recentWindow? }`; `PlayerRegistryDeps` = `{ dir, station, now? }`; `collectStationSnapshot(station, activePlayerDeviceId, now)` + `restoreStationSnapshot(file, station, log)`. The radio is wired into the controller through `setRadioContinuation`/`setRadioTopUp` (no circular import); do not pass `radio` into the `StationController` constructor.)
 
 2. **Typecheck the composition root.** `npm run typecheck`
@@ -7004,15 +7682,19 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 ### Task 4.5: Phase completion — full verification, adversarial debug, single squash commit
 
 **Files**
+
 - No new files. This task gates the phase.
 
 #### Steps
 
 1. **Full verification — typecheck + lint + build + tests.** Run:
+
    ```
    npm run typecheck && npm run lint && npm run build && npm test
    ```
+
    Expected GREEN output (shape):
+
    ```
    > tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit && tsc -p web/tsconfig.json
    (no output, exit 0)
@@ -7032,6 +7714,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    Test Files  N passed (N)
         Tests  M passed (M)
    ```
+
    If anything is red, fix it before proceeding — do NOT commit a partial phase.
 
 2. **Adversarial multi-agent /debug pass.** Fan out finder subagents across this phase's changed files — `src/auth/password.ts`, `src/server/rest.ts`, `src/server/app.ts`, `src/index.ts` — each through a reliability lens, then adversarially verify every finding before fixing. Lenses to assign:
@@ -7041,7 +7724,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    - **buildApp hardening:** is the rate-limit key the session deviceId else `socket.remoteAddress` (NOT `req.ip`, to defeat XFF spoofing under trustProxy)? Does the error handler map URIError→400 and >=500→internal_error while preserving explicit 4xx? Does the SPA fallback exclude `/api`, `/ws`, `/audio`? Are cookies `httpOnly`, `sameSite:lax`, `secure:cfg.secureCookies`?
    - **Composition root:** is `buildApp`+`listen` done immediately (no gateway wait)? Is the snapshot flushed on SIGTERM and `app.close()` called within `graceMs`? Is the debounced writer timer cleared in the shutdown task so it can't fire post-close? Does `main().catch` exit(1) on a fatal startup error?
    - **WS origin guard reachability:** confirm `buildApp` passes `cfg.allowedWsOrigins` (which the config layer pins to `[publicBaseUrl]`) into `registerWebsocket` so the origin guard is actually armed.
-   Verify each candidate finding against the code/tests; fix ALL confirmed bugs (add a regression test for each behavioral fix); discard the false positives. Re-run the full verification from step 1 until green.
+     Verify each candidate finding against the code/tests; fix ALL confirmed bugs (add a regression test for each behavioral fix); discard the false positives. Re-run the full verification from step 1 until green.
 
 3. **Exactly ONE squash commit for the whole phase** (after debug is clean — per the one-commit-per-phase rule, overriding any per-task commit default). The repo is under `Atvriders`, branch `master`, no `gh` CLI:
    ```
@@ -7096,6 +7779,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 ### Task 5.1: Design system + api client + deviceId
 
 **Files**
+
 - Create: `web/src/index.css` (authored via the `frontend-design` skill)
 - Create: `web/src/lib/api.ts`
 - Test: `web/src/lib/api.test.ts`
@@ -7103,6 +7787,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 - Test: `web/src/lib/deviceId.test.ts`
 
 **Interfaces**
+
 - Consumes: `web/src/types.ts` (Phase 0) — `LoginRequest`, `AdminRequest`, `SessionInfo`, `StationStateResponse`, `AddRequest`, `AddResponse`, `PickRequest`, `PickResponse`, `ControlAction`, `ControlRequest`, `ControlResponse`, `SpeakerAction`, `SpeakerRequest`, `SpeakerResponse`, `LyricsResult`. Spec §6 REST routes.
 - Produces:
   - `web/src/index.css` — Tailwind v4 `@theme` design tokens + component classes (`.card`, `.pill`, `.pill-primary`, `.pill-ghost`, `.eyebrow`, `.vu`, `.spinner`, `.reveal`, `.hero-glow`).
@@ -7185,7 +7870,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 
    function mockOnce(ok: boolean, json: unknown, status = ok ? 200 : 400, statusText?: string) {
      const fn = vi.fn().mockResolvedValue({
-       ok, status, statusText,
+       ok,
+       status,
+       statusText,
        headers: { get: () => null },
        json: async () => json,
      });
@@ -7202,14 +7889,20 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        expect(url).toBe("/api/login");
        expect((init as RequestInit).method).toBe("POST");
        expect((init as RequestInit).credentials).toBe("include");
-       expect(JSON.parse(String((init as RequestInit).body))).toEqual({ password: "pw", displayName: "Al", deviceId: "d1" });
+       expect(JSON.parse(String((init as RequestInit).body))).toEqual({
+         password: "pw",
+         displayName: "Al",
+         deviceId: "d1",
+       });
        expect(s.isAdmin).toBe(false);
      });
      it("admin POSTs the AdminRequest and returns the elevated session", async () => {
        const fn = mockOnce(true, { displayName: "Al", deviceId: "d1", isAdmin: true });
        const s = await api.admin({ password: "root" });
        expect(fn.mock.calls[0]![0]).toBe("/api/admin");
-       expect(JSON.parse(String((fn.mock.calls[0]![1] as RequestInit).body))).toEqual({ password: "root" });
+       expect(JSON.parse(String((fn.mock.calls[0]![1] as RequestInit).body))).toEqual({
+         password: "root",
+       });
        expect(s.isAdmin).toBe(true);
      });
      it("state GETs /api/state with credentials", async () => {
@@ -7242,12 +7935,17 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        await api.control("seek", 42000);
        const [url, init] = fn.mock.calls[0]!;
        expect(url).toBe("/api/control");
-       expect(JSON.parse(String((init as RequestInit).body))).toEqual({ action: "seek", value: 42000 });
+       expect(JSON.parse(String((init as RequestInit).body))).toEqual({
+         action: "seek",
+         value: 42000,
+       });
      });
      it("control omits value when not provided (bodyless-ish action like pause)", async () => {
        const fn = mockOnce(true, { ok: true });
        await api.control("pause");
-       expect(JSON.parse(String((fn.mock.calls[0]![1] as RequestInit).body))).toEqual({ action: "pause" });
+       expect(JSON.parse(String((fn.mock.calls[0]![1] as RequestInit).body))).toEqual({
+         action: "pause",
+       });
      });
      it("speaker POSTs { action } and returns the active player id", async () => {
        const fn = mockOnce(true, { ok: true, activePlayerDeviceId: "d1" });
@@ -7272,7 +7970,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        const save = mockOnce(true, { ok: true });
        await api.savePlaylist("road trip");
        expect(save.mock.calls[0]![0]).toBe("/api/playlists");
-       expect(JSON.parse(String((save.mock.calls[0]![1] as RequestInit).body))).toEqual({ name: "road trip" });
+       expect(JSON.parse(String((save.mock.calls[0]![1] as RequestInit).body))).toEqual({
+         name: "road trip",
+       });
        const load = mockOnce(true, { ok: true, queued: 2 });
        expect((await api.loadPlaylist("mix")).queued).toBe(2);
        expect(load.mock.calls[0]![0]).toBe("/api/playlists/load");
@@ -7283,9 +7983,12 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      });
      it("logout resolves on an empty 204 body without parsing JSON", async () => {
        const fn = vi.fn().mockResolvedValue({
-         ok: true, status: 204,
+         ok: true,
+         status: 204,
          headers: { get: () => null },
-         json: async () => { throw new SyntaxError("Unexpected end of JSON input"); },
+         json: async () => {
+           throw new SyntaxError("Unexpected end of JSON input");
+         },
        });
        vi.stubGlobal("fetch", fn);
        await expect(api.logout()).resolves.toBeUndefined();
@@ -7293,17 +7996,25 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      });
      it("throws ApiError with the status AND the body's error message on non-OK", async () => {
        mockOnce(false, { error: "bad password" }, 401);
-       await expect(api.login({ password: "x", displayName: "y", deviceId: "z" }))
-         .rejects.toMatchObject({ status: 401, message: "bad password" });
+       await expect(
+         api.login({ password: "x", displayName: "y", deviceId: "z" }),
+       ).rejects.toMatchObject({ status: 401, message: "bad password" });
      });
      it("falls back to statusText when the non-OK body has no parseable JSON", async () => {
        const fn = vi.fn().mockResolvedValue({
-         ok: false, status: 500, statusText: "Internal Server Error",
+         ok: false,
+         status: 500,
+         statusText: "Internal Server Error",
          headers: { get: () => null },
-         json: async () => { throw new SyntaxError("boom"); },
+         json: async () => {
+           throw new SyntaxError("boom");
+         },
        });
        vi.stubGlobal("fetch", fn);
-       await expect(api.state()).rejects.toMatchObject({ status: 500, message: "Internal Server Error" });
+       await expect(api.state()).rejects.toMatchObject({
+         status: 500,
+         message: "Internal Server Error",
+       });
      });
      it("ApiError is an Error subclass named ApiError", () => {
        const e = new ApiError(403, "forbidden");
@@ -7317,13 +8028,29 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 7. **Minimal implementation.** Create `web/src/lib/api.ts`:
    ```ts
    import type {
-     AddRequest, AddResponse, AdminRequest, ControlAction, ControlRequest, ControlResponse,
-     LoginRequest, LyricsResult, PickRequest, PickResponse, PlaylistSummary, SessionInfo,
-     SpeakerAction, SpeakerRequest, SpeakerResponse, StationStateResponse,
+     AddRequest,
+     AddResponse,
+     AdminRequest,
+     ControlAction,
+     ControlRequest,
+     ControlResponse,
+     LoginRequest,
+     LyricsResult,
+     PickRequest,
+     PickResponse,
+     PlaylistSummary,
+     SessionInfo,
+     SpeakerAction,
+     SpeakerRequest,
+     SpeakerResponse,
+     StationStateResponse,
    } from "../types.js";
 
    export class ApiError extends Error {
-     constructor(public readonly status: number, message: string) {
+     constructor(
+       public readonly status: number,
+       message: string,
+     ) {
        super(message);
        this.name = "ApiError";
      }
@@ -7333,7 +8060,11 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      const res = await fetch(url, { credentials: "include", ...init });
      if (!res.ok) {
        let detail = res.statusText;
-       try { detail = ((await res.json()) as { error?: string }).error ?? detail; } catch { /* ignore */ }
+       try {
+         detail = ((await res.json()) as { error?: string }).error ?? detail;
+       } catch {
+         /* ignore */
+       }
        throw new ApiError(res.status, detail);
      }
      // 204 / empty bodies: calling res.json() would throw — short-circuit.
@@ -7357,15 +8088,23 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      admin: (body: AdminRequest) => post<SessionInfo>("/api/admin", body),
      logout: () => post<void>("/api/logout"),
      state: () => req<StationStateResponse>("/api/state"),
-     add: (urlOrQuery: string) => post<AddResponse>("/api/add", { urlOrQuery } satisfies AddRequest),
-     pick: (candidateId: string) => post<PickResponse>("/api/pick", { candidateId } satisfies PickRequest),
+     add: (urlOrQuery: string) =>
+       post<AddResponse>("/api/add", { urlOrQuery } satisfies AddRequest),
+     pick: (candidateId: string) =>
+       post<PickResponse>("/api/pick", { candidateId } satisfies PickRequest),
      control: (action: ControlAction, value?: ControlRequest["value"]) =>
-       post<ControlResponse>("/api/control", value === undefined ? { action } : ({ action, value } satisfies ControlRequest)),
-     speaker: (action: SpeakerAction) => post<SpeakerResponse>("/api/speaker", { action } satisfies SpeakerRequest),
-     lyrics: (trackId: string) => req<LyricsResult>(`/api/lyrics?trackId=${encodeURIComponent(trackId)}`),
+       post<ControlResponse>(
+         "/api/control",
+         value === undefined ? { action } : ({ action, value } satisfies ControlRequest),
+       ),
+     speaker: (action: SpeakerAction) =>
+       post<SpeakerResponse>("/api/speaker", { action } satisfies SpeakerRequest),
+     lyrics: (trackId: string) =>
+       req<LyricsResult>(`/api/lyrics?trackId=${encodeURIComponent(trackId)}`),
      playlists: () => req<{ playlists: PlaylistSummary[] }>("/api/playlists"),
      savePlaylist: (name: string) => post<{ ok: boolean }>("/api/playlists", { name }),
-     loadPlaylist: (name: string) => post<{ ok: boolean; queued: number }>("/api/playlists/load", { name }),
+     loadPlaylist: (name: string) =>
+       post<{ ok: boolean; queued: number }>("/api/playlists/load", { name }),
      deletePlaylist: (name: string) =>
        req<{ ok: boolean }>(`/api/playlists/${encodeURIComponent(name)}`, { method: "DELETE" }),
    };
@@ -7377,11 +8116,13 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 ### Task 5.2: useStationState WS hook + reducer
 
 **Files**
+
 - Create: `web/src/lib/useStationState.ts`
 - Test: `web/src/lib/useStationState.test.ts`
 - Test: `web/src/lib/wsReducer.test.ts`
 
 **Interfaces**
+
 - Consumes: 5.1 `getDeviceId`; Phase 0 `StationSnapshot`, `ServerBroadcastMessage`; spec §6 WS protocol.
 - Produces:
   - `interface WsState { snapshot: StationSnapshot | null; status: "connecting"|"live"|"forbidden"|"closed"; receivedAt: number; lastError?: { title: string; reason: string; seq: number } | null; }`
@@ -7434,9 +8175,20 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        expect(applyWsMessage(prev, JSON.stringify({ type: "noop" }))).toBe(prev);
      });
      it("sets lastError on a trackError frame and increments seq", () => {
-       const s1 = applyWsMessage(initialWsState, JSON.stringify({ type: "trackError", videoId: "v1", title: "X", reason: "po_token_sabr" }));
+       const s1 = applyWsMessage(
+         initialWsState,
+         JSON.stringify({ type: "trackError", videoId: "v1", title: "X", reason: "po_token_sabr" }),
+       );
        expect(s1.lastError).toMatchObject({ title: "X", reason: "po_token_sabr", seq: 1 });
-       const s2 = applyWsMessage(s1, JSON.stringify({ type: "trackError", videoId: "v2", title: "Y", reason: "download_failed" }));
+       const s2 = applyWsMessage(
+         s1,
+         JSON.stringify({
+           type: "trackError",
+           videoId: "v2",
+           title: "Y",
+           reason: "download_failed",
+         }),
+       );
        expect(s2.lastError).toMatchObject({ title: "Y", reason: "download_failed", seq: 2 });
      });
    });
@@ -7481,7 +8233,11 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 
    export function applyWsMessage(prev: WsState, raw: string): WsState {
      let msg: { type?: string; state?: StationSnapshot; title?: string; reason?: string };
-     try { msg = JSON.parse(raw); } catch { return prev; }
+     try {
+       msg = JSON.parse(raw);
+     } catch {
+       return prev;
+     }
      if (msg.type === "state" && msg.state)
        return { ...prev, snapshot: msg.state, status: "live", receivedAt: Date.now() };
      if (msg.type === "trackError") {
@@ -7511,18 +8267,35 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    // Minimal controllable fake WebSocket capturing sends + exposing the open/message hooks.
    class FakeWS {
      static instances: FakeWS[] = [];
-     static OPEN = 1; static CONNECTING = 0;
+     static OPEN = 1;
+     static CONNECTING = 0;
      readyState = FakeWS.CONNECTING;
      sent: string[] = [];
      private listeners: Record<string, ((e: unknown) => void)[]> = {};
-     constructor(public url: string) { FakeWS.instances.push(this); }
-     addEventListener(type: string, fn: (e: unknown) => void) { (this.listeners[type] ??= []).push(fn); }
+     constructor(public url: string) {
+       FakeWS.instances.push(this);
+     }
+     addEventListener(type: string, fn: (e: unknown) => void) {
+       (this.listeners[type] ??= []).push(fn);
+     }
      removeEventListener() {}
-     send(data: string) { this.sent.push(data); }
-     close() { this.readyState = 3; this.emit("close", {}); }
-     emit(type: string, e: unknown) { (this.listeners[type] ?? []).forEach((fn) => fn(e)); }
-     fireOpen() { this.readyState = FakeWS.OPEN; this.emit("open", {}); }
-     fireMessage(data: string) { this.emit("message", { data }); }
+     send(data: string) {
+       this.sent.push(data);
+     }
+     close() {
+       this.readyState = 3;
+       this.emit("close", {});
+     }
+     emit(type: string, e: unknown) {
+       (this.listeners[type] ?? []).forEach((fn) => fn(e));
+     }
+     fireOpen() {
+       this.readyState = FakeWS.OPEN;
+       this.emit("open", {});
+     }
+     fireMessage(data: string) {
+       this.emit("message", { data });
+     }
    }
 
    beforeEach(() => {
@@ -7539,13 +8312,19 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        const ws = FakeWS.instances[0]!;
        expect(ws.url).toMatch(/\/ws$/);
        act(() => ws.fireOpen());
-       expect(JSON.parse(ws.sent[0]!)).toEqual({ type: "hello", deviceId: "dev-abc", role: "remote" });
+       expect(JSON.parse(ws.sent[0]!)).toEqual({
+         type: "hello",
+         deviceId: "dev-abc",
+         role: "remote",
+       });
      });
      it("becomes live and stores the snapshot on a state frame", () => {
        const { result } = renderHook(() => useStationState());
        const ws = FakeWS.instances[0]!;
        act(() => ws.fireOpen());
-       act(() => ws.fireMessage(JSON.stringify({ type: "state", state: { current: null, paused: false } })));
+       act(() =>
+         ws.fireMessage(JSON.stringify({ type: "state", state: { current: null, paused: false } })),
+       );
        expect(result.current.status).toBe("live");
        expect(result.current.snapshot).toMatchObject({ paused: false });
      });
@@ -7579,19 +8358,31 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        let retryTimer: ReturnType<typeof setTimeout> | null = null;
        let forbidden = false;
 
-       const clearRetry = () => { if (retryTimer !== null) { clearTimeout(retryTimer); retryTimer = null; } };
+       const clearRetry = () => {
+         if (retryTimer !== null) {
+           clearTimeout(retryTimer);
+           retryTimer = null;
+         }
+       };
        const scheduleReconnect = () => {
          if (unmounted || forbidden || retryTimer !== null) return;
          const delay = reconnectDelayMs(attempt);
          attempt += 1;
-         retryTimer = setTimeout(() => { retryTimer = null; connect(); }, delay);
+         retryTimer = setTimeout(() => {
+           retryTimer = null;
+           connect();
+         }, delay);
        };
 
        type Tracked = WebSocket & { _dead?: boolean };
        function teardownSocket() {
          if (socket) {
            (socket as Tracked)._dead = true;
-           try { socket.close(); } catch { /* ignore */ }
+           try {
+             socket.close();
+           } catch {
+             /* ignore */
+           }
            socket = null;
            setLiveSocket(null);
          }
@@ -7633,7 +8424,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
          attempt = 0;
          connect();
        };
-       const onVisible = () => { if (document.visibilityState === "visible") reconnectNow(); };
+       const onVisible = () => {
+         if (document.visibilityState === "visible") reconnectNow();
+       };
 
        document.addEventListener("visibilitychange", onVisible);
        window.addEventListener("online", reconnectNow);
@@ -7658,10 +8451,12 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 ### Task 5.3: usePlayerRole hidden-audio sink
 
 **Files**
+
 - Create: `web/src/lib/usePlayerRole.ts`
 - Test: `web/src/lib/usePlayerRole.test.ts`
 
 **Interfaces**
+
 - Consumes: 5.1 `getDeviceId` (unused here directly; deviceId carried by the WS session); Phase 0 `ServerPlayerMessage`, `ClientWsMessage`; spec §5 browser-autoplay caveat.
 - Produces: `usePlayerRole(ws: WebSocket | null, isSpeaker: boolean): { audioRef: React.RefObject<HTMLAudioElement>; volume: number; error: string | null }`.
   - Owns a hidden `<audio>` (the caller mounts `audioRef`).
@@ -7684,10 +8479,16 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      const listeners: Record<string, ((e: unknown) => void)[]> = {};
      return {
        sent: [] as string[],
-       send(d: string) { this.sent.push(d); },
-       addEventListener(t: string, fn: (e: unknown) => void) { (listeners[t] ??= []).push(fn); },
+       send(d: string) {
+         this.sent.push(d);
+       },
+       addEventListener(t: string, fn: (e: unknown) => void) {
+         (listeners[t] ??= []).push(fn);
+       },
        removeEventListener() {},
-       fireMessage(data: string) { (listeners.message ?? []).forEach((fn) => fn({ data })); },
+       fireMessage(data: string) {
+         (listeners.message ?? []).forEach((fn) => fn({ data }));
+       },
      };
    }
 
@@ -7707,12 +8508,16 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    describe("usePlayerRole", () => {
      it("sends becomePlayer when it becomes the speaker", () => {
        const ws = makeWs();
-       renderHook(({ s }) => usePlayerRole(ws as unknown as WebSocket, s), { initialProps: { s: true } });
+       renderHook(({ s }) => usePlayerRole(ws as unknown as WebSocket, s), {
+         initialProps: { s: true },
+       });
        expect(ws.sent.map((m) => JSON.parse(m).type)).toContain("becomePlayer");
      });
      it("sends relinquishPlayer when it stops being the speaker", () => {
        const ws = makeWs();
-       const { rerender } = renderHook(({ s }) => usePlayerRole(ws as unknown as WebSocket, s), { initialProps: { s: true } });
+       const { rerender } = renderHook(({ s }) => usePlayerRole(ws as unknown as WebSocket, s), {
+         initialProps: { s: true },
+       });
        act(() => rerender({ s: false }));
        expect(ws.sent.map((m) => JSON.parse(m).type)).toContain("relinquishPlayer");
      });
@@ -7720,8 +8525,12 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        const ws = makeWs();
        const { result } = renderHook(() => usePlayerRole(ws as unknown as WebSocket, true));
        const el = document.createElement("audio");
-       act(() => { (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current = el; });
-       act(() => ws.fireMessage(JSON.stringify({ type: "load", audioUrl: "/audio/v1", startMs: 0 })));
+       act(() => {
+         (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current = el;
+       });
+       act(() =>
+         ws.fireMessage(JSON.stringify({ type: "load", audioUrl: "/audio/v1", startMs: 0 })),
+       );
        expect(el.getAttribute("src")).toBe("/audio/v1");
        act(() => ws.fireMessage(JSON.stringify({ type: "setVolume", pct: 50 })));
        expect(el.volume).toBeCloseTo(0.5);
@@ -7731,7 +8540,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        const ws = makeWs();
        const { result } = renderHook(() => usePlayerRole(ws as unknown as WebSocket, true));
        const el = document.createElement("audio");
-       act(() => { (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current = el; });
+       act(() => {
+         (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current = el;
+       });
        act(() => ws.fireMessage(JSON.stringify({ type: "setVolume", pct: 150 })));
        expect(el.volume).toBe(1);
        expect(result.current.volume).toBe(150);
@@ -7740,7 +8551,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        const ws = makeWs();
        const { result } = renderHook(() => usePlayerRole(ws as unknown as WebSocket, true));
        const el = document.createElement("audio");
-       act(() => { (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current = el; });
+       act(() => {
+         (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current = el;
+       });
        // Re-render so the effect re-binds to the now-present element.
        act(() => ws.fireMessage(JSON.stringify({ type: "play" })));
        act(() => el.dispatchEvent(new Event("ended")));
@@ -7790,14 +8603,24 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        if (!ws) return;
        const onMessage = (e: MessageEvent) => {
          let msg: ServerPlayerMessage;
-         try { msg = JSON.parse(String(e.data)); } catch { return; }
+         try {
+           msg = JSON.parse(String(e.data));
+         } catch {
+           return;
+         }
          const el = audioRef.current;
          if (!el) return;
          switch (msg.type) {
            case "load": {
              el.src = msg.audioUrl;
              const startMs = msg.startMs;
-             const seekToStart = () => { try { el.currentTime = startMs / 1000; } catch { /* ignore */ } };
+             const seekToStart = () => {
+               try {
+                 el.currentTime = startMs / 1000;
+               } catch {
+                 /* ignore */
+               }
+             };
              el.addEventListener("loadedmetadata", seekToStart, { once: true });
              el.load();
              break;
@@ -7810,8 +8633,16 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
                send({ type: "playbackError", message });
              });
              break;
-           case "pause": el.pause(); break;
-           case "seek": try { el.currentTime = msg.ms / 1000; } catch { /* ignore */ } break;
+           case "pause":
+             el.pause();
+             break;
+           case "seek":
+             try {
+               el.currentTime = msg.ms / 1000;
+             } catch {
+               /* ignore */
+             }
+             break;
            case "setVolume": {
              const pct = msg.pct;
              el.volume = Math.max(0, Math.min(1, pct / 100));
@@ -7863,12 +8694,14 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 ### Task 5.4: LoginGate + PlayerPanel
 
 **Files**
+
 - Create: `web/src/components/LoginGate.tsx`
 - Test: `web/src/components/LoginGate.test.tsx`
 - Create: `web/src/components/PlayerPanel.tsx`
 - Test: `web/src/components/PlayerPanel.test.tsx`
 
 **Interfaces**
+
 - Consumes: 5.1 `api.login`/`api.admin`, `getDeviceId`/`getDisplayName`/`setDisplayName`; 5.3 `usePlayerRole` (audioRef is passed in by App, not created here); Phase 0 `SessionInfo`.
 - Produces:
   - `LoginGate({ onAuthed }: { onAuthed: (s: SessionInfo) => void })` — shared-password + displayName form; submits `api.login({ password, displayName, deviceId })`; surfaces the error message on failure; optional admin-unlock sub-form calling `api.admin({ password })` then `onAuthed` with the elevated session.
@@ -7885,7 +8718,10 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    import { api } from "../lib/api.js";
 
    beforeEach(() => localStorage.clear());
-   afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+   afterEach(() => {
+     cleanup();
+     vi.restoreAllMocks();
+   });
 
    describe("LoginGate", () => {
      it("submits the password + displayName + deviceId and calls onAuthed with the session", async () => {
@@ -7903,7 +8739,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        await waitFor(() => expect(onAuthed).toHaveBeenCalledWith(session));
      });
      it("shows the server error message on a failed login and does not call onAuthed", async () => {
-       vi.spyOn(api, "login").mockRejectedValue(Object.assign(new Error("bad password"), { name: "ApiError", status: 401 }));
+       vi.spyOn(api, "login").mockRejectedValue(
+         Object.assign(new Error("bad password"), { name: "ApiError", status: 401 }),
+       );
        const onAuthed = vi.fn();
        render(<LoginGate onAuthed={onAuthed} />);
        fireEvent.change(screen.getByLabelText(/display name/i), { target: { value: "Al" } });
@@ -7935,7 +8773,11 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        setError(null);
        try {
          setDisplayName(displayName);
-         const session = await api.login({ password, displayName: displayName.trim() || "Guest", deviceId: getDeviceId() });
+         const session = await api.login({
+           password,
+           displayName: displayName.trim() || "Guest",
+           deviceId: getDeviceId(),
+         });
          onAuthed(session);
        } catch (err) {
          setError(err instanceof Error ? err.message : "Login failed");
@@ -7947,29 +8789,59 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      return (
        <main className="min-h-full grid place-items-center px-6 py-12">
          <form onSubmit={submit} className="card hero-glow reveal max-w-md w-full p-10">
-           <p className="eyebrow" style={{ color: "var(--color-ember-soft)" }}>LAN Jukebox</p>
-           <h1 className="font-display text-4xl mt-3 leading-tight" style={{ color: "var(--color-ink)" }}>
+           <p className="eyebrow" style={{ color: "var(--color-ember-soft)" }}>
+             LAN Jukebox
+           </p>
+           <h1
+             className="font-display text-4xl mt-3 leading-tight"
+             style={{ color: "var(--color-ink)" }}
+           >
              Join the station.
            </h1>
            <label className="flex flex-col gap-1.5 mt-7">
              <span className="eyebrow">Display name</span>
-             <input value={displayName} onChange={(e) => setName(e.target.value)}
-               aria-label="Display name" autoComplete="nickname"
+             <input
+               value={displayName}
+               onChange={(e) => setName(e.target.value)}
+               aria-label="Display name"
+               autoComplete="nickname"
                className="outline-none text-sm px-4 py-3"
-               style={{ border: "1px solid var(--color-line)", color: "var(--color-ink)" }} />
+               style={{ border: "1px solid var(--color-line)", color: "var(--color-ink)" }}
+             />
            </label>
            <label className="flex flex-col gap-1.5 mt-4">
              <span className="eyebrow">Password</span>
-             <input value={password} onChange={(e) => setPassword(e.target.value)}
-               type="password" aria-label="Password" autoComplete="current-password"
+             <input
+               value={password}
+               onChange={(e) => setPassword(e.target.value)}
+               type="password"
+               aria-label="Password"
+               autoComplete="current-password"
                className="outline-none text-sm px-4 py-3"
-               style={{ border: "1px solid var(--color-line)", color: "var(--color-ink)" }} />
+               style={{ border: "1px solid var(--color-line)", color: "var(--color-ink)" }}
+             />
            </label>
            {error && (
-             <p role="alert" className="mt-4 text-sm font-mono" style={{ color: "var(--color-ember-soft)" }}>{error}</p>
+             <p
+               role="alert"
+               className="mt-4 text-sm font-mono"
+               style={{ color: "var(--color-ember-soft)" }}
+             >
+               {error}
+             </p>
            )}
-           <button type="submit" disabled={busy} className="pill pill-primary mt-7 justify-center w-full">
-             {busy ? (<><span className="spinner" aria-hidden /> Entering…</>) : "Enter the station"}
+           <button
+             type="submit"
+             disabled={busy}
+             className="pill pill-primary mt-7 justify-center w-full"
+           >
+             {busy ? (
+               <>
+                 <span className="spinner" aria-hidden /> Entering…
+               </>
+             ) : (
+               "Enter the station"
+             )}
            </button>
          </form>
        </main>
@@ -7993,7 +8865,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    describe("PlayerPanel", () => {
      it("announces this device is the speaker and mounts the audio element on the ref", () => {
        const audioRef = createRef<HTMLAudioElement>();
-       const { container } = render(<PlayerPanel isSpeaker onRelinquish={() => {}} audioRef={audioRef} />);
+       const { container } = render(
+         <PlayerPanel isSpeaker onRelinquish={() => {}} audioRef={audioRef} />,
+       );
        expect(screen.getByText(/this device is the speaker/i)).toBeTruthy();
        const audio = container.querySelector("audio");
        expect(audio).toBeTruthy();
@@ -8008,7 +8882,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      });
      it("still mounts the (hidden) audio element when this device is NOT the speaker", () => {
        const audioRef = createRef<HTMLAudioElement>();
-       const { container } = render(<PlayerPanel isSpeaker={false} onRelinquish={() => {}} audioRef={audioRef} />);
+       const { container } = render(
+         <PlayerPanel isSpeaker={false} onRelinquish={() => {}} audioRef={audioRef} />,
+       );
        expect(container.querySelector("audio")).toBeTruthy(); // audio always mounted so commands can load
        expect(screen.queryByText(/this device is the speaker/i)).toBeNull();
      });
@@ -8034,17 +8910,31 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
          {isSpeaker ? (
            <div className="flex items-center justify-between gap-3">
              <div className="flex items-center gap-3">
-               <span aria-hidden className="font-mono text-sm" style={{ color: "var(--color-ember-soft)" }}>●</span>
-               <span className="text-sm" style={{ color: "var(--color-ink)" }}>This device is the speaker</span>
+               <span
+                 aria-hidden
+                 className="font-mono text-sm"
+                 style={{ color: "var(--color-ember-soft)" }}
+               >
+                 ●
+               </span>
+               <span className="text-sm" style={{ color: "var(--color-ink)" }}>
+                 This device is the speaker
+               </span>
              </div>
-             <button className="pill pill-ghost" onClick={onRelinquish} aria-label="Relinquish speaker">
+             <button
+               className="pill pill-ghost"
+               onClick={onRelinquish}
+               aria-label="Relinquish speaker"
+             >
                Relinquish
              </button>
            </div>
          ) : (
            <div className="flex items-center gap-3">
              <span className="eyebrow">Player</span>
-             <span className="text-sm" style={{ color: "var(--color-ink-dim)" }}>Not the speaker on this device.</span>
+             <span className="text-sm" style={{ color: "var(--color-ink-dim)" }}>
+               Not the speaker on this device.
+             </span>
            </div>
          )}
        </section>
@@ -8058,6 +8948,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 ### Task 5.5: De-guild/de-Discord reused panels
 
 **Files** (port each from `~/discord-yt-music-bot/web/src/components/`, prune Discord/guild/removed features, re-skin against 5.1's design system)
+
 - Modify(port): `web/src/components/AddBar.tsx` + Test `AddBar.test.tsx`
 - Modify(port): `web/src/components/Controls.tsx` + Test `Controls.test.tsx`
 - Modify(port): `web/src/components/NowPlaying.tsx` + Test `NowPlaying.test.tsx`
@@ -8069,6 +8960,7 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 - (Verbatim helpers, no test changes needed beyond a smoke render: `Picker.tsx`, `Thumb.tsx`, `Grain.tsx`, `Preparing.tsx`)
 
 **Interfaces** (Produces — exact props)
+
 - `AddBar({ onPlay, onQueueAll, busy }: { onPlay: (input: string) => Promise<{ candidates: TrackMeta[] | null }>; onQueueAll: (videoIds: string[]) => Promise<boolean>; busy?: boolean })` — drops the voice-target busy state.
 - `Controls({ onAction, paused, disabled }: { onAction: (a: "skip"|"pause"|"resume") => void; paused: boolean; disabled?: boolean })` — **Stop button removed.**
 - `NowPlaying({ item, paused, receivedAt, canSeek, onSeek }: { item: CurrentItem | null; paused?: boolean; receivedAt?: number; canSeek?: boolean; onSeek?: (positionMs: number) => void | Promise<void> })` — **Visualizer removed; `requester.displayName` only (no avatarUrl); `source` line kept.**
@@ -8120,20 +9012,43 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    ```tsx
    const Icon = { skip: "⏭", pause: "⏸", resume: "▶" } as const;
 
-   export function Controls({ onAction, paused, disabled }: {
-     onAction: (a: "skip" | "pause" | "resume") => void; paused: boolean; disabled?: boolean;
+   export function Controls({
+     onAction,
+     paused,
+     disabled,
+   }: {
+     onAction: (a: "skip" | "pause" | "resume") => void;
+     paused: boolean;
+     disabled?: boolean;
    }) {
      return (
        <div className="flex flex-col gap-2.5">
          <span className="eyebrow">Transport</span>
-         <div role="group" aria-label="Playback transport" className="flex flex-wrap items-center gap-2.5">
-           <button className="pill pill-primary" disabled={disabled} aria-label={paused ? "Resume" : "Pause"}
-             onClick={() => onAction(paused ? "resume" : "pause")}>
-             <span aria-hidden className="font-mono text-[0.95em] leading-none">{paused ? Icon.resume : Icon.pause}</span>
+         <div
+           role="group"
+           aria-label="Playback transport"
+           className="flex flex-wrap items-center gap-2.5"
+         >
+           <button
+             className="pill pill-primary"
+             disabled={disabled}
+             aria-label={paused ? "Resume" : "Pause"}
+             onClick={() => onAction(paused ? "resume" : "pause")}
+           >
+             <span aria-hidden className="font-mono text-[0.95em] leading-none">
+               {paused ? Icon.resume : Icon.pause}
+             </span>
              {paused ? "Resume" : "Pause"}
            </button>
-           <button className="pill" disabled={disabled} aria-label="Skip" onClick={() => onAction("skip")}>
-             <span aria-hidden className="font-mono text-[0.95em] leading-none">{Icon.skip}</span>
+           <button
+             className="pill"
+             disabled={disabled}
+             aria-label="Skip"
+             onClick={() => onAction("skip")}
+           >
+             <span aria-hidden className="font-mono text-[0.95em] leading-none">
+               {Icon.skip}
+             </span>
              Skip
            </button>
          </div>
@@ -8209,12 +9124,25 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      { sec: 21600, label: "6 hours" },
      { sec: 0, label: "No limit" },
    ];
-   const REPEAT_LABELS: Record<RepeatMode, string> = { off: "Off", one: "Repeat one", all: "Repeat all" };
-   const AUTOPLAY_SOURCE_LABELS: Record<AutoplaySource, string> = { radio: "Radio / Mix", artist: "Artist" };
+   const REPEAT_LABELS: Record<RepeatMode, string> = {
+     off: "Off",
+     one: "Repeat one",
+     all: "Repeat all",
+   };
+   const AUTOPLAY_SOURCE_LABELS: Record<AutoplaySource, string> = {
+     radio: "Radio / Mix",
+     artist: "Artist",
+   };
    const VOLUME_MAX = 200;
 
    export function Settings({
-     repeat, autoplay, autoplaySource, volume, maxTrackDurationSec, disabled, onChange,
+     repeat,
+     autoplay,
+     autoplaySource,
+     volume,
+     maxTrackDurationSec,
+     disabled,
+     onChange,
    }: {
      repeat: RepeatMode;
      autoplay: boolean;
@@ -8224,7 +9152,10 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      disabled?: boolean;
      onChange: (patch: Partial<StationSettings>) => void;
    }) {
-     const inputStyle = { border: "1px solid var(--color-line)", color: "var(--color-ink)" } as const;
+     const inputStyle = {
+       border: "1px solid var(--color-line)",
+       color: "var(--color-ink)",
+     } as const;
      const selectClass = "bg-transparent px-3 py-2 text-sm font-mono tracking-tight";
      const optStyle = { background: "var(--color-raised)", color: "var(--color-ink)" } as const;
      const maxLenIsPreset = MAX_LEN_PRESETS.some((p) => p.sec === maxTrackDurationSec);
@@ -8233,11 +9164,18 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        <div className="flex flex-wrap items-center gap-x-5 gap-y-3" aria-label="Playback settings">
          <label className="flex flex-col gap-1.5">
            <span className="eyebrow">Repeat</span>
-           <select aria-label="Repeat mode" value={repeat} disabled={disabled}
+           <select
+             aria-label="Repeat mode"
+             value={repeat}
+             disabled={disabled}
              onChange={(e) => onChange({ repeat: e.target.value as RepeatMode })}
-             className={selectClass} style={inputStyle}>
+             className={selectClass}
+             style={inputStyle}
+           >
              {(Object.keys(REPEAT_LABELS) as RepeatMode[]).map((m) => (
-               <option key={m} value={m} style={optStyle}>{REPEAT_LABELS[m]}</option>
+               <option key={m} value={m} style={optStyle}>
+                 {REPEAT_LABELS[m]}
+               </option>
              ))}
            </select>
          </label>
@@ -8245,26 +9183,49 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
          <label className="flex flex-col gap-1.5">
            <span className="eyebrow">Volume</span>
            <div className="flex items-center gap-3">
-             <input type="range" min={0} max={VOLUME_MAX} step={5} aria-label="Volume" value={volume} disabled={disabled}
+             <input
+               type="range"
+               min={0}
+               max={VOLUME_MAX}
+               step={5}
+               aria-label="Volume"
+               value={volume}
+               disabled={disabled}
                onChange={(e) => onChange({ volume: Number(e.target.value) })}
-               style={{ "--range-fill": `${(volume / VOLUME_MAX) * 100}%` } as React.CSSProperties} />
-             <span className="font-mono tabular-nums text-sm"
-               style={{ minWidth: "4ch", color: "var(--color-ink)", textAlign: "right" }}>{volume}%</span>
+               style={{ "--range-fill": `${(volume / VOLUME_MAX) * 100}%` } as React.CSSProperties}
+             />
+             <span
+               className="font-mono tabular-nums text-sm"
+               style={{ minWidth: "4ch", color: "var(--color-ink)", textAlign: "right" }}
+             >
+               {volume}%
+             </span>
            </div>
          </label>
 
          <label className="flex flex-col gap-1.5">
            <span className="eyebrow">Max track length</span>
-           <select aria-label="Max track length" value={String(maxTrackDurationSec)} disabled={disabled}
+           <select
+             aria-label="Max track length"
+             value={String(maxTrackDurationSec)}
+             disabled={disabled}
              onChange={(e) => onChange({ maxTrackDurationSec: Number(e.target.value) })}
-             className={selectClass} style={inputStyle}>
+             className={selectClass}
+             style={inputStyle}
+           >
              {!maxLenIsPreset && (
-               <option key={maxTrackDurationSec} value={String(maxTrackDurationSec)} style={optStyle}>
+               <option
+                 key={maxTrackDurationSec}
+                 value={String(maxTrackDurationSec)}
+                 style={optStyle}
+               >
                  {maxTrackDurationSec}s (current)
                </option>
              )}
              {MAX_LEN_PRESETS.map((p) => (
-               <option key={p.sec} value={String(p.sec)} style={optStyle}>{p.label}</option>
+               <option key={p.sec} value={String(p.sec)} style={optStyle}>
+                 {p.label}
+               </option>
              ))}
            </select>
          </label>
@@ -8272,19 +9233,36 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
          <div className="flex flex-col gap-1.5">
            <span className="eyebrow">Autoplay</span>
            <div className="flex items-center gap-4">
-             <label className="flex items-center gap-2 text-sm" style={{ color: "var(--color-ink-dim)" }}>
-               <input type="checkbox" aria-label="Autoplay" checked={autoplay} disabled={disabled}
-                 onChange={(e) => onChange({ autoplay: e.target.checked })} />
-               <span className="font-mono text-xs" style={{ color: "var(--color-ink-faint)" }}>{autoplay ? "ON" : "OFF"}</span>
+             <label
+               className="flex items-center gap-2 text-sm"
+               style={{ color: "var(--color-ink-dim)" }}
+             >
+               <input
+                 type="checkbox"
+                 aria-label="Autoplay"
+                 checked={autoplay}
+                 disabled={disabled}
+                 onChange={(e) => onChange({ autoplay: e.target.checked })}
+               />
+               <span className="font-mono text-xs" style={{ color: "var(--color-ink-faint)" }}>
+                 {autoplay ? "ON" : "OFF"}
+               </span>
              </label>
              {autoplay && (
                <label className="flex items-center gap-2">
                  <span className="eyebrow">Source</span>
-                 <select aria-label="Autoplay source" value={autoplaySource} disabled={disabled}
+                 <select
+                   aria-label="Autoplay source"
+                   value={autoplaySource}
+                   disabled={disabled}
                    onChange={(e) => onChange({ autoplaySource: e.target.value as AutoplaySource })}
-                   className={selectClass} style={inputStyle}>
+                   className={selectClass}
+                   style={inputStyle}
+                 >
                    {(Object.keys(AUTOPLAY_SOURCE_LABELS) as AutoplaySource[]).map((s) => (
-                     <option key={s} value={s} style={optStyle}>{AUTOPLAY_SOURCE_LABELS[s]}</option>
+                     <option key={s} value={s} style={optStyle}>
+                       {AUTOPLAY_SOURCE_LABELS[s]}
+                     </option>
                    ))}
                  </select>
                </label>
@@ -8313,10 +9291,12 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 ### Task 5.6: App root — session + station status + role wiring
 
 **Files**
+
 - Create: `web/src/components/App.tsx`
 - Test: `web/src/components/App.test.tsx`
 
 **Interfaces**
+
 - Consumes: 5.1 `api`/`getDeviceId`/`getDisplayName`; 5.2 `useStationState`; 5.3 `usePlayerRole`; 5.4 `LoginGate`/`PlayerPanel`; 5.5 all panels; Phase 0 `StationStateResponse`, `SessionInfo`, `ControlAction`, `TrackMeta`.
 - Produces: `App()` —
   - Session check: on mount `api.state()`; a 401 (`ApiError.status === 401`) → render `LoginGate`; success → render the station.
@@ -8341,13 +9321,21 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
    beforeEach(() => {
      localStorage.clear();
      class NoopWS {
-       static OPEN = 1; static CONNECTING = 0;
+       static OPEN = 1;
+       static CONNECTING = 0;
        readyState = 0;
-       addEventListener() {} removeEventListener() {} send() {} close() {}
+       addEventListener() {}
+       removeEventListener() {}
+       send() {}
+       close() {}
      }
      vi.stubGlobal("WebSocket", NoopWS as unknown as typeof WebSocket);
    });
-   afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+   afterEach(() => {
+     cleanup();
+     vi.restoreAllMocks();
+     vi.unstubAllGlobals();
+   });
 
    describe("App", () => {
      it("renders the LoginGate when /api/state returns 401", async () => {
@@ -8357,9 +9345,20 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      });
      it("shows the cold-start banner when there is no seed and nothing playing", async () => {
        vi.spyOn(api, "state").mockResolvedValue({
-         current: null, upcoming: [], upcomingRadio: [], history: [], seed: null,
-         paused: false, preparing: null, activePlayerPresent: false, activePlayerLabel: null,
-         repeat: "off", autoplay: true, autoplaySource: "radio", volume: 100, maxTrackDurationSec: 0,
+         current: null,
+         upcoming: [],
+         upcomingRadio: [],
+         history: [],
+         seed: null,
+         paused: false,
+         preparing: null,
+         activePlayerPresent: false,
+         activePlayerLabel: null,
+         repeat: "off",
+         autoplay: true,
+         autoplaySource: "radio",
+         volume: 100,
+         maxTrackDurationSec: 0,
          isThisDeviceSpeaker: false,
        } as never);
        render(<App />);
@@ -8367,10 +9366,27 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      });
      it("does NOT show the cold-start banner once a seed exists", async () => {
        vi.spyOn(api, "state").mockResolvedValue({
-         current: null, upcoming: [], upcomingRadio: [], history: [],
-         seed: { videoId: "v1", title: "Seed", channel: "C", durationSec: 100, isLive: false, thumbnailUrl: null },
-         paused: false, preparing: null, activePlayerPresent: false, activePlayerLabel: null,
-         repeat: "off", autoplay: true, autoplaySource: "radio", volume: 100, maxTrackDurationSec: 0,
+         current: null,
+         upcoming: [],
+         upcomingRadio: [],
+         history: [],
+         seed: {
+           videoId: "v1",
+           title: "Seed",
+           channel: "C",
+           durationSec: 100,
+           isLive: false,
+           thumbnailUrl: null,
+         },
+         paused: false,
+         preparing: null,
+         activePlayerPresent: false,
+         activePlayerLabel: null,
+         repeat: "off",
+         autoplay: true,
+         autoplaySource: "radio",
+         volume: 100,
+         maxTrackDurationSec: 0,
          isThisDeviceSpeaker: false,
        } as never);
        render(<App />);
@@ -8407,10 +9423,15 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      const [, setSession] = useState<SessionInfo | null>(null);
      // Per-viewer flags from the REST snapshot (the WS broadcast carries the shared
      // StationSnapshot; isThisDeviceSpeaker comes from /api/state).
-     const [meta, setMeta] = useState<Pick<StationStateResponse, "isThisDeviceSpeaker"> | null>(null);
+     const [meta, setMeta] = useState<Pick<StationStateResponse, "isThisDeviceSpeaker"> | null>(
+       null,
+     );
      const [playlists, setPlaylists] = useState<PlaylistSummary[]>([]);
      const refreshPlaylists = useCallback(() => {
-       api.playlists().then((r) => setPlaylists(r.playlists)).catch(() => {});
+       api
+         .playlists()
+         .then((r) => setPlaylists(r.playlists))
+         .catch(() => {});
      }, []);
      const ws = useStationState();
 
@@ -8418,15 +9439,21 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      useEffect(() => {
        getDeviceId();
        let alive = true;
-       api.state()
+       api
+         .state()
          .then((s) => {
            if (!alive) return;
            setMeta({ isThisDeviceSpeaker: s.isThisDeviceSpeaker });
            setAuth("authed");
            refreshPlaylists();
          })
-         .catch((e) => { if (!alive) return; setAuth(e instanceof ApiError && e.status === 401 ? "anon" : "authed"); });
-       return () => { alive = false; };
+         .catch((e) => {
+           if (!alive) return;
+           setAuth(e instanceof ApiError && e.status === 401 ? "anon" : "authed");
+         });
+       return () => {
+         alive = false;
+       };
      }, [refreshPlaylists]);
 
      // Auto-engage the speaker role when the server marks this device the remembered
@@ -8443,10 +9470,22 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
      const onRelinquish = useCallback(() => void api.speaker("release"), []);
 
      if (auth === "checking") {
-       return <main className="min-h-full grid place-items-center"><span className="spinner" aria-label="Loading" /></main>;
+       return (
+         <main className="min-h-full grid place-items-center">
+           <span className="spinner" aria-label="Loading" />
+         </main>
+       );
      }
      if (auth === "anon") {
-       return <LoginGate onAuthed={(s) => { setSession(s); setAuth("authed"); api.state().then((st) => setMeta({ isThisDeviceSpeaker: st.isThisDeviceSpeaker })); }} />;
+       return (
+         <LoginGate
+           onAuthed={(s) => {
+             setSession(s);
+             setAuth("authed");
+             api.state().then((st) => setMeta({ isThisDeviceSpeaker: st.isThisDeviceSpeaker }));
+           }}
+         />
+       );
      }
 
      const snap = ws.snapshot;
@@ -8456,14 +9495,22 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
        <main className="min-h-full px-4 py-6 sm:px-8 max-w-5xl mx-auto">
          <Grain />
          <header className="flex items-center justify-between mb-6">
-           <p className="eyebrow" style={{ color: "var(--color-ember-soft)" }}>LAN Jukebox</p>
+           <p className="eyebrow" style={{ color: "var(--color-ember-soft)" }}>
+             LAN Jukebox
+           </p>
            <span className="font-mono text-xs" style={{ color: "var(--color-ink-faint)" }}>
-             {snap?.activePlayerPresent ? `● ${snap.activePlayerLabel ?? "speaker"} live` : "○ no speaker"}
+             {snap?.activePlayerPresent
+               ? `● ${snap.activePlayerLabel ?? "speaker"} live`
+               : "○ no speaker"}
            </span>
          </header>
 
          {playerError && (
-           <p role="alert" className="card p-3 mb-4 text-sm font-mono" style={{ color: "var(--color-ember-soft)" }}>
+           <p
+             role="alert"
+             className="card p-3 mb-4 text-sm font-mono"
+             style={{ color: "var(--color-ember-soft)" }}
+           >
              Playback: {playerError}
            </p>
          )}
@@ -8488,8 +9535,14 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
          <div className="mt-6 grid gap-6">
            <PlayerPanel isSpeaker={isSpeaker} onRelinquish={onRelinquish} audioRef={audioRef} />
            <AddBar
-             onPlay={async (input) => { const r = await api.add(input); return { candidates: r.candidates ?? null }; }}
-             onQueueAll={async (ids) => { for (const id of ids) await api.pick(id); return ids.length > 0; }}
+             onPlay={async (input) => {
+               const r = await api.add(input);
+               return { candidates: r.candidates ?? null };
+             }}
+             onQueueAll={async (ids) => {
+               for (const id of ids) await api.pick(id);
+               return ids.length > 0;
+             }}
            />
            <Controls
              onAction={(a) => onControl(a === "resume" ? "play" : a)}
@@ -8610,9 +9663,9 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 
 ---
 
-## Phase 6:Deploy (Docker/CI/GHCR/compose/Cloudflare Tunnel) — Deploy (Docker/CI/GHCR/compose/Cloudflare Tunnel)
+## Phase 6:Deploy (Docker/CI/GHCR/compose; bring-your-own ingress) — Deploy (Docker/CI/GHCR/compose; bring-your-own ingress)
 
-**Goal:** Ship the container + pipeline: a multi-stage `Dockerfile` (Node 22 + yt-dlp + ffmpeg + Deno + gosu + cache-chown entrypoint + `/healthz`), GHCR CI (test gate + build/push `:latest`+`:sha` + weekly cron + yt-dlp cache-bust), a `docker-compose.yml` (GHCR pull, env block, named cache volume that also holds the persisted station snapshot + device registry, healthcheck, optional bgutil-pot + cloudflared), and a `README.md` documenting the autoplay-grant + device-memory + cloudflared/WS gotchas.
+**Goal:** Ship the container + pipeline: a multi-stage `Dockerfile` (Node 22 + yt-dlp + ffmpeg + Deno + gosu + cache-chown entrypoint + `/healthz`), GHCR CI (test gate + build/push `:latest`+`:sha` + weekly cron + yt-dlp cache-bust), a `docker-compose.yml` (GHCR pull, env block, named cache volume that also holds the persisted station snapshot + device registry, healthcheck, optional bgutil-pot; bring-your-own external ingress — NO bundled cloudflared, just a localhost-bound published host port), and a `README.md` documenting the autoplay-grant + device-memory + bring-your-own-ingress/WS gotchas.
 
 ### Parallelization
 
@@ -8620,13 +9673,14 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 - **Parallel-safe (all independent leaves, may be authored concurrently):** `Dockerfile`, `docker-entrypoint.sh`, `.github/workflows/build.yml`, `docker-compose.yml`, `.dockerignore`, `README.md`.
 - **Cross-phase dependencies (must already exist on disk from earlier phases — do NOT create here):** Phase 0 `package.json` scripts (`build`, `start`, `typecheck`, `test`, `lint`); Phase 0 `.dockerignore` baseline (extended in 6.1 if absent); Phase 4 `GET /healthz` route in `src/server/app.ts`; Phase 0 `src/config.ts` env names (`PORT`/`HOST`/`PUBLIC_BASE_URL`/`ALLOWED_WS_ORIGINS`/`TRUST_PROXY`/`VIEWER_PASSWORD`/`ADMIN_PASSWORD`/`SESSION_SECRET`/`CACHE_DIR`/`CACHE_MAX_MB`/`YT_PLAYER_CLIENTS`/`PO_TOKEN_PROVIDER_URL`/`LOG_LEVEL`/`NODE_ENV`/`ALLOW_NO_PASSWORD`).
 
-> **Testing note for this phase.** Deploy artifacts (Dockerfile, compose, CI YAML, shell entrypoint) are not runtime TypeScript, so they cannot be unit-tested with Vitest in the normal "import-the-function" way. Instead, each task below is driven by a **Vitest spec that asserts on the artifact files as fixtures** — it reads the file off disk and asserts the load-bearing invariants the spec demands (no Discord env, `ALLOWED_WS_ORIGINS == PUBLIC_BASE_URL`, no published host port, `TRUST_PROXY=true`, the YTDLP_REFRESH cache-bust wiring, the gosu drop, etc.). These tests live under `src/deploy/` so they run inside the existing `npm test` (vitest `include` already covers `src/**`). They are real, runnable assertions — not placeholders — and they make the "did we de-Discord / did we keep the cloudflared invariants" rules regression-proof. Shell/compose/Dockerfile lint is additionally run as a manual command in each task and again in Phase completion.
+> **Testing note for this phase.** Deploy artifacts (Dockerfile, compose, CI YAML, shell entrypoint) are not runtime TypeScript, so they cannot be unit-tested with Vitest in the normal "import-the-function" way. Instead, each task below is driven by a **Vitest spec that asserts on the artifact files as fixtures** — it reads the file off disk and asserts the load-bearing invariants the spec demands (no Discord env, `ALLOWED_WS_ORIGINS == PUBLIC_BASE_URL`, no bundled cloudflared / `TUNNEL_TOKEN` + a localhost-bound published host port for bring-your-own ingress, `TRUST_PROXY=true`, the YTDLP_REFRESH cache-bust wiring, the gosu drop, etc.). These tests live under `src/deploy/` so they run inside the existing `npm test` (vitest `include` already covers `src/**`). They are real, runnable assertions — not placeholders — and they make the "did we de-Discord / did we keep the bring-your-own-ingress invariants" rules regression-proof. Shell/compose/Dockerfile lint is additionally run as a manual command in each task and again in Phase completion.
 
 ---
 
 ### Task 6.1: Dockerfile + entrypoint
 
 **Files**
+
 - Create: `/home/kasm-user/lan-jukebox/Dockerfile`
 - Create: `/home/kasm-user/lan-jukebox/docker-entrypoint.sh`
 - Create (extend if a baseline exists from Phase 0): `/home/kasm-user/lan-jukebox/.dockerignore`
@@ -8635,17 +9689,20 @@ Behavior: load config; `setRootLogger`; `installCrashHandlers`; init cache + pla
 **Interfaces**
 
 Consumes (must already exist on disk):
+
 - Phase 0 `package.json` scripts: `npm run build` (tsc + vite build → `dist/` + `web/dist/`), `npm start` → `node dist/index.js`.
 - Phase 4 route: `GET /healthz` served by Fastify on `process.env.PORT` (default `8080`), returns `200 {ok:true}`.
 - `src/index.ts` composition root that calls `loadConfig()` and `listen({ port: web.port, host: web.host })`.
 
 Produces (no exported TS symbols — these are container build artifacts):
+
 - A multi-stage image: `build` stage `node:22-bookworm` (`npm ci` → `npm run build` → `npm ci --omit=dev`) → `runtime` stage `node:22-bookworm-slim` with `ffmpeg python3 python3-pip ca-certificates curl unzip gosu`, pip `yt-dlp[default]` + `bgutil-ytdlp-pot-provider` (cache-busted by `ARG YTDLP_REFRESH`), pinned + SHA256-verified Deno, `useradd app` uid `10001`, `chown` of `CACHE_DIR` + `/app`, `ENTRYPOINT docker-entrypoint.sh`, `CMD node dist/index.js`, `HEALTHCHECK` that fetches `/healthz`, `VOLUME /data/cache`, `EXPOSE 8080`.
 - `docker-entrypoint.sh`: runs as root, `mkdir -p` + `chown -R app:app "$CACHE_DIR"`, then `exec gosu app "$@"`.
 
 **Steps**
 
 1. **Write the FAILING test.** Create `/home/kasm-user/lan-jukebox/src/deploy/dockerfile.test.ts`:
+
    ```ts
    import { readFileSync } from "node:fs";
    import { fileURLToPath } from "node:url";
@@ -8722,6 +9779,7 @@ Produces (no exported TS symbols — these are container build artifacts):
    Expected failure: `ENOENT: no such file or directory, open '.../lan-jukebox/Dockerfile'` (the file does not exist yet).
 
 3. **Minimal implementation — `docker-entrypoint.sh`.** Create `/home/kasm-user/lan-jukebox/docker-entrypoint.sh`:
+
    ```sh
    #!/bin/sh
    # A mounted named volume / bind mount can be root-owned, which the unprivileged
@@ -8736,6 +9794,7 @@ Produces (no exported TS symbols — these are container build artifacts):
    ```
 
 4. **Minimal implementation — `Dockerfile`.** Create `/home/kasm-user/lan-jukebox/Dockerfile`:
+
    ```dockerfile
    # syntax=docker/dockerfile:1
    FROM node:22-bookworm AS build
@@ -8793,6 +9852,7 @@ Produces (no exported TS symbols — these are container build artifacts):
    ```
 
 5. **Ensure `.dockerignore` excludes build cruft + secrets.** If `/home/kasm-user/lan-jukebox/.dockerignore` does not already exist from Phase 0, create it; otherwise verify it contains these lines (add any missing). The `dist`/`web/dist` excludes matter so the slim runtime copies only the freshly-built artifacts from the build stage and never a stale host build:
+
    ```
    node_modules
    dist
@@ -8812,16 +9872,19 @@ Produces (no exported TS symbols — these are container build artifacts):
 ### Task 6.2: GHCR CI workflow
 
 **Files**
+
 - Create: `/home/kasm-user/lan-jukebox/.github/workflows/build.yml`
 - Test: `/home/kasm-user/lan-jukebox/src/deploy/workflow.test.ts`
 
 **Interfaces**
 
 Consumes (must already exist):
+
 - Phase 0 `package.json` scripts `typecheck`, `test`, `lint`, `build`.
 - Task 6.1 `Dockerfile` (the `YTDLP_REFRESH` build arg it feeds; the `context: .` it builds).
 
 Produces (CI workflow YAML — no TS symbols):
+
 - Triggers: `push` to `[master]`, `workflow_dispatch`, weekly `schedule` cron.
 - `permissions: { contents: read, packages: write }`, `concurrency` cancel-in-progress keyed on the ref.
 - `test` job (`npm ci` → `typecheck` → `test` → `lint`) that **gates** `build-and-push` via `needs: test`.
@@ -8832,6 +9895,7 @@ Produces (CI workflow YAML — no TS symbols):
 **Steps**
 
 1. **Write the FAILING test.** Create `/home/kasm-user/lan-jukebox/src/deploy/workflow.test.ts`:
+
    ```ts
    import { readFileSync } from "node:fs";
    import { fileURLToPath } from "node:url";
@@ -8854,7 +9918,9 @@ Produces (CI workflow YAML — no TS symbols):
      });
 
      it("cancels superseded runs per ref", () => {
-       expect(wf).toMatch(/concurrency:\s*\{\s*group:\s*"build-\$\{\{ github\.ref \}\}",\s*cancel-in-progress:\s*true\s*\}/);
+       expect(wf).toMatch(
+         /concurrency:\s*\{\s*group:\s*"build-\$\{\{ github\.ref \}\}",\s*cancel-in-progress:\s*true\s*\}/,
+       );
      });
 
      it("runs the full test gate before building", () => {
@@ -8876,7 +9942,9 @@ Produces (CI workflow YAML — no TS symbols):
      });
 
      it("forces no-cache on schedule/dispatch and uses gha cache mode=max", () => {
-       expect(wf).toMatch(/no-cache:\s*\$\{\{ github\.event_name == 'schedule' \|\| github\.event_name == 'workflow_dispatch' \}\}/);
+       expect(wf).toMatch(
+         /no-cache:\s*\$\{\{ github\.event_name == 'schedule' \|\| github\.event_name == 'workflow_dispatch' \}\}/,
+       );
        expect(wf).toMatch(/cache-to:\s*type=gha,mode=max/);
      });
 
@@ -8890,6 +9958,7 @@ Produces (CI workflow YAML — no TS symbols):
    Expected failure: `ENOENT: no such file or directory, open '.../.github/workflows/build.yml'`.
 
 3. **Minimal implementation.** Create `/home/kasm-user/lan-jukebox/.github/workflows/build.yml`:
+
    ```yaml
    name: build
    on:
@@ -8955,27 +10024,31 @@ Produces (CI workflow YAML — no TS symbols):
 
 ---
 
-### Task 6.3: docker-compose + Cloudflare Tunnel
+### Task 6.3: docker-compose (bring-your-own ingress)
 
 **Files**
+
 - Create: `/home/kasm-user/lan-jukebox/docker-compose.yml`
 - Test: `/home/kasm-user/lan-jukebox/src/deploy/compose.test.ts`
 
 **Interfaces**
 
 Consumes (must already exist):
+
 - Task 6.1 image (`ghcr.io/atvriders/lan-jukebox:latest`) + its `/healthz` healthcheck contract.
 - Phase 0 `src/config.ts` env names: `PORT`, `HOST`, `PUBLIC_BASE_URL`, `ALLOWED_WS_ORIGINS`, `TRUST_PROXY`, `VIEWER_PASSWORD`, `ADMIN_PASSWORD`, `SESSION_SECRET`, `ALLOW_NO_PASSWORD`, `NODE_ENV`, `LOG_LEVEL`, `CACHE_DIR`, `CACHE_MAX_MB`, `HISTORY_MAX_ITEMS`, `SEARCH_RESULT_COUNT`, `PREFETCH_DEPTH`, `MAX_CONCURRENT_DOWNLOADS`, `MAX_TRACK_DURATION_SEC`, `YT_PROXY`, `YT_COOKIES_FILE`, `YT_PLAYER_CLIENTS`, `PO_TOKEN_PROVIDER_URL`.
 
 Produces (compose YAML — no TS symbols):
-- Service `jukebox`: GHCR image, `pull_policy: always`, env block (NO Discord vars, NO `IDLE_TIMEOUT_SEC`, `TRUST_PROXY: "true"`, `ALLOWED_WS_ORIGINS` == `PUBLIC_BASE_URL`), `expose: ["8080"]` with **no `ports:`** (cloudflared dials out — no published host port), `volumes: ["cache:/data/cache"]` (holds `station-snapshot.json` + `device-registry.json` + audio cache), `restart: unless-stopped`, `/healthz` healthcheck, json-file logging.
+
+- Service `jukebox`: GHCR image, `pull_policy: always`, env block (NO Discord vars, NO `IDLE_TIMEOUT_SEC`, `TRUST_PROXY: "true"`, `ALLOWED_WS_ORIGINS` == `PUBLIC_BASE_URL`), a **localhost-bound published host port** `ports: ["127.0.0.1:${HOST_PORT:-8080}:8080"]` (for the user's OWN external ingress — their separate cloudflared / nginx / etc.), `volumes: ["cache:/data/cache"]` (holds `station-snapshot.json` + `device-registry.json` + audio cache), `restart: unless-stopped`, `/healthz` healthcheck, json-file logging.
 - Optional `bgutil-pot` sidecar under the `pot` profile.
-- Optional `cloudflared` sidecar under the `tunnel` profile (token-driven, no published port).
+- **No bundled tunnel.** The project does NOT install or run `cloudflared` itself — bring your own external ingress.
 - Named `cache:` volume.
 
 **Steps**
 
 1. **Write the FAILING test.** Create `/home/kasm-user/lan-jukebox/src/deploy/compose.test.ts`:
+
    ```ts
    import { readFileSync } from "node:fs";
    import { fileURLToPath } from "node:url";
@@ -9000,10 +10073,11 @@ Produces (compose YAML — no TS symbols):
        expect(ws).toBe(pub);
      });
 
-     it("exposes 8080 internally but publishes NO host port (cloudflared dials out)", () => {
-       expect(yml).toMatch(/expose:\s*\[\s*"8080"\s*\]/);
-       // no `ports:` mapping on the jukebox service — the tunnel reaches it over the compose network
-       expect(yml).not.toMatch(/ports:\s*\[/);
+     it("publishes a localhost-bound host port for the user's own external ingress", () => {
+       // the jukebox service publishes a 127.0.0.1-bound host port so a separate
+       // host-level reverse proxy / Cloudflare Tunnel can reach it
+       expect(yml).toMatch(/127\.0\.0\.1:\$\{HOST_PORT:-8080\}:8080/);
+       expect(yml).toMatch(/ports:\s*\[\s*"127\.0\.0\.1:.*:8080"\s*\]/);
      });
 
      it("mounts the named cache volume that also holds snapshot + registry", () => {
@@ -9029,10 +10103,9 @@ Produces (compose YAML — no TS symbols):
        expect(yml).toMatch(/profiles:\s*\[\s*"pot"\s*\]/);
      });
 
-     it("offers an optional cloudflared tunnel under the tunnel profile with no published port", () => {
-       expect(yml).toMatch(/cloudflared:/);
-       expect(yml).toMatch(/profiles:\s*\[\s*"tunnel"\s*\]/);
-       expect(yml).toMatch(/TUNNEL_TOKEN/);
+     it("does NOT bundle a tunnel (bring your own ingress)", () => {
+       expect(yml).not.toMatch(/cloudflared/i);
+       expect(yml).not.toMatch(/TUNNEL_TOKEN/);
      });
 
      it("contains no Discord vars and no idle-timeout setting", () => {
@@ -9047,18 +10120,21 @@ Produces (compose YAML — no TS symbols):
    Expected failure: `ENOENT: no such file or directory, open '.../docker-compose.yml'`.
 
 3. **Minimal implementation.** Create `/home/kasm-user/lan-jukebox/docker-compose.yml`:
+
    ```yaml
    # IMPORTANT: This file contains PLACEHOLDER values.
    # Before running `docker compose up`, fill in your real values for:
    #   PUBLIC_BASE_URL, ALLOWED_WS_ORIGINS (== PUBLIC_BASE_URL), VIEWER_PASSWORD,
-   #   ADMIN_PASSWORD (optional), SESSION_SECRET (>= 32 chars), and — if you run the
-   #   built-in tunnel — TUNNEL_TOKEN.
+   #   ADMIN_PASSWORD (optional), SESSION_SECRET (>= 32 chars).
    # Keep your filled-in copy LOCAL — do NOT commit real secrets to the repo.
    #
-   # Ingress: a Cloudflare Tunnel reaches this container over the compose network at
-   # http://jukebox:8080 — so there is intentionally NO published host port. Enable the
-   # bundled `cloudflared` with `docker compose --profile tunnel up -d`, or point an
-   # existing host-level cloudflared at http://jukebox:8080 (join its network).
+   # Ingress: BRING YOUR OWN. This project does NOT bundle or run cloudflared. The
+   # jukebox service publishes a LOCALHOST-bound host port (127.0.0.1:${HOST_PORT:-8080})
+   # so your OWN external ingress — a separate Cloudflare Tunnel, nginx, Caddy, etc.,
+   # running on the host — can reach the app at http://127.0.0.1:${HOST_PORT:-8080}.
+   #   Alternative: if your tunnel runs as its own container, drop the `ports:` mapping,
+   #   attach both it and this service to a shared external Docker network, and reach the
+   #   app at http://jukebox:8080 over that network instead of publishing a host port.
    #
    # Persistence: the `cache` named volume holds the LRU audio cache AND the restart-safe
    #   /data/cache/station-snapshot.json   (current track, queue, upcoming-radio, seed)
@@ -9081,10 +10157,11 @@ Produces (compose YAML — no TS symbols):
          # MUST equal PUBLIC_BASE_URL exactly, or the live-updates WebSocket /ws is
          # rejected by the origin guard and the station UI never goes live.
          ALLOWED_WS_ORIGINS: "https://jukebox.waterburp.com"
-         # Cloudflare terminates HTTPS at the edge and reaches this origin over plain
-         # HTTP, sending X-Forwarded-Proto: https. TRUST_PROXY=true makes the app honor
-         # it for correct scheme detection + Secure session cookies. Required behind the
-         # tunnel; only set "false" for direct LAN exposure with no proxy.
+         # Your external HTTPS proxy / Cloudflare Tunnel terminates TLS at the edge and
+         # reaches this origin over plain HTTP, sending X-Forwarded-Proto: https.
+         # TRUST_PROXY=true makes the app honor it for correct scheme detection + Secure
+         # session cookies. Required behind any HTTPS proxy/tunnel; only set "false" for
+         # direct LAN exposure with no proxy.
          TRUST_PROXY: "true"
 
          # Auth (shared viewer password required; admin optional). Server refuses to
@@ -9116,7 +10193,11 @@ Produces (compose YAML — no TS symbols):
          # otherwise those clients silently fail to extract audio.
          YT_PLAYER_CLIENTS: "android_vr,web_embedded,tv"
          PO_TOKEN_PROVIDER_URL: "" # only set (e.g. http://bgutil-pot:4416) with --profile pot
-       expose: ["8080"] # internal-only; cloudflared dials out, so NO published host port
+       # Published on LOCALHOST only — your OWN external ingress (a separate cloudflared /
+       # nginx / Caddy on the host) connects here. Override the host port with HOST_PORT.
+       # Alternative: if your tunnel is its own container, delete this line and instead
+       # join a shared external network and reach the app at http://jukebox:8080.
+       ports: ["127.0.0.1:${HOST_PORT:-8080}:8080"]
        volumes: ["cache:/data/cache"]
        restart: unless-stopped
        healthcheck:
@@ -9143,22 +10224,6 @@ Produces (compose YAML — no TS symbols):
        restart: unless-stopped
        expose: ["4416"]
 
-     # Optional bundled Cloudflare Tunnel — reaches the app at http://jukebox:8080 over the
-     # compose network (no published host port needed). Create a tunnel in the Cloudflare
-     # dashboard, route the subdomain to http://jukebox:8080, and put its token in TUNNEL_TOKEN.
-     # Enable with: docker compose --profile tunnel up -d
-     # (Skip this service if a host-level cloudflared already fronts the container.)
-     cloudflared:
-       image: cloudflare/cloudflared:latest
-       profiles: ["tunnel"]
-       command: tunnel --no-autoupdate run
-       environment:
-         TUNNEL_TOKEN: "CHANGE_ME"
-       restart: unless-stopped
-       depends_on:
-         jukebox:
-           condition: service_healthy
-
    volumes:
      cache:
    ```
@@ -9173,25 +10238,29 @@ Produces (compose YAML — no TS symbols):
 ### Task 6.4: README deploy docs
 
 **Files**
+
 - Create: `/home/kasm-user/lan-jukebox/README.md`
 - Test: `/home/kasm-user/lan-jukebox/src/deploy/readme.test.ts`
 
 **Interfaces**
 
 Consumes (must already exist):
+
 - Tasks 6.1/6.2/6.3 artifacts (image name, env names, profiles, the no-published-port + `TRUST_PROXY` + `ALLOWED_WS_ORIGINS` invariants).
 - Spec §5 (device memory + auto-select speaker + browser-autoplay caveat), §10 (deployment + cloudflared), §13 (open risks: WS origin/upgrade, autoplay policy).
 
 Produces (docs — no TS symbols):
+
 - An env table covering every `loadConfig()` var the operator sets.
 - GHCR-public + forked-repo `workflow_dispatch` + `--force-recreate` re-pull gotchas.
-- The `ALLOWED_WS_ORIGINS == PUBLIC_BASE_URL` + `TRUST_PROXY=true` behind cloudflared rule + a "verify `/ws` upgrades end-to-end" step.
+- The `ALLOWED_WS_ORIGINS == PUBLIC_BASE_URL` + `TRUST_PROXY=true` behind-an-external-proxy/tunnel rule + a "verify `/ws` upgrades end-to-end" step.
 - A one-time speaker-PC autoplay-permission grant + device-memory checklist.
 - A manual-verify `<audio>` playback checklist (spec §11: real playback is manual-verify).
 
 **Steps**
 
 1. **Write the FAILING test.** Create `/home/kasm-user/lan-jukebox/src/deploy/readme.test.ts`:
+
    ```ts
    import { readFileSync } from "node:fs";
    import { fileURLToPath } from "node:url";
@@ -9226,12 +10295,14 @@ Produces (docs — no TS symbols):
        expect(md).toMatch(/TRUST_PROXY[\s\S]{0,40}true/);
      });
 
-     it("documents the cloudflared / WebSocket upgrade gotcha", () => {
+     it("documents bring-your-own ingress + the WebSocket upgrade gotcha", () => {
+       // mentions Cloudflare Tunnel only as the EXAMPLE external ingress
        expect(md).toMatch(/cloudflared|Cloudflare Tunnel/i);
        expect(md).toMatch(/\/ws/);
        expect(md).toMatch(/upgrade/i);
-       // no published host port
-       expect(md).toMatch(/no (published|host) port|dials out/i);
+       // bring your own ingress — app publishes a localhost-bound host port
+       expect(md).toMatch(/bring your own|your own (external )?ingress/i);
+       expect(md).toMatch(/127\.0\.0\.1|HOST_PORT/);
      });
 
      it("documents the speaker-PC one-time autoplay grant + device memory", () => {
@@ -9264,7 +10335,8 @@ Produces (docs — no TS symbols):
    Expected failure: `ENOENT: no such file or directory, open '.../README.md'`.
 
 3. **Minimal implementation.** Create `/home/kasm-user/lan-jukebox/README.md`:
-   ```markdown
+
+   ````markdown
    # LAN Jukebox — Always-On Group Radio
 
    A self-hosted, browser-based **always-playing YouTube radio**. A Dockerized Node
@@ -9279,11 +10351,11 @@ Produces (docs — no TS symbols):
 
    ```bash
    # 1. Copy docker-compose.yml and fill in the placeholders (see env table below).
-   # 2. Pull + run (includes the bundled Cloudflare Tunnel):
-   docker compose --profile tunnel up -d
-   # …or, if a host-level cloudflared already fronts the container, omit the profile:
+   # 2. Pull + run. The app publishes 127.0.0.1:${HOST_PORT:-8080}; point your OWN
+   #    external ingress (a separate Cloudflare Tunnel, nginx, etc.) at it.
    docker compose up -d
    ```
+   ````
 
    The image is published **public** to `ghcr.io/atvriders/lan-jukebox:latest` by
    GitHub Actions on every push to `master`, plus a weekly rebuild that cache-busts
@@ -9294,57 +10366,61 @@ Produces (docs — no TS symbols):
    `src/config.ts` is the only env reader. All variables are set inline in
    `docker-compose.yml`.
 
-   | Variable | Required | Default | Notes |
-   |---|---|---|---|
-   | `PORT` | no | `8080` | Internal listen port; cloudflared dials this. |
-   | `HOST` | no | `0.0.0.0` | Bind address. |
-   | `PUBLIC_BASE_URL` | yes | — | The public `https://` subdomain (e.g. `https://jukebox.waterburp.com`). |
-   | `ALLOWED_WS_ORIGINS` | yes | — | **MUST equal `PUBLIC_BASE_URL` exactly** (see WebSocket gotcha). |
-   | `TRUST_PROXY` | yes behind tunnel | `false` | Set **`true`** behind cloudflared/any HTTPS proxy. |
-   | `VIEWER_PASSWORD` | yes* | — | Shared viewer password. *Server refuses to start unless set, unless `ALLOW_NO_PASSWORD=true`. |
-   | `ADMIN_PASSWORD` | no | — | If set, destructive/global actions need an elevated session. |
-   | `ALLOW_NO_PASSWORD` | no | `false` | Escape hatch to run with no viewer password (LAN-only). |
-   | `SESSION_SECRET` | yes | — | Cookie-signing secret, **>= 32 chars**. |
-   | `CACHE_DIR` | no | `/data/cache` | Holds the audio LRU **and** `station-snapshot.json` + `device-registry.json`. |
-   | `CACHE_MAX_MB` | no | `5000` | LRU audio cache size cap. |
-   | `HISTORY_MAX_ITEMS` | no | `100` | Recently-played history length. |
-   | `SEARCH_RESULT_COUNT` | no | `10` | Search-candidate count. |
-   | `PREFETCH_DEPTH` | no | `3` | Radio queue-ahead depth. |
-   | `MAX_CONCURRENT_DOWNLOADS` | no | `4` | Parallel yt-dlp download cap. |
-   | `MAX_TRACK_DURATION_SEC` | no | `0` | `0`/empty = no cap. |
-   | `YT_PROXY` | no | — | Optional residential/SOCKS proxy. |
-   | `YT_COOKIES_FILE` | no | — | Optional mounted `cookies.txt` for flagged IPs. |
-   | `YT_PLAYER_CLIENTS` | no | `android_vr,web_embedded,tv` | Zero-PO-token ladder. Only use `web,mweb` with the bgutil sidecar. |
-   | `PO_TOKEN_PROVIDER_URL` | no | — | Only set (e.g. `http://bgutil-pot:4416`) with `--profile pot`. |
-   | `LOG_LEVEL` | no | `info` | pino level. |
-   | `NODE_ENV` | no | `production` | — |
+   | Variable                   | Required           | Default                      | Notes                                                                                         |
+   | -------------------------- | ------------------ | ---------------------------- | --------------------------------------------------------------------------------------------- |
+   | `PORT`                     | no                 | `8080`                       | Internal container listen port.                                                               |
+   | `HOST_PORT`                | no                 | `8080`                       | Host port your own ingress connects to (published on `127.0.0.1`).                            |
+   | `HOST`                     | no                 | `0.0.0.0`                    | Bind address.                                                                                 |
+   | `PUBLIC_BASE_URL`          | yes                | —                            | The public `https://` subdomain (e.g. `https://jukebox.waterburp.com`).                       |
+   | `ALLOWED_WS_ORIGINS`       | yes                | —                            | **MUST equal `PUBLIC_BASE_URL` exactly** (see WebSocket gotcha).                              |
+   | `TRUST_PROXY`              | yes behind a proxy | `false`                      | Set **`true`** behind any HTTPS proxy / tunnel.                                               |
+   | `VIEWER_PASSWORD`          | yes*               | —                            | Shared viewer password. *Server refuses to start unless set, unless `ALLOW_NO_PASSWORD=true`. |
+   | `ADMIN_PASSWORD`           | no                 | —                            | If set, destructive/global actions need an elevated session.                                  |
+   | `ALLOW_NO_PASSWORD`        | no                 | `false`                      | Escape hatch to run with no viewer password (LAN-only).                                       |
+   | `SESSION_SECRET`           | yes                | —                            | Cookie-signing secret, **>= 32 chars**.                                                       |
+   | `CACHE_DIR`                | no                 | `/data/cache`                | Holds the audio LRU **and** `station-snapshot.json` + `device-registry.json`.                 |
+   | `CACHE_MAX_MB`             | no                 | `5000`                       | LRU audio cache size cap.                                                                     |
+   | `HISTORY_MAX_ITEMS`        | no                 | `100`                        | Recently-played history length.                                                               |
+   | `SEARCH_RESULT_COUNT`      | no                 | `10`                         | Search-candidate count.                                                                       |
+   | `PREFETCH_DEPTH`           | no                 | `3`                          | Radio queue-ahead depth.                                                                      |
+   | `MAX_CONCURRENT_DOWNLOADS` | no                 | `4`                          | Parallel yt-dlp download cap.                                                                 |
+   | `MAX_TRACK_DURATION_SEC`   | no                 | `0`                          | `0`/empty = no cap.                                                                           |
+   | `YT_PROXY`                 | no                 | —                            | Optional residential/SOCKS proxy.                                                             |
+   | `YT_COOKIES_FILE`          | no                 | —                            | Optional mounted `cookies.txt` for flagged IPs.                                               |
+   | `YT_PLAYER_CLIENTS`        | no                 | `android_vr,web_embedded,tv` | Zero-PO-token ladder. Only use `web,mweb` with the bgutil sidecar.                            |
+   | `PO_TOKEN_PROVIDER_URL`    | no                 | —                            | Only set (e.g. `http://bgutil-pot:4416`) with `--profile pot`.                                |
+   | `LOG_LEVEL`                | no                 | `info`                       | pino level.                                                                                   |
+   | `NODE_ENV`                 | no                 | `production`                 | —                                                                                             |
 
    > There are intentionally **no idle-timeout settings** — the station never stops.
 
-   ## Deploy & ingress (Cloudflare Tunnel)
+   ## Bring your own ingress (e.g. a separate Cloudflare Tunnel)
 
-   Ingress is a **Cloudflare Tunnel** (`cloudflared`), not port-forwarding:
+   This project does **not** bundle, install, or run `cloudflared`. You provide your
+   own external ingress — a separate Cloudflare Tunnel, nginx, Caddy, Traefik, etc.
+   Two ways to wire it up:
 
-   - **No published host port.** The compose `jukebox` service only `expose`s `8080`
-     on the internal network; cloudflared **dials out** and routes the subdomain to
-     `http://jukebox:8080`. Do not add a `ports:` mapping.
-   - **HTTPS is terminated at the Cloudflare edge**; cloudflared reaches the origin
-     over plain HTTP and sets `X-Forwarded-Proto: https`. Therefore **`TRUST_PROXY=true`
+   - **Host-level ingress (default).** The `jukebox` service publishes a
+     **localhost-bound** host port `127.0.0.1:${HOST_PORT:-8080}`. Point your own
+     host-level `cloudflared` / reverse proxy at `http://127.0.0.1:${HOST_PORT}`
+     (override `HOST_PORT` to avoid a clash). Binding to `127.0.0.1` keeps the app off
+     the LAN — only your ingress on the same host can reach it.
+   - **Containerized ingress.** If your tunnel runs as its own container, drop the
+     `ports:` mapping, attach both it and the `jukebox` service to a shared external
+     Docker network, and reach the app at `http://jukebox:8080` over that network.
+   - **HTTPS is terminated at your edge**; your tunnel/proxy reaches the origin over
+     plain HTTP and should set `X-Forwarded-Proto: https`. Therefore **`TRUST_PROXY=true`
      is required** for correct scheme detection and `Secure` session cookies — without
-     it, login cookies are dropped over the tunnel.
-   - **WebSocket gotcha (verify end-to-end).** Cloudflare Tunnels pass WebSockets
-     through, but the app's origin guard rejects any `/ws` upgrade whose `Origin`
-     isn't in `ALLOWED_WS_ORIGINS`. So **`ALLOWED_WS_ORIGINS` must equal
+     it, login cookies are dropped behind the proxy.
+   - **WebSocket gotcha (verify end-to-end).** Cloudflare Tunnels (and most proxies)
+     pass WebSockets through, but the app's origin guard rejects any `/ws` upgrade
+     whose `Origin` isn't in `ALLOWED_WS_ORIGINS`. So **`ALLOWED_WS_ORIGINS` must equal
      `PUBLIC_BASE_URL` exactly** (scheme + host, no trailing slash). After deploy,
-     confirm the `/ws` upgrade succeeds through cloudflared (browser devtools →
+     confirm the `/ws` upgrade succeeds through your ingress (browser devtools →
      Network → WS shows status `101 Switching Protocols`; the UI flips to
      "📻 Station is live"). A 403/closed socket means the origins don't match.
-   - **Bundled vs host cloudflared.** Run the bundled tunnel with
-     `docker compose --profile tunnel up -d` (set `TUNNEL_TOKEN`), or point an
-     existing host-level cloudflared at `http://jukebox:8080`.
 
    ## CI / GHCR gotchas
-
    - **Public package.** The GHCR image is published public. If the first build
      leaves the package private, set its visibility to public once in the GitHub
      package settings.
@@ -9362,8 +10438,8 @@ Produces (docs — no TS symbols):
    interacts. For the always-on speaker PC, do this **once**:
 
    1. Open `PUBLIC_BASE_URL` in the speaker PC's browser and log in (shared password
-      + a display name). A persistent **`deviceId`** is stored in `localStorage` —
-      this is how the backend recognizes the device on every reconnect.
+      - a display name). A persistent **`deviceId`** is stored in `localStorage` —
+        this is how the backend recognizes the device on every reconnect.
    2. Click **"Play on this device"** to make it the Player, then **"Remember this
       device as the speaker"** (sets `isPreferredSpeaker`).
    3. Grant the subdomain **autoplay permission** in the browser (site settings →
@@ -9399,6 +10475,9 @@ Produces (docs — no TS symbols):
          reopen it → it auto-resumes from the saved position.
    - [ ] `docker compose restart jukebox` → the station snapshot + remembered speaker
          survive (current track, queue, seed restored from `/data/cache`).
+
+   ```
+
    ```
 
 4. **Run it — expect PASS.** `cd /home/kasm-user/lan-jukebox && npx vitest run src/deploy/readme.test.ts`
@@ -9413,9 +10492,11 @@ Produces (docs — no TS symbols):
 **Steps**
 
 1. **Full green verification.** Run the complete suite from the repo root:
+
    ```bash
    cd /home/kasm-user/lan-jukebox && npm run typecheck && npm run lint && npm run build && npm test
    ```
+
    Expected output (the deploy specs run alongside all prior-phase specs):
    - `typecheck`: tsc exits 0, no errors.
    - `lint`: eslint exits 0, no warnings/errors.
@@ -9426,15 +10507,17 @@ Produces (docs — no TS symbols):
      `Test Files  N passed (N)` / `Tests  M passed (M)` and exit code 0.
 
 2. **Artifact sanity (manual).** Confirm the leaf artifacts parse/lint where tools exist:
+
    ```bash
    cd /home/kasm-user/lan-jukebox && sh -n docker-entrypoint.sh && echo SHELL_OK
    cd /home/kasm-user/lan-jukebox && (docker compose config -q && echo COMPOSE_OK) 2>/dev/null || echo "docker absent (ok)"
    ```
+
    Expected: `SHELL_OK`; `COMPOSE_OK` if Docker is present, otherwise the "docker absent (ok)" fallback (sandbox has no Docker — not a blocker).
 
 3. **Adversarial multi-agent `/debug` pass.** Fan out finder agents across every file changed/created in this phase — `Dockerfile`, `docker-entrypoint.sh`, `.github/workflows/build.yml`, `docker-compose.yml`, `.dockerignore`, `README.md`, and the four `src/deploy/*.test.ts` specs — each agent assigned a reliability lens:
    - **De-Discord/de-idle lens:** grep every artifact for `discord`, `oauth`, `IDLE_TIMEOUT`, `guild`, `voice`, `DISCORD_TOKEN`, `web,mweb` (default) — any hit is a confirmed bug (spec §1 non-goals, §3.1 deletions).
-   - **Cloudflared/WS invariant lens:** verify `ALLOWED_WS_ORIGINS` literally equals `PUBLIC_BASE_URL` in compose; `TRUST_PROXY: "true"`; no `ports:` mapping on `jukebox`; `expose: ["8080"]`; README states the `/ws` upgrade + 101 verification (spec §10, §13).
+   - **Ingress/WS invariant lens:** verify NO `cloudflared` service and NO `TUNNEL_TOKEN` are bundled anywhere (bring-your-own ingress); the `jukebox` service publishes a localhost-bound host port (`ports: ["127.0.0.1:${HOST_PORT:-8080}:8080"]`); `ALLOWED_WS_ORIGINS` literally equals `PUBLIC_BASE_URL` in compose; `TRUST_PROXY: "true"`; README states the `/ws` upgrade + 101 verification (spec §10, §13).
    - **Secret-hygiene lens:** confirm `.dockerignore` excludes `.env`; compose secrets are `CHANGE_ME` placeholders (no real tokens); `SESSION_SECRET` placeholder is >= 32 chars; README warns to keep the filled copy local.
    - **Persistence lens:** confirm the single `cache:` volume mounts `/data/cache` and is documented to hold `station-snapshot.json` + `device-registry.json`; entrypoint chowns `CACHE_DIR` before the gosu drop so the app user can write all three (spec §4/§5 restart-safe).
    - **Supply-chain lens:** confirm Deno is pinned + SHA256-verified (no `curl|sh`); `YTDLP_REFRESH` cache-bust is wired both in the Dockerfile (`ARG`/`ENV`) and the workflow (`date +%Y%U` → build-arg); `no-cache` on schedule/dispatch; image tags are `:latest` + `:${{ github.sha }}`.
@@ -9446,7 +10529,7 @@ Produces (docs — no TS symbols):
 4. **Single squash commit for the whole phase.** After green + clean debug, make exactly one commit (per the one-commit-per-phase rule):
    ```bash
    cd /home/kasm-user/lan-jukebox && git add Dockerfile docker-entrypoint.sh docker-compose.yml .dockerignore README.md .github/workflows/build.yml src/deploy/ && git commit -m "$(cat <<'EOF'
-   Phase 6: deploy — Dockerfile, GHCR CI, compose + Cloudflare Tunnel, README
+   Phase 6: deploy — Dockerfile, GHCR CI, compose (bring-your-own ingress), README
 
    - Multi-stage Dockerfile (Node 22 + yt-dlp[default] + bgutil + ffmpeg +
      SHA256-pinned Deno + gosu cache-chown entrypoint + /healthz HEALTHCHECK).
@@ -9454,13 +10537,14 @@ Produces (docs — no TS symbols):
      build/push :latest + :sha, weekly cron + date-keyed YTDLP_REFRESH cache-bust,
      no-cache on schedule/dispatch, concurrency cancel, gha cache mode=max.
    - docker-compose.yml: GHCR pull_policy:always, env block (no Discord, no idle
-     timeout, TRUST_PROXY=true, ALLOWED_WS_ORIGINS==PUBLIC_BASE_URL), expose:8080
-     with NO published port (cloudflared dials out), named cache volume holding the
-     station snapshot + device registry, /healthz healthcheck, optional bgutil-pot
-     and cloudflared profiles.
-   - README: env table, GHCR-public + workflow_dispatch + force-recreate gotchas,
-     cloudflared/WS-upgrade + TRUST_PROXY invariants, speaker-PC autoplay-grant +
-     device-memory checklist, manual <audio> playback verification checklist.
+     timeout, TRUST_PROXY=true, ALLOWED_WS_ORIGINS==PUBLIC_BASE_URL), a
+     localhost-bound published host port (127.0.0.1:${HOST_PORT:-8080}:8080) for the
+     user's OWN external ingress — NO bundled cloudflared — named cache volume holding
+     the station snapshot + device registry, /healthz healthcheck, optional bgutil-pot.
+   - README: env table (incl. HOST_PORT), GHCR-public + workflow_dispatch +
+     force-recreate gotchas, bring-your-own-ingress/WS-upgrade + TRUST_PROXY
+     invariants, speaker-PC autoplay-grant + device-memory checklist, manual <audio>
+     playback verification checklist.
    - src/deploy/*.test.ts: fixture-asserting Vitest specs guarding every invariant.
 
    Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
@@ -9514,6 +10598,7 @@ Produces (docs — no TS symbols):
 ```bash
 npm run typecheck && npm run lint && npm run build && npm test
 ```
+
 Expected: typecheck (backend + test + web) clean; eslint + prettier clean; web + tsc build succeed; **all Vitest suites pass**.
 
 - [ ] **Step 2: Completeness critic.** Run one final critic agent asking "what file, lens, or claim did we NOT cover, and what remains unverified?" Feed anything it surfaces back through Tasks 7.1–7.3 until it comes back clean (loop-until-dry).
@@ -9527,6 +10612,7 @@ $(printf '%s\n' 'Release-wide adversarial audit (many agents, all reliability le
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```
+
 Expected: one commit on `master`; `git status` clean. Do not push unless the user asks.
 
 ---

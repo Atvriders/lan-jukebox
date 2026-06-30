@@ -37,23 +37,23 @@ by "serve an audio stream that a browser plays."
 
 ## 2. Decisions (locked)
 
-| Decision | Choice |
-|---|---|
-| What it is | An always-playing YouTube radio station for a group |
-| Backend | Dockerized Node service = the always-on "master" / central coordinator |
-| Topology | Central client-server (browsers ↔ one backend). **Not** WebRTC P2P. |
-| Audio output | A browser's `<audio>` element (the "Player"); routes to the OS default device → speakers |
-| Player role | "Play on this device" toggle; **remembered devices auto-become the Player** |
-| Zones | Single station, one shared queue + radio |
-| Radio | When the queue empties, autoplay YouTube related/mix from the last seed, forever |
-| Cold start | Wait for a seed — "Queue a song to start the station"; no default station |
-| Timeouts | None. Never stops, never disconnects on idle |
-| Source | YouTube only (exact link + search→pick) |
-| Access | Single shared password (signed cookie); optional admin password for destructive/global actions |
-| Hosting | A `waterburp.com` subdomain served from a high-uptime 2 Gbit home network (public HTTPS → local Docker host) |
-| Deploy | GitHub Actions builds the image → **GHCR (public)** → `docker-compose` pulls it |
-| UI quality | Built with the `frontend-design` skill — professional-grade for a professional group |
-| Repo | New standalone public repo under Atvriders; branch `master` |
+| Decision     | Choice                                                                                                       |
+| ------------ | ------------------------------------------------------------------------------------------------------------ |
+| What it is   | An always-playing YouTube radio station for a group                                                          |
+| Backend      | Dockerized Node service = the always-on "master" / central coordinator                                       |
+| Topology     | Central client-server (browsers ↔ one backend). **Not** WebRTC P2P.                                          |
+| Audio output | A browser's `<audio>` element (the "Player"); routes to the OS default device → speakers                     |
+| Player role  | "Play on this device" toggle; **remembered devices auto-become the Player**                                  |
+| Zones        | Single station, one shared queue + radio                                                                     |
+| Radio        | When the queue empties, autoplay YouTube related/mix from the last seed, forever                             |
+| Cold start   | Wait for a seed — "Queue a song to start the station"; no default station                                    |
+| Timeouts     | None. Never stops, never disconnects on idle                                                                 |
+| Source       | YouTube only (exact link + search→pick)                                                                      |
+| Access       | Single shared password (signed cookie); optional admin password for destructive/global actions               |
+| Hosting      | A `waterburp.com` subdomain served from a high-uptime 2 Gbit home network (public HTTPS → local Docker host) |
+| Deploy       | GitHub Actions builds the image → **GHCR (public)** → `docker-compose` pulls it                              |
+| UI quality   | Built with the `frontend-design` skill — professional-grade for a professional group                         |
+| Repo         | New standalone public repo under Atvriders; branch `master`                                                  |
 
 ## 3. Architecture
 
