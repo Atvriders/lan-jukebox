@@ -262,9 +262,17 @@ broadcast" mode, mobile-native clients.
   gotcha: first build may need a `workflow_dispatch`.)
 - **Run:** `docker-compose.yml` pulls the GHCR image (`pull_policy: always`),
   mounts a named volume for cache + a volume/file for the persisted device
-  registry + station snapshot, and sets env inline. Behind the user's reverse
-  proxy for the `waterburp.com` subdomain (HTTPS).
-- **Config (env):** `PORT`, `PUBLIC_BASE_URL` (the subdomain),
+  registry + station snapshot, and sets env inline.
+- **Ingress:** a **Cloudflare Tunnel** (`cloudflared`) exposes the
+  `waterburp.com` subdomain → the container. Implications: **no port-forwarding /
+  no published host port needed** (cloudflared dials out and routes to the app's
+  `PORT` over the Docker network or loopback); **HTTPS is terminated at the
+  Cloudflare edge** and `cloudflared` reaches the origin over plain HTTP;
+  Cloudflare sets `X-Forwarded-Proto: https`, so `TRUST_PROXY=true` is required
+  for correct scheme detection + secure cookies; Cloudflare Tunnels pass
+  **WebSockets** through (verify `/ws` upgrades end-to-end). `cloudflared` may run
+  as its own service in the same compose file or already exist on the host.
+- **Config (env):** `PORT`, `PUBLIC_BASE_URL` (the `https://` subdomain),
   `ALLOWED_WS_ORIGINS` (**must equal** `PUBLIC_BASE_URL`), `TRUST_PROXY=true`,
   `VIEWER_PASSWORD`, `ADMIN_PASSWORD` (optional), `CACHE_DIR`, cache size,
   yt-dlp player clients, optional bgutil POT URL. No idle-timeout settings exist.
@@ -303,7 +311,8 @@ Subagent/workflow-driven, per the bot's hard-won lesson:
   2 Gbit home host, the LRU cache, and queue-ahead resolution; monitor.
 - **yt-dlp breakage** over time — mitigated by the player-client fallback
   ladder, optional bgutil POT, and CI cache-busting (carried from the bot).
-- **WS origin rejection** behind the proxy — `ALLOWED_WS_ORIGINS` must equal the
-  public subdomain (explicit bot gotcha), enforced + documented.
+- **WS origin/upgrade over the Cloudflare Tunnel** — `ALLOWED_WS_ORIGINS` must
+  equal the public subdomain (explicit bot gotcha), and the `/ws` upgrade must be
+  verified end-to-end through `cloudflared`; both enforced + documented.
 - **Keeping the speaker tab awake** on an always-on PC — recommend foreground/
   fullscreen + Wake Lock; revisit if throttling appears (deferred).
