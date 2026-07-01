@@ -50,7 +50,7 @@ by "serve an audio stream that a browser plays."
 | Timeouts     | None. Never stops, never disconnects on idle                                                                 |
 | Source       | YouTube only (exact link + search→pick)                                                                      |
 | Access       | Single shared password (signed cookie); anyone authenticated may control everything                          |
-| Hosting      | A `waterburp.com` subdomain served from a high-uptime 2 Gbit home network (public HTTPS → local Docker host) |
+| Hosting      | A `example.com` subdomain served from a high-uptime 2 Gbit home network (public HTTPS → local Docker host) |
 | Deploy       | GitHub Actions builds the image → **GHCR (public)** → `docker-compose` pulls it                              |
 | UI quality   | Built with the `frontend-design` skill — professional-grade for a professional group                         |
 | Repo         | New standalone public repo under Atvriders; branch `master`                                                  |
@@ -58,7 +58,7 @@ by "serve an audio stream that a browser plays."
 ## 3. Architecture
 
 ```
-                         waterburp.com subdomain (HTTPS, reverse proxy)
+                         example.com subdomain (HTTPS, reverse proxy)
                                         │
 [Speaker browser: Player] ─┐           ▼
 [Client browser: Remote ] ─┼─ HTTP+WS ─→ [Dockerized Node/Fastify backend (master)]
@@ -70,7 +70,7 @@ by "serve an audio stream that a browser plays."
 ```
 
 The Docker host runs on the home network behind a reverse proxy that terminates
-HTTPS for the `waterburp.com` subdomain. The speaker (a Windows PC) and remotes
+HTTPS for the `example.com` subdomain. The speaker (a Windows PC) and remotes
 reach it by that URL from a browser; on the home LAN the audio moves at local
 2 Gbit speed.
 

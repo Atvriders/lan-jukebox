@@ -32,7 +32,7 @@ yt-dlp (YouTube rotates its nsig solver, so a stale yt-dlp breaks extraction).
 | `PORT`                   | no       | `8080`                       | Internal container listen port.                                                                                                    |
 | `HOST_PORT`              | no       | `8080`                       | Host port your own ingress connects to (published on `127.0.0.1`, in `docker-compose.yml`).                                        |
 | `HOST`                   | no       | `0.0.0.0`                    | Bind address inside the container.                                                                                                 |
-| `PUBLIC_BASE_URL`        | yes      | —                            | The public `https://` subdomain (e.g. `https://jukebox.waterburp.com`). Trailing slash is stripped.                                |
+| `PUBLIC_BASE_URL`        | yes      | —                            | The public `https://` subdomain (e.g. `https://jukebox.example.com`). Trailing slash is stripped.                                  |
 | `ALLOWED_WS_ORIGINS`     | no\*     | = `PUBLIC_BASE_URL`          | **MUST equal `PUBLIC_BASE_URL` exactly** (see WebSocket gotcha). Defaults to `PUBLIC_BASE_URL`; only override for extra origins.   |
 | `VIEWER_PASSWORD`        | yes\*\*  | —                            | Single shared password; anyone authenticated controls everything. There is no separate admin/second password.                      |
 | `ALLOW_NO_PASSWORD`      | no       | `false`                      | Set `true` to run with no viewer password (LAN-only escape hatch). Server refuses to start with no password unless this is `true`. |

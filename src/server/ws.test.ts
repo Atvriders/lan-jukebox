@@ -36,13 +36,11 @@ const SNAP: StationSnapshot = {
 
 describe("isAllowedOrigin", () => {
   it("accepts an exact match", () => {
-    expect(isAllowedOrigin("https://radio.waterburp.com", ["https://radio.waterburp.com"])).toBe(
-      true,
-    );
+    expect(isAllowedOrigin("https://radio.example.com", ["https://radio.example.com"])).toBe(true);
   });
   it("rejects a mismatch and undefined", () => {
-    expect(isAllowedOrigin("https://evil.example", ["https://radio.waterburp.com"])).toBe(false);
-    expect(isAllowedOrigin(undefined, ["https://radio.waterburp.com"])).toBe(false);
+    expect(isAllowedOrigin("https://evil.example", ["https://radio.example.com"])).toBe(false);
+    expect(isAllowedOrigin(undefined, ["https://radio.example.com"])).toBe(false);
   });
 });
 

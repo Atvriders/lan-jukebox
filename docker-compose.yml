@@ -34,11 +34,11 @@ services:
       NODE_ENV: "production"
       LOG_LEVEL: "info"
 
-      # Public URL (the https:// waterburp.com subdomain served by the tunnel).
-      PUBLIC_BASE_URL: "https://jukebox.waterburp.com"
+      # Public URL (the https:// example.com subdomain served by the tunnel).
+      PUBLIC_BASE_URL: "https://jukebox.example.com"
       # MUST equal PUBLIC_BASE_URL exactly, or the live-updates WebSocket /ws is
       # rejected by the origin guard and the station UI never goes live.
-      ALLOWED_WS_ORIGINS: "https://jukebox.waterburp.com"
+      ALLOWED_WS_ORIGINS: "https://jukebox.example.com"
       # Your external HTTPS proxy / Cloudflare Tunnel terminates TLS at the edge and
       # reaches this origin over plain HTTP, sending X-Forwarded-Proto: https. The app
       # hardcodes Fastify trustProxy:true so it honors that for correct scheme detection

@@ -10,7 +10,7 @@ import {
 
 const SECRET = "x".repeat(32);
 const base = {
-  PUBLIC_BASE_URL: "https://jukebox.waterburp.com",
+  PUBLIC_BASE_URL: "https://jukebox.example.com",
   SESSION_SECRET: SECRET,
   VIEWER_PASSWORD: "hunter2",
 };
@@ -30,12 +30,12 @@ describe("loadWebConfig", () => {
     expect(() => loadWebConfig({ ...base, SESSION_SECRET: "short" })).toThrow(/SESSION_SECRET/);
   });
   it("requires PUBLIC_BASE_URL and strips a trailing slash", () => {
-    const cfg = loadWebConfig({ ...base, PUBLIC_BASE_URL: "https://jb.waterburp.com/" });
-    expect(cfg.publicBaseUrl).toBe("https://jb.waterburp.com");
+    const cfg = loadWebConfig({ ...base, PUBLIC_BASE_URL: "https://jb.example.com/" });
+    expect(cfg.publicBaseUrl).toBe("https://jb.example.com");
   });
   it("defaults ALLOWED_WS_ORIGINS to [publicBaseUrl]", () => {
     const cfg = loadWebConfig(base);
-    expect(cfg.allowedWsOrigins).toEqual(["https://jukebox.waterburp.com"]);
+    expect(cfg.allowedWsOrigins).toEqual(["https://jukebox.example.com"]);
   });
   it("always sets trustProxy true (always behind the tunnel; no env knob) and derives secureCookies from NODE_ENV", () => {
     const dev = loadWebConfig(base);
@@ -103,6 +103,6 @@ describe("loadConfig", () => {
     const cfg = loadConfig(base);
     expect(cfg.media.playerClients).toBe("android_vr,web_embedded,tv");
     expect(cfg.station.maxConcurrentDownloads).toBeGreaterThanOrEqual(1);
-    expect(cfg.web.publicBaseUrl).toBe("https://jukebox.waterburp.com");
+    expect(cfg.web.publicBaseUrl).toBe("https://jukebox.example.com");
   });
 });

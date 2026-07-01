@@ -853,7 +853,7 @@ declare module "fastify" {
 
    const SECRET = "x".repeat(32);
    const base = {
-     PUBLIC_BASE_URL: "https://jukebox.waterburp.com",
+     PUBLIC_BASE_URL: "https://jukebox.example.com",
      SESSION_SECRET: SECRET,
      VIEWER_PASSWORD: "hunter2",
    };
@@ -873,12 +873,12 @@ declare module "fastify" {
        expect(() => loadWebConfig({ ...base, SESSION_SECRET: "short" })).toThrow(/SESSION_SECRET/);
      });
      it("requires PUBLIC_BASE_URL and strips a trailing slash", () => {
-       const cfg = loadWebConfig({ ...base, PUBLIC_BASE_URL: "https://jb.waterburp.com/" });
-       expect(cfg.publicBaseUrl).toBe("https://jb.waterburp.com");
+       const cfg = loadWebConfig({ ...base, PUBLIC_BASE_URL: "https://jb.example.com/" });
+       expect(cfg.publicBaseUrl).toBe("https://jb.example.com");
      });
      it("defaults ALLOWED_WS_ORIGINS to [publicBaseUrl]", () => {
        const cfg = loadWebConfig(base);
-       expect(cfg.allowedWsOrigins).toEqual(["https://jukebox.waterburp.com"]);
+       expect(cfg.allowedWsOrigins).toEqual(["https://jukebox.example.com"]);
      });
      it("derives secureCookies from NODE_ENV", () => {
        const dev = loadWebConfig(base);
@@ -912,7 +912,7 @@ declare module "fastify" {
        const cfg = loadConfig(base);
        expect(cfg.media.playerClients).toBe("android_vr,web_embedded,tv");
        expect(cfg.station.maxConcurrentDownloads).toBeGreaterThanOrEqual(1);
-       expect(cfg.web.publicBaseUrl).toBe("https://jukebox.waterburp.com");
+       expect(cfg.web.publicBaseUrl).toBe("https://jukebox.example.com");
      });
    });
    ```
@@ -4952,13 +4952,13 @@ Per the one-commit-per-phase rule (overrides the skill's per-task default): exac
 
    describe("isAllowedOrigin", () => {
      it("accepts an exact match", () => {
-       expect(isAllowedOrigin("https://radio.waterburp.com", ["https://radio.waterburp.com"])).toBe(
+       expect(isAllowedOrigin("https://radio.example.com", ["https://radio.example.com"])).toBe(
          true,
        );
      });
      it("rejects a mismatch and undefined", () => {
-       expect(isAllowedOrigin("https://evil.example", ["https://radio.waterburp.com"])).toBe(false);
-       expect(isAllowedOrigin(undefined, ["https://radio.waterburp.com"])).toBe(false);
+       expect(isAllowedOrigin("https://evil.example", ["https://radio.example.com"])).toBe(false);
+       expect(isAllowedOrigin(undefined, ["https://radio.example.com"])).toBe(false);
      });
    });
    ```
@@ -9448,11 +9448,11 @@ Produces (compose YAML — no TS symbols):
          NODE_ENV: "production"
          LOG_LEVEL: "info"
 
-         # Public URL (the https:// waterburp.com subdomain served by the tunnel).
-         PUBLIC_BASE_URL: "https://jukebox.waterburp.com"
+         # Public URL (the https:// example.com subdomain served by the tunnel).
+         PUBLIC_BASE_URL: "https://jukebox.example.com"
          # MUST equal PUBLIC_BASE_URL exactly, or the live-updates WebSocket /ws is
          # rejected by the origin guard and the station UI never goes live.
-         ALLOWED_WS_ORIGINS: "https://jukebox.waterburp.com"
+         ALLOWED_WS_ORIGINS: "https://jukebox.example.com"
          # Your external HTTPS proxy / Cloudflare Tunnel terminates TLS at the edge and
          # reaches this origin over plain HTTP, sending X-Forwarded-Proto: https. The app
          # hardcodes Fastify trustProxy:true so it honors that for correct scheme detection
@@ -9667,7 +9667,7 @@ Produces (docs — no TS symbols):
    | `PORT`                     | no                 | `8080`                       | Internal container listen port.                                                               |
    | `HOST_PORT`                | no                 | `8080`                       | Host port your own ingress connects to (published on `127.0.0.1`).                            |
    | `HOST`                     | no                 | `0.0.0.0`                    | Bind address.                                                                                 |
-   | `PUBLIC_BASE_URL`          | yes                | —                            | The public `https://` subdomain (e.g. `https://jukebox.waterburp.com`).                       |
+   | `PUBLIC_BASE_URL`          | yes                | —                            | The public `https://` subdomain (e.g. `https://jukebox.example.com`).                       |
    | `ALLOWED_WS_ORIGINS`       | yes                | —                            | **MUST equal `PUBLIC_BASE_URL` exactly** (see WebSocket gotcha).                              |
    | `VIEWER_PASSWORD`          | yes*               | —                            | Single shared password; anyone authenticated controls everything. *Server refuses to start unless set, unless `ALLOW_NO_PASSWORD=true`. |
    | `ALLOW_NO_PASSWORD`        | no                 | `false`                      | Escape hatch to run with no viewer password (LAN-only).                                       |
