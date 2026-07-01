@@ -6,7 +6,7 @@
  * design system over the page:
  *   1. film grain   — tiled fractal noise (matches the --grain token's
  *                     baseFrequency 0.85 / 2 octaves), overlay-blended.
- *   2. red light-leak — a soft #ff0000 bloom leaking from the top edge, the
+ *   2. amber light-leak — a soft amber bloom leaking from the top edge, the
  *                     visual proof the console is powered on.
  *   3. vignette     — corners pulled down so the deck reads three-dimensional.
  *
@@ -31,7 +31,7 @@ export function Grain() {
           position: "absolute",
           inset: "-30% -10% auto -10%",
           height: "55%",
-          background: "radial-gradient(60% 100% at 50% 0%, rgba(255,0,0,0.10), transparent 70%)",
+          background: "radial-gradient(60% 100% at 50% 0%, rgba(240,178,74,0.10), transparent 70%)",
           filter: "blur(8px)",
         }}
       />

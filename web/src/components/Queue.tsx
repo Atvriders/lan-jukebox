@@ -71,7 +71,7 @@ function AutoplaySwitch({
             width: "1.06rem",
             height: "1.06rem",
             borderRadius: "var(--radius-pill)",
-            background: "var(--color-ink)",
+            background: "var(--color-fg)",
             boxShadow: "0 1px 2px rgba(0,0,0,0.6)",
             transform: "translateY(-50%)",
             transition: "left var(--dur-fast) var(--ease-mech)",

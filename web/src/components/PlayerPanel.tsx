@@ -22,7 +22,7 @@ export function PlayerPanel({
             >
               ●
             </span>
-            <span className="text-sm" style={{ color: "var(--color-ink)" }}>
+            <span className="text-sm" style={{ color: "var(--color-fg)" }}>
               This device is the speaker
             </span>
           </div>

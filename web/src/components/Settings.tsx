@@ -35,10 +35,10 @@ export function Settings({
 }) {
   const inputStyle = {
     border: "1px solid var(--color-line)",
-    color: "var(--color-ink)",
+    color: "var(--color-fg)",
   } as const;
   const selectClass = "bg-transparent px-3 py-2 text-sm font-mono tracking-tight";
-  const optStyle = { background: "var(--color-raised)", color: "var(--color-ink)" } as const;
+  const optStyle = { background: "var(--color-raised)", color: "var(--color-fg)" } as const;
   const maxLenIsPreset = MAX_LEN_PRESETS.some((p) => p.sec === maxTrackDurationSec);
 
   return (
@@ -77,7 +77,7 @@ export function Settings({
           />
           <span
             className="font-mono tabular-nums text-sm"
-            style={{ minWidth: "4ch", color: "var(--color-ink)", textAlign: "right" }}
+            style={{ minWidth: "4ch", color: "var(--color-fg)", textAlign: "right" }}
           >
             {volume}%
           </span>

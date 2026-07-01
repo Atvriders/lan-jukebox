@@ -31,61 +31,74 @@ export function LoginGate({ onAuthed }: { onAuthed: (s: SessionInfo) => void }) 
 
   return (
     <main className="min-h-full grid place-items-center px-6 py-12">
-      <form onSubmit={submit} className="card hero-glow reveal max-w-md w-full p-10">
-        <p className="eyebrow" style={{ color: "var(--color-ember-soft)" }}>
-          LAN Jukebox
-        </p>
-        <h1
-          className="font-display text-4xl mt-3 leading-tight"
-          style={{ color: "var(--color-ink)" }}
-        >
-          Join the station.
-        </h1>
-        <label className="flex flex-col gap-1.5 mt-7">
-          <span className="eyebrow">Display name</span>
-          <input
-            value={displayName}
-            onChange={(e) => setName(e.target.value)}
-            aria-label="Display name"
-            autoComplete="nickname"
-            className="outline-none text-sm px-4 py-3"
-            style={{ border: "1px solid var(--color-line)", color: "var(--color-ink)" }}
-          />
-        </label>
-        <label className="flex flex-col gap-1.5 mt-4">
-          <span className="eyebrow">Password</span>
-          <input
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            type="password"
-            aria-label="Password"
-            autoComplete="current-password"
-            className="outline-none text-sm px-4 py-3"
-            style={{ border: "1px solid var(--color-line)", color: "var(--color-ink)" }}
-          />
-        </label>
-        {error && (
-          <p
-            role="alert"
-            className="mt-4 text-sm font-mono"
-            style={{ color: "var(--color-ember-soft)" }}
-          >
-            {error}
+      <form onSubmit={submit} className="card reveal relative overflow-hidden max-w-md w-full p-10">
+        <div className="hero-glow" aria-hidden="true" />
+        <div className="relative z-10">
+          <p className="eyebrow" style={{ color: "var(--color-ember-soft)" }}>
+            LAN Jukebox
           </p>
-        )}
-        <button
-          type="submit"
-          disabled={busy}
-          className="pill pill-primary mt-7 justify-center w-full"
-        >
-          {busy ? (
-            <>
-              <span className="spinner" aria-hidden /> Entering…
-            </>
-          ) : (
-            "Enter the station"
+          <h1
+            className="font-display text-4xl mt-3 leading-tight"
+            style={{ color: "var(--color-fg)" }}
+          >
+            Join the station.
+          </h1>
+          <label className="flex flex-col gap-1.5 mt-7">
+            <span className="eyebrow">Display name</span>
+            <input
+              value={displayName}
+              onChange={(e) => setName(e.target.value)}
+              aria-label="Display name"
+              autoComplete="nickname"
+              className="outline-none text-sm px-4 py-3"
+              style={{
+                border: "1px solid var(--color-line)",
+                background: "var(--color-sunken)",
+                color: "var(--color-fg)",
+                borderRadius: "var(--radius-sm)",
+              }}
+            />
+          </label>
+          <label className="flex flex-col gap-1.5 mt-4">
+            <span className="eyebrow">Password</span>
+            <input
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              type="password"
+              aria-label="Password"
+              autoComplete="current-password"
+              className="outline-none text-sm px-4 py-3"
+              style={{
+                border: "1px solid var(--color-line)",
+                background: "var(--color-sunken)",
+                color: "var(--color-fg)",
+                borderRadius: "var(--radius-sm)",
+              }}
+            />
+          </label>
+          {error && (
+            <p
+              role="alert"
+              className="mt-4 text-sm font-mono"
+              style={{ color: "var(--color-ember-soft)" }}
+            >
+              {error}
+            </p>
           )}
-        </button>
+          <button
+            type="submit"
+            disabled={busy}
+            className="pill pill-primary mt-7 justify-center w-full"
+          >
+            {busy ? (
+              <>
+                <span className="spinner" aria-hidden /> Entering…
+              </>
+            ) : (
+              "Enter the station"
+            )}
+          </button>
+        </div>
       </form>
     </main>
   );

@@ -239,13 +239,16 @@ export function App() {
 
       {coldStart ? (
         <section
-          className="card hero-glow reveal p-10 text-center"
+          className="card reveal relative overflow-hidden p-10 text-center"
           style={{ animationDelay: "80ms" }}
         >
-          <p className="eyebrow">Station idle</p>
-          <h1 className="font-display text-3xl mt-3" style={{ color: "var(--color-ink)" }}>
-            Queue a song to start the station.
-          </h1>
+          <div className="hero-glow" aria-hidden="true" />
+          <div className="relative z-10">
+            <p className="eyebrow">Station idle</p>
+            <h1 className="font-display text-3xl mt-3" style={{ color: "var(--color-fg)" }}>
+              Queue a song to start the station.
+            </h1>
+          </div>
         </section>
       ) : (
         <div className="reveal" style={{ animationDelay: "80ms" }}>
