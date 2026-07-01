@@ -83,10 +83,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     cookie: {
       path: "/",
       httpOnly: true,
-      // "auto": Secure over HTTPS (detected via the tunnel's X-Forwarded-Proto, honored
-      // because trustProxy is on) and non-Secure over plain-HTTP LAN access — so login
-      // works both through the tunnel and directly at http://<host-ip>:PORT.
-      secure: "auto",
+      // Always Secure in production: the app is served over HTTPS via the tunnel, so the
+      // session cookie must never travel in cleartext. Access it via the https:// URL —
+      // plain-HTTP LAN access still loads but cannot hold a session (by design).
+      secure: deps.cfg.secureCookies,
       sameSite: "lax",
       maxAge: 7 * 24 * 60 * 60 * 1000,
     },
