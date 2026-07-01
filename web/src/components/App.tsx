@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from "react";
 import type {
   ControlAction,
   ControlRequest,
-  SessionInfo,
   StationSettings,
   StationSnapshot,
   StationStateResponse,
@@ -49,7 +48,6 @@ type AuthState = "checking" | "anon" | "authed";
  */
 export function App() {
   const [auth, setAuth] = useState<AuthState>("checking");
-  const [, setSession] = useState<SessionInfo | null>(null);
   // The immediate REST snapshot (a per-viewer StationStateResponse). Used until — and
   // as a fallback alongside — the WS broadcast; carries isThisDeviceSpeaker.
   const [restSnap, setRestSnap] = useState<StationStateResponse | null>(null);
@@ -135,13 +133,14 @@ export function App() {
   if (auth === "anon" || ws.status === "forbidden") {
     return (
       <LoginGate
-        onAuthed={(s) => {
-          setSession(s);
-          setAuth("authed");
-          void api.state().then((st) => {
-            setRestSnap(st);
-            setWantsSpeaker(st.isThisDeviceSpeaker);
-          });
+        onAuthed={() => {
+          // Full reload after login. The /ws socket opened before login was rejected
+          // (1008, no session) and the hook stops retrying a forbidden socket, so simply
+          // flipping auth to "authed" would leave ws.status === "forbidden" latched —
+          // which the gate above still treats as "show login", so the app never advances.
+          // Reloading re-runs bootstrap with the new session cookie present on BOTH the
+          // REST probe and the /ws upgrade, yielding an authenticated live socket + state.
+          window.location.reload();
         }}
       />
     );
