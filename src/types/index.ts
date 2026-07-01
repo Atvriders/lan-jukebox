@@ -299,7 +299,10 @@ export interface MediaConfig {
   searchResultCount: number;
   maxTrackDurationSec: number | null;
   ytProxy: string | null;
+  /** Path to a mounted cookies.txt (yt-dlp --cookies). Takes precedence over ytCookiesText. */
   ytCookiesFile: string | null;
+  /** Inline Netscape cookies.txt CONTENT (pasted into compose); materialized to a file at startup. */
+  ytCookiesText: string | null;
   poTokenProviderUrl: string | null;
   playerClients: string; // default "android_vr,web_embedded,tv"
   ytdlpTimeoutMs: number;

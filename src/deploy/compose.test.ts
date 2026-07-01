@@ -91,5 +91,9 @@ describe("docker-compose.yml", () => {
     expect(yml).toMatch(/YT_COOKIES:/);
     expect(yml).not.toMatch(/YT_COOKIES_FILE:/);
     expect(config).toMatch(/"YT_COOKIES"/);
+
+    // inline pasted-cookies content is a first-class env, read by config.ts
+    expect(yml).toMatch(/YT_COOKIES_TEXT:/);
+    expect(config).toMatch(/"YT_COOKIES_TEXT"/);
   });
 });

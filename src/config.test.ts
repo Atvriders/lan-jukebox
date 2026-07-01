@@ -1,9 +1,14 @@
 import { describe, it, expect } from "vitest";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   loadConfig,
   loadWebConfig,
   loadMediaConfig,
   loadStationConfig,
+  materializeCookies,
+  toNetscapeCookies,
   intEnv,
   strEnv,
 } from "./config.js";
@@ -104,5 +109,55 @@ describe("loadConfig", () => {
     expect(cfg.media.playerClients).toBe("android_vr,web_embedded,tv");
     expect(cfg.station.maxConcurrentDownloads).toBeGreaterThanOrEqual(1);
     expect(cfg.web.publicBaseUrl).toBe("https://jukebox.example.com");
+  });
+});
+
+describe("cookies (paste-into-compose)", () => {
+  const line = (name: string, value: string) =>
+    [".youtube.com", "TRUE", "/", "TRUE", "2000000000", name, value].join("\t");
+
+  it("converts a browser 'Cookie:' header to Netscape lines for .youtube.com", () => {
+    const out = toNetscapeCookies("Cookie: SID=abc; HSID=def; malformed");
+    expect(out).toMatch(/^# Netscape HTTP Cookie File\n/);
+    expect(out).toContain(line("SID", "abc"));
+    expect(out).toContain(line("HSID", "def"));
+    expect(out.endsWith("\n")).toBe(true);
+    // a pair without '=' is skipped -> exactly two cookie lines
+    expect(
+      out
+        .trim()
+        .split("\n")
+        .filter((l) => l.startsWith(".youtube.com")).length,
+    ).toBe(2);
+  });
+
+  it("passes exported cookies.txt through, adding the header only when missing", () => {
+    const raw = line("SID", "abc");
+    expect(toNetscapeCookies(raw)).toBe(`# Netscape HTTP Cookie File\n${raw}\n`);
+    const withHeader = `# Netscape HTTP Cookie File\n${raw}\n`;
+    expect(toNetscapeCookies(withHeader)).toBe(withHeader);
+  });
+
+  it("materializes YT_COOKIES_TEXT to <cacheDir>/yt-cookies.txt", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lj-ck-"));
+    const media = loadMediaConfig({ CACHE_DIR: dir, YT_COOKIES_TEXT: "SID=abc; HSID=def" });
+    const path = await materializeCookies(media);
+    expect(path).toBe(join(dir, "yt-cookies.txt"));
+    expect(readFileSync(path as string, "utf8")).toContain(line("SID", "abc"));
+  });
+
+  it("prefers an explicit YT_COOKIES path over YT_COOKIES_TEXT", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lj-ck-"));
+    const media = loadMediaConfig({
+      CACHE_DIR: dir,
+      YT_COOKIES: "/mnt/cookies.txt",
+      YT_COOKIES_TEXT: "SID=abc",
+    });
+    expect(await materializeCookies(media)).toBe("/mnt/cookies.txt");
+  });
+
+  it("returns null when neither cookies option is set", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lj-ck-"));
+    expect(await materializeCookies(loadMediaConfig({ CACHE_DIR: dir }))).toBeNull();
   });
 });

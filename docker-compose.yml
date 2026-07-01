@@ -67,7 +67,17 @@ services:
 
       # YouTube extraction
       YT_PROXY: "" # optional residential/SOCKS proxy if your IP gets blocked
-      YT_COOKIES: "" # optional path to a mounted cookies.txt for flagged IPs
+      YT_COOKIES: "" # optional path to a MOUNTED cookies.txt (takes precedence over YT_COOKIES_TEXT)
+      # Paste YouTube cookies here to fix "Sign in to confirm you're not a bot" on flagged IPs.
+      # It is written to <cache>/yt-cookies.txt (0600) at startup — no file mount needed.
+      # Easiest: a one-line browser "Cookie:" header (DevTools → Network → any youtube.com
+      # request → Request Headers → cookie), e.g.:
+      #   YT_COOKIES_TEXT: "VISITOR_INFO1_LIVE=...; LOGIN_INFO=...; SID=...; HSID=...; SSID=..."
+      # Or a full exported cookies.txt as a YAML block scalar:
+      #   YT_COOKIES_TEXT: |
+      #     # Netscape HTTP Cookie File
+      #     .youtube.com	TRUE	/	TRUE	2000000000	SID	<value>
+      YT_COOKIES_TEXT: ""
       # Zero-PO-token clients — reliable on most hosts. Only switch to "web,mweb" if
       # you also run the bgutil sidecar (`--profile pot`) and set PO_TOKEN_PROVIDER_URL;
       # otherwise those clients silently fail to extract audio.

@@ -1,4 +1,4 @@
-import { loadConfig } from "./config.js";
+import { loadConfig, materializeCookies } from "./config.js";
 import { YouTubeService } from "./youtube/index.js";
 import { AudioCache } from "./cache/index.js";
 import { Semaphore } from "./util/semaphore.js";
@@ -27,6 +27,10 @@ async function main(): Promise<void> {
   // at LOG_LEVEL instead of their own default-"info" instance.
   setRootLogger(log);
   installCrashHandlers(log);
+
+  // Materialize inline YT_COOKIES_TEXT (pasted into compose) to a file for yt-dlp's --cookies;
+  // an explicit YT_COOKIES path wins. No-op when neither is set.
+  media.ytCookiesFile = await materializeCookies(media);
 
   const youtube = new YouTubeService(media);
   const cache = new AudioCache(media.cacheDir, media.cacheMaxBytes);

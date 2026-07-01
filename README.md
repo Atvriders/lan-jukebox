@@ -46,7 +46,8 @@ yt-dlp (YouTube rotates its nsig solver, so a stale yt-dlp breaks extraction).
 | `MAX_TRACK_DURATION_SEC` | no       | — (`0`/empty = no cap)       | Reject tracks longer than this many seconds; `0`, empty, or unset means no ceiling.                                                |
 | `YTDLP_TIMEOUT_MS`       | no       | `60000`                      | Per-invocation yt-dlp timeout (ms).                                                                                                |
 | `YT_PROXY`               | no       | —                            | Optional residential/SOCKS proxy for yt-dlp.                                                                                       |
-| `YT_COOKIES`             | no       | —                            | Optional mounted `cookies.txt` path for flagged IPs.                                                                               |
+| `YT_COOKIES`             | no       | —                            | Optional mounted `cookies.txt` path for flagged IPs (takes precedence over `YT_COOKIES_TEXT`).                                     |
+| `YT_COOKIES_TEXT`        | no       | —                            | Paste cookies inline (a browser `Cookie:` header or a full `cookies.txt`); written to `<cache>/yt-cookies.txt` at startup.         |
 | `YT_PLAYER_CLIENTS`      | no       | `android_vr,web_embedded,tv` | Zero-PO-token client ladder. **Never** use `web,mweb` unless you run the bgutil PO-token sidecar.                                  |
 | `PO_TOKEN_PROVIDER_URL`  | no       | —                            | Only set (e.g. `http://bgutil-pot:4416`) when you run the optional bgutil PO-token provider (`--profile pot`).                     |
 | `LOG_LEVEL`              | no       | `info`                       | pino level (`trace`..`fatal`).                                                                                                     |
