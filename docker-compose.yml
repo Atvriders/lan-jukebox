@@ -5,9 +5,10 @@
 # Keep your filled-in copy LOCAL — do NOT commit real secrets to the repo.
 #
 # Ingress: BRING YOUR OWN. This project does NOT bundle or run a tunnel daemon. The
-# jukebox service publishes a LOCALHOST-bound host port (127.0.0.1:${HOST_PORT:-3018})
-# so your OWN external ingress — a separate Cloudflare Tunnel, nginx, Caddy, etc.,
-# running on the host — can reach the app at http://127.0.0.1:${HOST_PORT:-3018}.
+# jukebox service publishes host port ${HOST_PORT:-3018} on ALL interfaces, so the LAN
+# (http://<host-ip>:${HOST_PORT:-3018}) AND your OWN external ingress — a separate
+# Cloudflare Tunnel, nginx, Caddy, etc. — can reach it. (To keep it off the LAN and
+# reachable only by a same-host tunnel, prefix the ports mapping with 127.0.0.1:.)
 #   Alternative: if your tunnel runs as its own container, drop the `ports:` mapping,
 #   attach both it and this service to a shared external Docker network, and reach the
 #   app at http://jukebox:3018 over that network instead of publishing a host port.
@@ -83,11 +84,13 @@ services:
       # otherwise those clients silently fail to extract audio.
       YT_PLAYER_CLIENTS: "android_vr,web_embedded,tv"
       PO_TOKEN_PROVIDER_URL: "" # only set (e.g. http://bgutil-pot:4416) with --profile pot
-    # Published on LOCALHOST only — your OWN external ingress (a separate tunnel /
-    # nginx / Caddy on the host) connects here. Override the host port with HOST_PORT.
+    # Published on ALL host interfaces so the LAN (http://<host-ip>:3018) AND your OWN
+    # external ingress (a separate tunnel / nginx / Caddy) can reach it. Override the
+    # host port with HOST_PORT. To keep it OFF the LAN (only a same-host tunnel reaches
+    # it), prefix the mapping with 127.0.0.1: e.g. "127.0.0.1:${HOST_PORT:-3018}:3018".
     # Alternative: if your tunnel is its own container, delete this line and instead
     # join a shared external network and reach the app at http://jukebox:3018.
-    ports: ["127.0.0.1:${HOST_PORT:-3018}:3018"]
+    ports: ["${HOST_PORT:-3018}:3018"]
     volumes: ["cache:/data/cache"]
     restart: unless-stopped
     healthcheck:

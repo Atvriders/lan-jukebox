@@ -265,10 +265,11 @@ broadcast" mode, mobile-native clients.
   registry + station snapshot, and sets env inline.
 - **Ingress (bring your own — NOT bundled):** the project does **not** bundle or
   run `cloudflared`. The user fronts it with their **own separate** Cloudflare
-  Tunnel (or any HTTPS reverse proxy). The container publishes a localhost-bound
-  host port (`127.0.0.1:${HOST_PORT:-3018}:3018`) that a host-level tunnel dials,
-  or — if the tunnel runs as its own container — it joins a shared Docker network
-  and reaches the app at `http://jukebox:3018`. **HTTPS is terminated at the
+  Tunnel (or any HTTPS reverse proxy). The container publishes host port
+  `${HOST_PORT:-3018}:3018` on all interfaces (reachable on the LAN and by a
+  host-level tunnel; prefix `127.0.0.1:` to keep it off the LAN), or — if the tunnel
+  runs as its own container — it joins a shared Docker network and reaches the app at
+  `http://jukebox:3018`. **HTTPS is terminated at the
   Cloudflare edge** and the tunnel reaches the origin over plain HTTP; Cloudflare
   sets `X-Forwarded-Proto: https`, and Fastify `trustProxy` is always `true` so
   scheme detection + secure cookies + real client IP are correct behind the

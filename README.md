@@ -13,8 +13,9 @@ seed, forever. No idle timeouts, no auto-stop.
 ```bash
 # 1. Copy docker-compose.yml and fill in the placeholders (see env table below).
 #    Keep your filled-in copy LOCAL — do NOT commit real secrets to the repo.
-# 2. Pull + run. The app publishes 127.0.0.1:${HOST_PORT:-3018}; point your OWN
-#    external ingress (a separate Cloudflare Tunnel, nginx, etc.) at it.
+# 2. Pull + run. The app publishes host port ${HOST_PORT:-3018} on all interfaces —
+#    reach it on the LAN at http://<host-ip>:3018 and/or point your OWN external
+#    ingress (a separate Cloudflare Tunnel, nginx, etc.) at it.
 docker compose up -d
 ```
 
@@ -66,11 +67,12 @@ This project does **not** bundle, install, or run `cloudflared`. There is no
 ingress** — a separate Cloudflare Tunnel, nginx, Caddy, Traefik, etc. Two ways to
 wire it up:
 
-- **Host-level ingress (default).** The `jukebox` service publishes a
-  **localhost-bound** host port `127.0.0.1:${HOST_PORT:-3018}:3018`. Point your own
-  host-level `cloudflared` / reverse proxy at `http://127.0.0.1:${HOST_PORT}`
-  (override `HOST_PORT` to avoid a clash). Binding to `127.0.0.1` keeps the app off
-  the LAN — only your ingress on the same host can reach it.
+- **Host-level ingress (default).** The `jukebox` service publishes host port
+  `${HOST_PORT:-3018}:3018` on all interfaces, so it's reachable on the LAN at
+  `http://<host-ip>:3018` and by a host-level `cloudflared` / reverse proxy at
+  `http://<host-ip>:${HOST_PORT}` (override `HOST_PORT` to avoid a clash). To keep the
+  app OFF the LAN (only a same-host tunnel can reach it), prefix the mapping with
+  `127.0.0.1:` — i.e. `"127.0.0.1:${HOST_PORT:-3018}:3018"`.
 - **Containerized ingress.** If your tunnel runs as its own container, drop the
   `ports:` mapping, attach both it and the `jukebox` service to a shared external
   Docker network, and reach the app at `http://jukebox:3018` over that network.
