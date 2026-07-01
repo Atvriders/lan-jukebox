@@ -5,12 +5,12 @@
 # Keep your filled-in copy LOCAL — do NOT commit real secrets to the repo.
 #
 # Ingress: BRING YOUR OWN. This project does NOT bundle or run a tunnel daemon. The
-# jukebox service publishes a LOCALHOST-bound host port (127.0.0.1:${HOST_PORT:-8080})
+# jukebox service publishes a LOCALHOST-bound host port (127.0.0.1:${HOST_PORT:-3018})
 # so your OWN external ingress — a separate Cloudflare Tunnel, nginx, Caddy, etc.,
-# running on the host — can reach the app at http://127.0.0.1:${HOST_PORT:-8080}.
+# running on the host — can reach the app at http://127.0.0.1:${HOST_PORT:-3018}.
 #   Alternative: if your tunnel runs as its own container, drop the `ports:` mapping,
 #   attach both it and this service to a shared external Docker network, and reach the
-#   app at http://jukebox:8080 over that network instead of publishing a host port.
+#   app at http://jukebox:3018 over that network instead of publishing a host port.
 #
 # Persistence: the `cache` named volume holds the LRU audio cache AND the restart-safe
 #   /data/cache/station-snapshot.json   (current track, queue, upcoming-radio, seed)
@@ -29,7 +29,7 @@ services:
     init: true
     environment:
       # Server
-      PORT: "8080"
+      PORT: "3018"
       HOST: "0.0.0.0"
       NODE_ENV: "production"
       LOG_LEVEL: "info"
@@ -86,8 +86,8 @@ services:
     # Published on LOCALHOST only — your OWN external ingress (a separate tunnel /
     # nginx / Caddy on the host) connects here. Override the host port with HOST_PORT.
     # Alternative: if your tunnel is its own container, delete this line and instead
-    # join a shared external network and reach the app at http://jukebox:8080.
-    ports: ["127.0.0.1:${HOST_PORT:-8080}:8080"]
+    # join a shared external network and reach the app at http://jukebox:3018.
+    ports: ["127.0.0.1:${HOST_PORT:-3018}:3018"]
     volumes: ["cache:/data/cache"]
     restart: unless-stopped
     healthcheck:
@@ -96,7 +96,7 @@ services:
           "CMD",
           "node",
           "-e",
-          "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+          "fetch('http://127.0.0.1:'+(process.env.PORT||3018)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
         ]
       interval: 30s
       timeout: 5s

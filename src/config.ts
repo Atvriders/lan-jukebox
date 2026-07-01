@@ -155,7 +155,7 @@ export function loadWebConfig(env: Env = process.env): WebConfig {
     viewerPassword: viewerPassword ?? "",
     allowNoPassword,
     sessionSecret,
-    port: intEnv(env, "PORT", 8080, { min: 1, max: 65535 }),
+    port: intEnv(env, "PORT", 3018, { min: 1, max: 65535 }),
     host: strEnv(env, "HOST") ?? "0.0.0.0",
     // The app is always served behind the user's Cloudflare Tunnel, so X-Forwarded-*
     // headers are always trustworthy here. Always-on; no env knob.

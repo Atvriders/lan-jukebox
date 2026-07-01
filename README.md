@@ -13,7 +13,7 @@ seed, forever. No idle timeouts, no auto-stop.
 ```bash
 # 1. Copy docker-compose.yml and fill in the placeholders (see env table below).
 #    Keep your filled-in copy LOCAL — do NOT commit real secrets to the repo.
-# 2. Pull + run. The app publishes 127.0.0.1:${HOST_PORT:-8080}; point your OWN
+# 2. Pull + run. The app publishes 127.0.0.1:${HOST_PORT:-3018}; point your OWN
 #    external ingress (a separate Cloudflare Tunnel, nginx, etc.) at it.
 docker compose up -d
 ```
@@ -29,8 +29,8 @@ yt-dlp (YouTube rotates its nsig solver, so a stale yt-dlp breaks extraction).
 
 | Variable                 | Required | Default                      | Notes                                                                                                                              |
 | ------------------------ | -------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `PORT`                   | no       | `8080`                       | Internal container listen port.                                                                                                    |
-| `HOST_PORT`              | no       | `8080`                       | Host port your own ingress connects to (published on `127.0.0.1`, in `docker-compose.yml`).                                        |
+| `PORT`                   | no       | `3018`                       | Internal container listen port.                                                                                                    |
+| `HOST_PORT`              | no       | `3018`                       | Host port your own ingress connects to (published on `127.0.0.1`, in `docker-compose.yml`).                                        |
 | `HOST`                   | no       | `0.0.0.0`                    | Bind address inside the container.                                                                                                 |
 | `PUBLIC_BASE_URL`        | yes      | —                            | The public `https://` subdomain (e.g. `https://jukebox.example.com`). Trailing slash is stripped.                                  |
 | `ALLOWED_WS_ORIGINS`     | no\*     | = `PUBLIC_BASE_URL`          | **MUST equal `PUBLIC_BASE_URL` exactly** (see WebSocket gotcha). Defaults to `PUBLIC_BASE_URL`; only override for extra origins.   |
@@ -67,13 +67,13 @@ ingress** — a separate Cloudflare Tunnel, nginx, Caddy, Traefik, etc. Two ways
 wire it up:
 
 - **Host-level ingress (default).** The `jukebox` service publishes a
-  **localhost-bound** host port `127.0.0.1:${HOST_PORT:-8080}:8080`. Point your own
+  **localhost-bound** host port `127.0.0.1:${HOST_PORT:-3018}:3018`. Point your own
   host-level `cloudflared` / reverse proxy at `http://127.0.0.1:${HOST_PORT}`
   (override `HOST_PORT` to avoid a clash). Binding to `127.0.0.1` keeps the app off
   the LAN — only your ingress on the same host can reach it.
 - **Containerized ingress.** If your tunnel runs as its own container, drop the
   `ports:` mapping, attach both it and the `jukebox` service to a shared external
-  Docker network, and reach the app at `http://jukebox:8080` over that network.
+  Docker network, and reach the app at `http://jukebox:3018` over that network.
 - **HTTPS is terminated at your edge.** Your tunnel/proxy reaches the origin over
   plain HTTP and should set `X-Forwarded-Proto: https`. The app hardcodes Fastify
   **`trustProxy: true`** (a fixed behavior, not an env knob — the app is always

@@ -28,8 +28,8 @@ describe("docker-compose.yml", () => {
   it("publishes a localhost-bound host port for the user's own external ingress", () => {
     // the jukebox service publishes a 127.0.0.1-bound host port so a separate
     // host-level reverse proxy / Cloudflare Tunnel can reach it
-    expect(yml).toMatch(/127\.0\.0\.1:\$\{HOST_PORT:-8080\}:8080/);
-    expect(yml).toMatch(/ports:\s*\[\s*"127\.0\.0\.1:.*:8080"\s*\]/);
+    expect(yml).toMatch(/127\.0\.0\.1:\$\{HOST_PORT:-3018\}:3018/);
+    expect(yml).toMatch(/ports:\s*\[\s*"127\.0\.0\.1:.*:3018"\s*\]/);
   });
 
   it("mounts the named cache volume that also holds snapshot + registry", () => {

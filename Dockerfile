@@ -8,7 +8,7 @@ RUN npm run build
 RUN npm ci --omit=dev
 
 FROM node:22-bookworm-slim AS runtime
-ENV NODE_ENV=production PORT=8080 CACHE_DIR=/data/cache PATH="/usr/local/bin:${PATH}"
+ENV NODE_ENV=production PORT=3018 CACHE_DIR=/data/cache PATH="/usr/local/bin:${PATH}"
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg python3 python3-pip ca-certificates curl unzip gosu \
     && rm -rf /var/lib/apt/lists/*
@@ -46,8 +46,8 @@ COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 # NOTE: no `USER app` here — the entrypoint starts as root only to chown the
 # mounted cache volume (which may be root-owned), then drops to 'app' via gosu.
 VOLUME ["/data/cache"]
-EXPOSE 8080
+EXPOSE 3018
 HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3018)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["node", "dist/index.js"]

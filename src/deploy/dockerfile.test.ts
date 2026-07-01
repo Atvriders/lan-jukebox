@@ -48,7 +48,7 @@ describe("Dockerfile", () => {
     expect(df).toMatch(/CMD \["node", "dist\/index\.js"\]/);
     expect(df).toMatch(/HEALTHCHECK[\s\S]*\/healthz/);
     expect(df).toMatch(/VOLUME \["\/data\/cache"\]/);
-    expect(df).toMatch(/EXPOSE 8080/);
+    expect(df).toMatch(/EXPOSE 3018/);
   });
 
   it("carries no Discord/OAuth remnants", () => {
