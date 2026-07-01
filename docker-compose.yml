@@ -1,0 +1,102 @@
+# IMPORTANT: This file contains PLACEHOLDER values.
+# Before running `docker compose up`, fill in your real values for:
+#   PUBLIC_BASE_URL, ALLOWED_WS_ORIGINS (== PUBLIC_BASE_URL), VIEWER_PASSWORD,
+#   SESSION_SECRET (>= 32 chars).
+# Keep your filled-in copy LOCAL — do NOT commit real secrets to the repo.
+#
+# Ingress: BRING YOUR OWN. This project does NOT bundle or run a tunnel daemon. The
+# jukebox service publishes a LOCALHOST-bound host port (127.0.0.1:${HOST_PORT:-8080})
+# so your OWN external ingress — a separate Cloudflare Tunnel, nginx, Caddy, etc.,
+# running on the host — can reach the app at http://127.0.0.1:${HOST_PORT:-8080}.
+#   Alternative: if your tunnel runs as its own container, drop the `ports:` mapping,
+#   attach both it and this service to a shared external Docker network, and reach the
+#   app at http://jukebox:8080 over that network instead of publishing a host port.
+#
+# Persistence: the `cache` named volume holds the LRU audio cache AND the restart-safe
+#   /data/cache/station-snapshot.json   (current track, queue, upcoming-radio, seed)
+#   /data/cache/device-registry.json    (remembered speaker / auto-select state)
+# so the station and the remembered speaker survive `docker compose up` restarts.
+
+services:
+  jukebox:
+    image: ghcr.io/atvriders/lan-jukebox:latest
+    pull_policy: always
+    environment:
+      # Server
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      NODE_ENV: "production"
+      LOG_LEVEL: "info"
+
+      # Public URL (the https:// waterburp.com subdomain served by the tunnel).
+      PUBLIC_BASE_URL: "https://jukebox.waterburp.com"
+      # MUST equal PUBLIC_BASE_URL exactly, or the live-updates WebSocket /ws is
+      # rejected by the origin guard and the station UI never goes live.
+      ALLOWED_WS_ORIGINS: "https://jukebox.waterburp.com"
+      # Your external HTTPS proxy / Cloudflare Tunnel terminates TLS at the edge and
+      # reaches this origin over plain HTTP, sending X-Forwarded-Proto: https. The app
+      # hardcodes Fastify trustProxy:true so it honors that for correct scheme detection
+      # + Secure session cookies + real client IP — there is no trust-proxy env knob.
+
+      # Auth: a single shared viewer password (required). Anyone authenticated may
+      # control everything — there is no second/admin password. The server refuses to
+      # start without VIEWER_PASSWORD unless ALLOW_NO_PASSWORD=true.
+      VIEWER_PASSWORD: "CHANGE_ME"
+      ALLOW_NO_PASSWORD: "false"
+      SESSION_SECRET: "CHANGE_ME_AT_LEAST_32_CHARACTERS_LONG"
+
+      # Cache + persistence (all three persisted files live under CACHE_DIR)
+      CACHE_DIR: "/data/cache"
+      CACHE_MAX_MB: "5000"
+
+      # History / search limits
+      HISTORY_MAX_ITEMS: "100"
+      SEARCH_RESULT_COUNT: "10"
+
+      # Download / radio tuning
+      PREFETCH_DEPTH: "3"
+      MAX_TRANSCODE_JOBS: "4"
+      # 0 / "" = no cap; long content (concerts) plays out of the box.
+      MAX_TRACK_DURATION_SEC: "0"
+
+      # YouTube extraction
+      YT_PROXY: "" # optional residential/SOCKS proxy if your IP gets blocked
+      YT_COOKIES: "" # optional path to a mounted cookies.txt for flagged IPs
+      # Zero-PO-token clients — reliable on most hosts. Only switch to "web,mweb" if
+      # you also run the bgutil sidecar (`--profile pot`) and set PO_TOKEN_PROVIDER_URL;
+      # otherwise those clients silently fail to extract audio.
+      YT_PLAYER_CLIENTS: "android_vr,web_embedded,tv"
+      PO_TOKEN_PROVIDER_URL: "" # only set (e.g. http://bgutil-pot:4416) with --profile pot
+    # Published on LOCALHOST only — your OWN external ingress (a separate tunnel /
+    # nginx / Caddy on the host) connects here. Override the host port with HOST_PORT.
+    # Alternative: if your tunnel is its own container, delete this line and instead
+    # join a shared external network and reach the app at http://jukebox:8080.
+    ports: ["127.0.0.1:${HOST_PORT:-8080}:8080"]
+    volumes: ["cache:/data/cache"]
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 25s
+      retries: 3
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Optional PO-token sidecar — only needed if you switch YT_PLAYER_CLIENTS to web/mweb.
+  # Enable with: docker compose --profile pot up -d
+  bgutil-pot:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    profiles: ["pot"]
+    restart: unless-stopped
+    expose: ["4416"]
+
+volumes:
+  cache:
