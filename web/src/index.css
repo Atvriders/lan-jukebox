@@ -1,1 +1,586 @@
-/* PLACEHOLDER — design system authored in Phase 5 (replaced, not deleted). */
+/* ============================================================================
+ * lan-jukebox — design system  ·  "On-Air Broadcast Console"
+ * ----------------------------------------------------------------------------
+ * A warm-dark broadcast deck: deep warm ink base, machined charcoal panels,
+ * ONE amber on-air tally (~#F0B24A) as the sole accent, a VU-meter now-playing
+ * motif, film grain + amber hero-glow atmosphere, and a single orchestrated
+ * power-on reveal. CSS-only (Tailwind v4 @theme). Respects prefers-reduced-motion.
+ *
+ * FROZEN after Task 5.1. Later tasks only CONSUME these tokens/classes:
+ *   .card .pill .pill-primary .pill-ghost .eyebrow .vu .spinner .reveal .hero-glow
+ *
+ * Fonts (loaded below): Instrument Serif (display), Archivo (UI/body),
+ * IBM Plex Mono (timecodes / deviceId / eyebrow labels).
+ * ========================================================================== */
+
+@import url("https://fonts.googleapis.com/css2?family=Archivo:ital,wght@0,300..800;1,300..700&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=Instrument+Serif:ital@0;1&display=swap");
+
+@import "tailwindcss";
+
+/* ----------------------------------------------------------------------------
+ * @theme — design tokens (exposed to Tailwind utilities + as CSS custom props)
+ * -------------------------------------------------------------------------- */
+@theme {
+  /* Type families — bind Tailwind's font-* utilities to our voices. */
+  --font-display: "Instrument Serif", ui-serif, Georgia, serif;
+  --font-sans: "Archivo", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+
+  /* --- Base surfaces: deep warm brown-black climbing to lifted charcoal --- */
+  --color-void: #0b0a08; /* the room behind the deck */
+  --color-ink: #12100e; /* page base — deep warm ink */
+  --color-sunken: #171410; /* recessed wells (rails, inputs, thumbs) */
+  --color-panel: #1d1a15; /* base panel plate */
+  --color-raised: #262119; /* lifted control faces / hover plates */
+
+  /* --- Text: warm bone → warm slate → faint --- */
+  --color-fg: #f3ede1; /* primary bone-white text */
+  --color-ink-dim: #b6ab97; /* secondary warm-slate */
+  --color-ink-faint: #7d7362; /* tertiary / disabled / captions */
+
+  /* --- Hairlines / machined edges --- */
+  --color-line: #332c22; /* fine panel borders */
+  --color-line-soft: #241f18; /* whisper divider */
+
+  /* --- THE ACCENT: one warm amber on-air tally, used sharply --- */
+  --color-accent: #f0b24a; /* live / primary transport / focus ring */
+  --color-accent-hi: #ffcf7a; /* highlit amber (glints, top-lit rims) */
+  --color-ember-soft: #f0b24a; /* alias — hot amber (active operations) */
+  --color-ember: #e39a2f; /* mid amber */
+  --color-ember-deep: #9a641b; /* banked ember (shadow side of the lamp) */
+  --color-accent-ink: #1a1206; /* text ON amber (dark, for contrast) */
+
+  /* Muted signal colors (used sparingly; still warm) */
+  --color-good: #8fbf6f; /* affirmative / connected */
+  --color-warn: #e6a94e; /* caution */
+  --color-bad: #d98a6a; /* warm terracotta error (NOT YouTube red) */
+
+  /* --- Radii --- */
+  --radius-sm: 0.5rem;
+  --radius-md: 0.85rem;
+  --radius-lg: 1.15rem;
+  --radius-pill: 999px;
+
+  /* --- Motion --- */
+  --dur-fast: 140ms; /* hover / small state changes */
+  --dur-press: 90ms; /* active/press feedback */
+  --dur-slow: 520ms; /* reveals, glows */
+  --ease-mech: cubic-bezier(0.2, 0.8, 0.2, 1); /* springy machined feel */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* --- Depth / rim lighting (machined-panel feel) --- */
+  --shadow-rim: 0 1px 0 0 rgba(255, 236, 200, 0.04) inset,
+    0 0 0 1px rgba(0, 0, 0, 0.35), 0 18px 40px -24px rgba(0, 0, 0, 0.85);
+  --shadow-inset: inset 0 2px 6px -2px rgba(0, 0, 0, 0.8),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.4);
+  --shadow-press: inset 0 3px 8px -3px rgba(0, 0, 0, 0.9);
+
+  /* --- The amber on-air glow (token kept named --glow-red for the frozen
+   *     components that reference it; defined as AMBER so no red ever shows). */
+  --glow-red: 0 0 0 1px rgba(240, 178, 74, 0.35), 0 0 16px -2px rgba(240, 178, 74, 0.55),
+    0 0 34px -6px rgba(240, 178, 74, 0.4);
+  --glow-amber: var(--glow-red);
+}
+
+/* ----------------------------------------------------------------------------
+ * Base layer — page atmosphere, typography defaults, focus, scrollbars
+ * -------------------------------------------------------------------------- */
+@layer base {
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.55;
+    font-weight: 400;
+    letter-spacing: 0.005em;
+    background-color: var(--color-ink);
+    /* Layered warm atmosphere: a soft amber wash top-center + banked corners,
+       riding on the deep warm ink. */
+    background-image:
+      radial-gradient(120% 90% at 50% -10%, rgba(240, 178, 74, 0.07), transparent 55%),
+      radial-gradient(90% 70% at 50% 120%, rgba(0, 0, 0, 0.55), transparent 60%),
+      linear-gradient(180deg, var(--color-void) 0%, var(--color-ink) 22%, var(--color-ink) 100%);
+    background-attachment: fixed;
+  }
+
+  /* Global film-grain overlay — the console was photographed in a dark room. */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    opacity: 0.05;
+    mix-blend-mode: overlay;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size: 160px 160px;
+    animation: grain-drift 6s steps(6) infinite;
+  }
+
+  /* Keep real content above the grain plane. */
+  #root {
+    position: relative;
+    z-index: 1;
+  }
+
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+    font-weight: 400;
+    line-height: 1.05;
+    letter-spacing: 0.01em;
+    margin: 0;
+  }
+
+  a {
+    color: var(--color-accent);
+    text-decoration: none;
+  }
+  a:hover {
+    color: var(--color-accent-hi);
+  }
+
+  /* Amber focus-visible rings everywhere — the a11y accent. */
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+
+  ::selection {
+    background: rgba(240, 178, 74, 0.28);
+    color: var(--color-fg);
+  }
+
+  /* Form controls inherit the deck's voice by default. */
+  input,
+  textarea,
+  select,
+  button {
+    font: inherit;
+    color: inherit;
+  }
+
+  /* Recessed console inputs. */
+  input[type="text"],
+  input[type="search"],
+  input[type="password"],
+  input[type="url"],
+  input[type="number"],
+  textarea,
+  select {
+    background: var(--color-sunken);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-inset);
+    padding: 0.6rem 0.85rem;
+    color: var(--color-fg);
+    transition: border-color var(--dur-fast) var(--ease-mech),
+      box-shadow var(--dur-fast) var(--ease-mech);
+  }
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-ink-faint);
+  }
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible {
+    outline: none;
+    border-color: var(--color-accent);
+    box-shadow: var(--shadow-inset), var(--glow-amber);
+  }
+
+  /* Amber range track/thumb (volume, seek). */
+  input[type="range"] {
+    accent-color: var(--color-accent);
+  }
+
+  /* Slim warm scrollbars. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--color-line);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--color-raised);
+    background-clip: padding-box;
+  }
+}
+
+/* ----------------------------------------------------------------------------
+ * Component classes — the frozen public surface consumed by later tasks.
+ * -------------------------------------------------------------------------- */
+@layer components {
+  /* ---- .card — a machined console panel: lifted charcoal, hairline rim,
+   *      soft depth shadow, and a faint top-lit edge. -------------------- */
+  .card {
+    position: relative;
+    background:
+      linear-gradient(180deg, rgba(255, 236, 200, 0.02), transparent 40%),
+      var(--color-panel);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-rim);
+    color: var(--color-fg);
+  }
+  /* Hairline top-lit rim — light catches the machined edge. */
+  .card::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    box-shadow: inset 0 1px 0 0 rgba(255, 236, 200, 0.05);
+  }
+
+  /* ---- .eyebrow — mono, tracked, uppercase micro-labels (section tags,
+   *      status lines, deviceId captions). ------------------------------ */
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    font-weight: 500;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--color-ink-faint);
+    line-height: 1;
+  }
+
+  /* ---- .pill — the transport-key base: a physical console button. ----- */
+  .pill {
+    --pill-fg: var(--color-fg);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.55rem 1.05rem;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--color-line);
+    background:
+      linear-gradient(180deg, var(--color-raised), var(--color-panel));
+    color: var(--pill-fg);
+    font-family: var(--font-sans);
+    font-size: 0.86rem;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    line-height: 1;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+    box-shadow: var(--shadow-rim);
+    transition: transform var(--dur-fast) var(--ease-mech),
+      border-color var(--dur-fast) var(--ease-mech),
+      background var(--dur-fast) var(--ease-mech),
+      box-shadow var(--dur-fast) var(--ease-mech),
+      color var(--dur-fast) var(--ease-mech);
+  }
+  .pill:hover {
+    transform: translateY(-1px);
+    border-color: var(--color-ember-deep);
+    color: var(--color-fg);
+  }
+  .pill:active {
+    transform: translateY(1px);
+    box-shadow: var(--shadow-press);
+    transition-duration: var(--dur-press);
+  }
+  .pill:disabled,
+  .pill[aria-disabled="true"] {
+    opacity: 0.45;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: var(--shadow-rim);
+  }
+
+  /* ---- .pill-primary — the AMBER transport key (play / queue / go). ---- */
+  .pill-primary {
+    --pill-fg: var(--color-accent-ink);
+    border-color: transparent;
+    background:
+      linear-gradient(180deg, var(--color-accent-hi), var(--color-accent) 55%, var(--color-ember) 100%);
+    box-shadow:
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.4),
+      0 8px 22px -10px rgba(240, 178, 74, 0.65),
+      0 0 0 1px rgba(240, 178, 74, 0.2);
+    font-weight: 700;
+  }
+  .pill-primary:hover {
+    border-color: transparent;
+    color: var(--color-accent-ink);
+    box-shadow:
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.5),
+      var(--glow-amber),
+      0 10px 26px -10px rgba(240, 178, 74, 0.7);
+  }
+  .pill-primary:active {
+    box-shadow: inset 0 2px 6px -2px rgba(120, 70, 0, 0.7);
+  }
+
+  /* ---- .pill-ghost — quiet, transparent transport key (secondary). ---- */
+  .pill-ghost {
+    background: transparent;
+    border-color: var(--color-line);
+    box-shadow: none;
+    color: var(--color-ink-dim);
+    font-weight: 500;
+  }
+  .pill-ghost:hover {
+    background: var(--color-raised);
+    border-color: var(--color-line);
+    color: var(--color-fg);
+    box-shadow: none;
+  }
+  .pill-ghost:active {
+    background: var(--color-sunken);
+    box-shadow: var(--shadow-press);
+  }
+
+  /* ---- .vu — the now-playing VU-meter / progress motif. ---------------
+   *  Used two ways by consumers:
+   *   • as a slim PROGRESS RAIL — a child <span> whose inline `width`
+   *     sets the fill (see Preparing.tsx), amber-lit with a soft bloom.
+   *   • as an ambient LEVEL METER — add the .vu-bars modifier for the
+   *     animated equalizer bars (child bars).
+   * -------------------------------------------------------------------- */
+  .vu {
+    position: relative;
+    width: 100%;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--color-sunken);
+    box-shadow: var(--shadow-inset);
+    overflow: hidden;
+  }
+  /* The fill: any direct child of a plain .vu rail. */
+  .vu > * {
+    display: block;
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--color-ember), var(--color-accent) 70%, var(--color-accent-hi));
+    box-shadow: 0 0 10px -1px rgba(240, 178, 74, 0.6);
+    transition: width var(--dur-slow) var(--ease-out);
+  }
+
+  /* Animated equalizer variant: five amber level bars breathing. */
+  .vu-bars {
+    display: inline-flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 1.1rem;
+    width: auto;
+    background: transparent;
+    box-shadow: none;
+    overflow: visible;
+  }
+  .vu-bars > * {
+    width: 3px;
+    height: 100%;
+    border-radius: 2px;
+    background: linear-gradient(180deg, var(--color-accent-hi), var(--color-ember));
+    box-shadow: 0 0 8px -2px rgba(240, 178, 74, 0.7);
+    transform-origin: bottom;
+    animation: vu-level 0.9s var(--ease-mech) infinite alternate;
+  }
+  .vu-bars > *:nth-child(1) { animation-delay: 0ms; animation-duration: 0.7s; }
+  .vu-bars > *:nth-child(2) { animation-delay: 120ms; animation-duration: 1.05s; }
+  .vu-bars > *:nth-child(3) { animation-delay: 60ms; animation-duration: 0.85s; }
+  .vu-bars > *:nth-child(4) { animation-delay: 200ms; animation-duration: 1.15s; }
+  .vu-bars > *:nth-child(5) { animation-delay: 90ms; animation-duration: 0.95s; }
+
+  /* ---- .spinner — the "working" ember ring (resolving / queuing). ----- */
+  .spinner {
+    display: inline-block;
+    width: 1rem;
+    height: 1rem;
+    flex: none;
+    border-radius: 50%;
+    border: 2px solid rgba(240, 178, 74, 0.22);
+    border-top-color: var(--color-accent);
+    box-shadow: 0 0 10px -3px rgba(240, 178, 74, 0.6);
+    animation: spin 0.7s linear infinite;
+  }
+
+  /* ---- .hero-glow — soft amber bloom behind the on-air / now-playing
+   *      area. Decorative; place as a positioned layer. ---------------- */
+  .hero-glow {
+    position: absolute;
+    inset: -20% -10% auto -10%;
+    height: 70%;
+    z-index: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(60% 100% at 50% 0%, rgba(240, 178, 74, 0.22), transparent 70%);
+    filter: blur(28px);
+    opacity: 0.9;
+    animation: glow-breathe 6s ease-in-out infinite;
+  }
+
+  /* ---- .reveal — the single orchestrated power-on entrance. Stagger
+   *      children by setting `animation-delay` inline / via utilities. -- */
+  .reveal {
+    animation: power-on var(--dur-slow) var(--ease-out) both;
+  }
+
+  /* ---- .tally — the signature "ON AIR" lamp. GLOWS amber when live,
+   *      banked/idle while waiting-for-seed. Consumers toggle
+   *      [data-live="true"]. ------------------------------------------- */
+  .tally {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.34rem 0.8rem 0.34rem 0.66rem;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--color-line);
+    background: linear-gradient(180deg, var(--color-panel), var(--color-sunken));
+    box-shadow: var(--shadow-inset);
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    font-weight: 600;
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+    color: var(--color-ink-faint);
+    transition: color var(--dur-fast) var(--ease-mech),
+      border-color var(--dur-fast) var(--ease-mech);
+  }
+  /* The bulb. */
+  .tally::before {
+    content: "";
+    width: 0.6rem;
+    height: 0.6rem;
+    border-radius: 50%;
+    flex: none;
+    background: radial-gradient(circle at 35% 30%, #4a3f2c 0%, #2a2318 70%, #1a150e 100%);
+    box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.5);
+    transition: background var(--dur-fast) var(--ease-mech),
+      box-shadow var(--dur-slow) var(--ease-out);
+  }
+  /* Live: bulb ignites amber and the label glows. */
+  .tally[data-live="true"] {
+    color: var(--color-accent-hi);
+    border-color: var(--color-ember-deep);
+  }
+  .tally[data-live="true"]::before {
+    background: radial-gradient(circle at 35% 30%, var(--color-accent-hi) 0%, var(--color-accent) 55%, var(--color-ember-deep) 100%);
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.35),
+      0 0 8px 1px rgba(240, 178, 74, 0.85),
+      0 0 18px 3px rgba(240, 178, 74, 0.5);
+    animation: tally-pulse 2.4s ease-in-out infinite;
+  }
+}
+
+/* ----------------------------------------------------------------------------
+ * Keyframes
+ * -------------------------------------------------------------------------- */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes grain-drift {
+  0% { transform: translate(0, 0); }
+  20% { transform: translate(-4%, 3%); }
+  40% { transform: translate(3%, -2%); }
+  60% { transform: translate(-2%, -3%); }
+  80% { transform: translate(2%, 4%); }
+  100% { transform: translate(0, 0); }
+}
+
+@keyframes power-on {
+  0% {
+    opacity: 0;
+    transform: translateY(10px) scale(0.99);
+    filter: brightness(0.7);
+  }
+  60% {
+    filter: brightness(1.05);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: brightness(1);
+  }
+}
+
+@keyframes vu-level {
+  0% { transform: scaleY(0.28); opacity: 0.7; }
+  100% { transform: scaleY(1); opacity: 1; }
+}
+
+@keyframes glow-breathe {
+  0%, 100% { opacity: 0.75; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.04); }
+}
+
+@keyframes tally-pulse {
+  0%, 100% {
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.35),
+      0 0 8px 1px rgba(240, 178, 74, 0.85),
+      0 0 18px 3px rgba(240, 178, 74, 0.5);
+  }
+  50% {
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.45),
+      0 0 12px 2px rgba(240, 178, 74, 1),
+      0 0 26px 5px rgba(240, 178, 74, 0.65);
+  }
+}
+
+/* ----------------------------------------------------------------------------
+ * Reduced motion — disable grain drift, VU animation, glow breathe, tally
+ * pulse, spinner, and the power-on reveal. Static states remain fully legible.
+ * -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  body::before {
+    animation: none;
+  }
+  .hero-glow,
+  .tally[data-live="true"]::before {
+    animation: none;
+  }
+  .vu-bars > * {
+    animation: none;
+    transform: scaleY(0.7);
+  }
+  .spinner {
+    animation: none;
+    border-top-color: var(--color-accent);
+  }
+  .reveal {
+    animation: none;
+  }
+}

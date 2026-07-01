@@ -1,5 +1,302 @@
-// PLACEHOLDER — replaced (not deleted) in Phase 5 by the real jukebox UI.
-// Exists now only so main.tsx typechecks/builds in Phase 0.
+import { useCallback, useEffect, useState } from "react";
+import type {
+  ControlAction,
+  ControlRequest,
+  SessionInfo,
+  StationSettings,
+  StationSnapshot,
+  StationStateResponse,
+} from "../types.js";
+import { api, ApiError } from "../lib/api.js";
+import { getDeviceId } from "../lib/deviceId.js";
+import { useStationState } from "../lib/useStationState.js";
+import { usePlayerRole } from "../lib/usePlayerRole.js";
+import { LoginGate } from "./LoginGate.js";
+import { PlayerPanel } from "./PlayerPanel.js";
+import { AddBar } from "./AddBar.js";
+import { Controls } from "./Controls.js";
+import { NowPlaying } from "./NowPlaying.js";
+import { Queue } from "./Queue.js";
+import { History } from "./History.js";
+import { Lyrics } from "./Lyrics.js";
+import { Settings } from "./Settings.js";
+import { Grain } from "./Grain.js";
+
+type AuthState = "checking" | "anon" | "authed";
+
+/**
+ * App root — the "On-Air Broadcast Console" shell.
+ *
+ * Responsibilities:
+ *  - Session gate: probe GET /api/state on mount; a 401 renders the LoginGate,
+ *    any success renders the console.
+ *  - deviceId bootstrap: mint the persistent device token BEFORE the WS connects
+ *    (the socket's hello frame carries it).
+ *  - Snapshot source: the WS 'state' broadcast is the live truth, but the very
+ *    first REST /api/state result seeds an immediate snapshot so the console (and
+ *    the cold-start banner) render before the first WS frame arrives. The per-viewer
+ *    `isThisDeviceSpeaker` flag also lives only on the REST response.
+ *  - Cold-start banner: shown exactly when seed === null && current === null (never
+ *    while auth === "checking"), otherwise the live station.
+ *  - Optimistic pause + server-confirmation guard: a just-issued pause is reflected
+ *    immediately and held until the server's snapshot confirms the op's target paused
+ *    value (or a safety timeout), so a stale WS snapshot that predates the op — still
+ *    carrying the old paused value — can't revert it.
+ *  - Auto-speaker: `wantsSpeaker` is initialized true when the server marks this
+ *    device the remembered/auto-selected speaker (isThisDeviceSpeaker), so the Player
+ *    role auto-engages over the WS via usePlayerRole.
+ */
 export function App() {
-  return null;
+  const [auth, setAuth] = useState<AuthState>("checking");
+  const [, setSession] = useState<SessionInfo | null>(null);
+  // The immediate REST snapshot (a per-viewer StationStateResponse). Used until — and
+  // as a fallback alongside — the WS broadcast; carries isThisDeviceSpeaker.
+  const [restSnap, setRestSnap] = useState<StationStateResponse | null>(null);
+  // Local speaker intent. Initialized from isThisDeviceSpeaker so the remembered
+  // speaker auto-engages; toggled by the manual "Play on this device" / relinquish.
+  const [wantsSpeaker, setWantsSpeaker] = useState(false);
+
+  // Optimistic-pause guard. Each pause/play op stamps the op's target paused state and the
+  // wall-clock; a WS snapshot only overrides the optimistic value once the server confirms
+  // the op's target (or a safety timeout elapses) — see effectivePaused.
+  const [optimistic, setOptimistic] = useState<{
+    paused: boolean;
+    at: number;
+  } | null>(null);
+
+  const ws = useStationState();
+
+  // Bootstrap: ensure a deviceId exists, then probe the session.
+  useEffect(() => {
+    getDeviceId();
+    let alive = true;
+    api
+      .state()
+      .then((s) => {
+        if (!alive) return;
+        setRestSnap(s);
+        setWantsSpeaker(s.isThisDeviceSpeaker);
+        setAuth("authed");
+      })
+      .catch((e) => {
+        if (!alive) return;
+        setAuth(e instanceof ApiError && e.status === 401 ? "anon" : "authed");
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // Claiming the Player needs the per-socket audio sink, so it happens over the WS
+  // (usePlayerRole sends becomePlayer/relinquishPlayer as `isSpeaker` flips), NOT REST.
+  const { audioRef, error: playerError } = usePlayerRole(ws.socket, wantsSpeaker);
+
+  // A transient error banner fed by wsState.lastError (trackError frames). Keyed on the
+  // monotonic seq so a repeat of the same title still re-surfaces, and auto-dismisses.
+  const [errorBanner, setErrorBanner] = useState<{ title: string; reason: string } | null>(null);
+  useEffect(() => {
+    if (!ws.lastError) return;
+    setErrorBanner({ title: ws.lastError.title, reason: ws.lastError.reason });
+    const t = setTimeout(() => setErrorBanner(null), 6000);
+    return () => clearTimeout(t);
+    // Fire only on a NEW error (monotonic seq), not on lastError object identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ws.lastError?.seq]);
+
+  // Wrap POST /api/control so a pause/play stamps the optimistic paused state.
+  const control = useCallback((action: ControlAction, value?: ControlRequest["value"]) => {
+    if (action === "pause" || action === "play") {
+      setOptimistic({ paused: action === "pause", at: Date.now() });
+    }
+    return api.control(action, value).catch(() => {
+      /* the WS snapshot remains the source of truth on failure */
+    });
+  }, []);
+
+  const becomeSpeaker = useCallback(() => setWantsSpeaker(true), []);
+  const relinquish = useCallback(() => {
+    // Stop announcing the role over the WS, and best-effort clear the persisted
+    // designation via REST (api.speaker("claim") is never sent — the backend 400s it).
+    setWantsSpeaker(false);
+    void api.speaker("release").catch(() => {});
+  }, []);
+
+  if (auth === "checking") {
+    return (
+      <main className="min-h-full grid place-items-center">
+        <span className="spinner" aria-label="Loading" />
+      </main>
+    );
+  }
+  if (auth === "anon") {
+    return (
+      <LoginGate
+        onAuthed={(s) => {
+          setSession(s);
+          setAuth("authed");
+          void api.state().then((st) => {
+            setRestSnap(st);
+            setWantsSpeaker(st.isThisDeviceSpeaker);
+          });
+        }}
+      />
+    );
+  }
+
+  // The WS broadcast is the live truth; fall back to the immediate REST snapshot
+  // (which is a superset) until the first WS frame lands.
+  const snap: StationSnapshot | null = ws.snapshot ?? restSnap;
+  const receivedAt = ws.snapshot ? ws.receivedAt : 0;
+
+  // Cold-start: exactly seed === null && current === null (never while checking auth).
+  const coldStart = snap !== null && snap.seed === null && snap.current === null;
+
+  // Effective paused = optimistic value until the server CONFIRMS the op, then the server
+  // wins. Because a StationSnapshot carries no sequence/generation field, wall-clock arrival
+  // (ws.receivedAt) cannot distinguish a snapshot generated BEFORE the op (still the old
+  // paused value, but arriving late) from one generated AFTER it — using arrival time alone
+  // lets a stale pre-op broadcast that was in flight when the user clicked revert the
+  // optimistic pause. Instead we hold the optimistic value until the server's paused matches
+  // the op's target (confirmation) or a safety timeout elapses; a snapshot still showing the
+  // pre-op value is treated as stale and does NOT override.
+  const serverPaused = snap?.paused ?? false;
+  let effectivePaused = serverPaused;
+  if (optimistic) {
+    const serverConfirmedOp = serverPaused === optimistic.paused;
+    const timedOut = Date.now() - optimistic.at > 4000;
+    effectivePaused = serverConfirmedOp || timedOut ? serverPaused : optimistic.paused;
+  }
+
+  const currentVideoId = snap?.current?.meta.videoId ?? null;
+
+  return (
+    <main className="min-h-full px-4 py-6 sm:px-8 max-w-5xl mx-auto">
+      <Grain />
+      <header
+        className="reveal flex items-center justify-between mb-6"
+        style={{ animationDelay: "0ms" }}
+      >
+        <p className="eyebrow" style={{ color: "var(--color-ember-soft)" }}>
+          LAN Jukebox
+        </p>
+        <span className="font-mono text-xs" style={{ color: "var(--color-ink-faint)" }}>
+          {snap?.activePlayerPresent
+            ? `● ${snap.activePlayerLabel ?? "speaker"} live`
+            : "○ no speaker"}
+        </span>
+      </header>
+
+      {playerError && (
+        <p
+          role="alert"
+          className="card p-3 mb-4 text-sm font-mono"
+          style={{ color: "var(--color-ember-soft)" }}
+        >
+          Playback: {playerError}
+        </p>
+      )}
+      {errorBanner && (
+        <p
+          role="status"
+          className="card p-3 mb-4 text-sm font-mono"
+          style={{ color: "var(--color-ember-soft)" }}
+        >
+          Skipped &ldquo;{errorBanner.title}&rdquo; — {errorBanner.reason}
+        </p>
+      )}
+
+      {coldStart ? (
+        <section
+          className="card hero-glow reveal p-10 text-center"
+          style={{ animationDelay: "80ms" }}
+        >
+          <p className="eyebrow">Station idle</p>
+          <h1 className="font-display text-3xl mt-3" style={{ color: "var(--color-ink)" }}>
+            Queue a song to start the station.
+          </h1>
+        </section>
+      ) : (
+        <div className="reveal" style={{ animationDelay: "80ms" }}>
+          <NowPlaying
+            item={snap?.current ?? null}
+            paused={effectivePaused}
+            receivedAt={receivedAt}
+            canSeek={wantsSpeaker}
+            onSeek={(positionMs) => void control("seek", positionMs)}
+          />
+        </div>
+      )}
+
+      <div className="mt-6 grid gap-6">
+        <div className="reveal" style={{ animationDelay: "140ms" }}>
+          <PlayerPanel isSpeaker={wantsSpeaker} onRelinquish={relinquish} audioRef={audioRef} />
+          {!wantsSpeaker && (
+            <button
+              className="pill pill-primary mt-4"
+              onClick={becomeSpeaker}
+              aria-label="Play on this device"
+            >
+              Play on this device
+            </button>
+          )}
+        </div>
+
+        <div className="reveal" style={{ animationDelay: "200ms" }}>
+          <AddBar
+            onPlay={async (input) => {
+              const r = await api.add(input);
+              return { candidates: r.candidates ?? null };
+            }}
+            onQueueAll={async (ids) => {
+              for (const id of ids) await api.pick(id);
+              return ids.length > 0;
+            }}
+          />
+        </div>
+
+        <div className="reveal card p-5 sm:p-6" style={{ animationDelay: "240ms" }}>
+          <Controls
+            onAction={(a) => void control(a === "resume" ? "play" : a)}
+            paused={effectivePaused}
+          />
+        </div>
+
+        <div className="reveal" style={{ animationDelay: "280ms" }}>
+          <Queue
+            items={snap?.upcoming ?? []}
+            current={snap?.current ?? null}
+            upcomingRadio={snap?.upcomingRadio ?? []}
+            onRemove={(id) => void control("remove", { itemId: id })}
+            onReorder={(id, toIndex) => void control("reorder", { itemId: id, toIndex })}
+            onPlayNext={(id) => void control("reorder", { itemId: id, toIndex: 0 })}
+            onJump={(id) => void control("jump", { itemId: id })}
+            onShuffle={() => void control("shuffle")}
+            onClear={() => void control("clear")}
+            autoplay={snap?.autoplay ?? true}
+            autoplaySource={snap?.autoplaySource ?? "radio"}
+            onToggleAutoplay={(on) => void control("settings", { autoplay: on })}
+          />
+        </div>
+
+        <div className="reveal" style={{ animationDelay: "320ms" }}>
+          <History history={snap?.history ?? []} onRequeue={(videoId) => void api.add(videoId)} />
+        </div>
+
+        {currentVideoId && (
+          <div className="reveal" style={{ animationDelay: "360ms" }}>
+            <Lyrics key={currentVideoId} trackId={currentVideoId} />
+          </div>
+        )}
+
+        <div className="reveal card p-5 sm:p-6" style={{ animationDelay: "400ms" }}>
+          <Settings
+            repeat={snap?.repeat ?? "off"}
+            volume={snap?.volume ?? 100}
+            maxTrackDurationSec={snap?.maxTrackDurationSec ?? 0}
+            onChange={(patch: Partial<StationSettings>) => void control("settings", patch)}
+          />
+        </div>
+      </div>
+    </main>
+  );
 }
