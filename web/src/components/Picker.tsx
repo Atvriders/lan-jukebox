@@ -129,24 +129,24 @@ export function Picker({
                   "background var(--dur-fast) var(--ease-mech), box-shadow var(--dur-fast) var(--ease-mech), border-color var(--dur-fast) var(--ease-mech), transform var(--dur-press) var(--ease-mech)",
                 transform: isSelected ? "translateY(1px)" : "none",
                 background: isSelected
-                  ? "linear-gradient(180deg, rgba(240,178,74,0.10), rgba(240,178,74,0.04))"
-                  : "linear-gradient(180deg, rgba(246,239,231,0.025), transparent 70%), var(--color-sunken)",
-                borderColor: isSelected ? "rgba(240,178,74,0.55)" : "var(--color-line)",
+                  ? "linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0.04))"
+                  : "linear-gradient(180deg, rgba(255,255,255,0.025), transparent 70%), var(--color-sunken)",
+                borderColor: isSelected ? "rgba(255,255,255,0.55)" : "var(--color-line)",
                 boxShadow: isSelected
-                  ? "inset 0 2px 5px -1px rgba(0,0,0,0.7), inset 0 0 0 1px var(--color-accent, rgba(240,178,74,0.6)), 0 0 18px -6px rgba(240,178,74,0.6)"
+                  ? "inset 0 2px 5px -1px rgba(0,0,0,0.7), inset 0 0 0 1px var(--color-accent, rgba(255,255,255,0.6)), 0 0 18px -6px rgba(255,255,255,0.6)"
                   : "var(--shadow-rim)",
               }}
               onMouseEnter={(e) => {
                 if (!isSelected) {
                   e.currentTarget.style.background =
-                    "linear-gradient(180deg, rgba(246,239,231,0.05), transparent 70%), var(--color-sunken)";
-                  e.currentTarget.style.borderColor = "rgba(246,239,231,0.2)";
+                    "linear-gradient(180deg, rgba(255,255,255,0.05), transparent 70%), var(--color-sunken)";
+                  e.currentTarget.style.borderColor = "rgba(255,255,255,0.2)";
                 }
               }}
               onMouseLeave={(e) => {
                 if (!isSelected) {
                   e.currentTarget.style.background =
-                    "linear-gradient(180deg, rgba(246,239,231,0.025), transparent 70%), var(--color-sunken)";
+                    "linear-gradient(180deg, rgba(255,255,255,0.025), transparent 70%), var(--color-sunken)";
                   e.currentTarget.style.borderColor = "var(--color-line)";
                 }
               }}

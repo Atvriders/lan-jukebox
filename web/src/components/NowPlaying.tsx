@@ -167,7 +167,7 @@ export function NowPlaying({
                 borderRadius: "var(--radius-md)",
                 boxShadow: "0 10px 28px -12px rgba(0,0,0,0.7)",
                 background:
-                  "radial-gradient(120% 90% at 50% 0%, rgba(240,178,74,0.10), transparent 60%)," +
+                  "radial-gradient(120% 90% at 50% 0%, rgba(255,255,255,0.10), transparent 60%)," +
                   "linear-gradient(180deg, var(--color-raised) 0%, var(--color-sunken) 100%)",
                 color: "var(--color-ink-faint)",
               }}
@@ -196,7 +196,7 @@ export function NowPlaying({
             style={{
               borderRadius: "var(--radius-md)",
               boxShadow:
-                "inset 0 0 0 1px var(--color-line), inset 0 0 22px -10px rgba(240,178,74,0.35)",
+                "inset 0 0 0 1px var(--color-line), inset 0 0 22px -10px rgba(255,255,255,0.35)",
             }}
           />
         </div>
@@ -501,8 +501,8 @@ function ProgressBar({ durationMs, displayedMs, receivedAt, canSeek, onSeek }: P
               background:
                 "radial-gradient(circle at 35% 30%, var(--color-accent-hi) 0%, var(--color-accent) 55%, var(--color-ember-deep) 100%)",
               boxShadow: seeking
-                ? "0 1px 3px 0 rgba(0,0,0,0.6), 0 0 16px 0 rgba(240,178,74,0.9)"
-                : "0 1px 3px 0 rgba(0,0,0,0.6), 0 0 12px -2px rgba(240,178,74,0.8)",
+                ? "0 1px 3px 0 rgba(0,0,0,0.6), 0 0 16px 0 rgba(255,255,255,0.9)"
+                : "0 1px 3px 0 rgba(0,0,0,0.6), 0 0 12px -2px rgba(255,255,255,0.8)",
               pointerEvents: "none",
             }}
           />

@@ -31,7 +31,8 @@ export function Grain() {
           position: "absolute",
           inset: "-30% -10% auto -10%",
           height: "55%",
-          background: "radial-gradient(60% 100% at 50% 0%, rgba(240,178,74,0.10), transparent 70%)",
+          background:
+            "radial-gradient(60% 100% at 50% 0%, rgba(255,255,255,0.10), transparent 70%)",
           filter: "blur(8px)",
         }}
       />

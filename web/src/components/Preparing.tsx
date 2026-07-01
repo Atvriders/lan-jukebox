@@ -57,7 +57,7 @@ export function Preparing({ preparing }: { preparing: PreparingState | null }) {
               style={{
                 color: "var(--color-ember-soft)",
                 letterSpacing: "0.02em",
-                textShadow: "0 0 10px rgba(240,178,74,0.45)",
+                textShadow: "0 0 10px rgba(255,255,255,0.45)",
               }}
             >
               {Math.round(pct)}%

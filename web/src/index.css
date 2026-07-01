@@ -1,9 +1,9 @@
 /* ============================================================================
- * lan-jukebox — design system  ·  "On-Air Broadcast Console"
+ * lan-jukebox — design system  ·  monochrome dark ("Broadcast Console")
  * ----------------------------------------------------------------------------
- * A warm-dark broadcast deck: deep warm ink base, machined charcoal panels,
- * ONE amber on-air tally (~#F0B24A) as the sole accent, a VU-meter now-playing
- * motif, film grain + amber hero-glow atmosphere, and a single orchestrated
+ * A black-and-white dark deck: neutral near-black base, machined charcoal
+ * panels, a WHITE on-air tally as the sole accent, a VU-meter now-playing
+ * motif, film grain + white hero-glow atmosphere, and a single orchestrated
  * power-on reveal. CSS-only (Tailwind v4 @theme). Respects prefers-reduced-motion.
  *
  * FROZEN after Task 5.1. Later tasks only CONSUME these tokens/classes:
@@ -26,34 +26,34 @@
   --font-sans: "Archivo", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
 
-  /* --- Base surfaces: deep warm brown-black climbing to lifted charcoal --- */
-  --color-void: #0b0a08; /* the room behind the deck */
-  --color-ink: #12100e; /* page base — deep warm ink */
-  --color-sunken: #171410; /* recessed wells (rails, inputs, thumbs) */
-  --color-panel: #1d1a15; /* base panel plate */
-  --color-raised: #262119; /* lifted control faces / hover plates */
+  /* --- Base surfaces: neutral near-black climbing to lifted charcoal (B&W dark) --- */
+  --color-void: #080808; /* the room behind the deck */
+  --color-ink: #101010; /* page base — near-black */
+  --color-sunken: #161616; /* recessed wells (rails, inputs, thumbs) */
+  --color-panel: #1c1c1c; /* base panel plate */
+  --color-raised: #272727; /* lifted control faces / hover plates */
 
-  /* --- Text: warm bone → warm slate → faint --- */
-  --color-fg: #f3ede1; /* primary bone-white text */
-  --color-ink-dim: #b6ab97; /* secondary warm-slate */
-  --color-ink-faint: #7d7362; /* tertiary / disabled / captions */
+  /* --- Text: near-white → mid grey → faint --- */
+  --color-fg: #f5f5f5; /* primary near-white text */
+  --color-ink-dim: #a8a8a8; /* secondary grey */
+  --color-ink-faint: #6f6f6f; /* tertiary / disabled / captions */
 
   /* --- Hairlines / machined edges --- */
-  --color-line: #332c22; /* fine panel borders */
-  --color-line-soft: #241f18; /* whisper divider */
+  --color-line: #333333; /* fine panel borders */
+  --color-line-soft: #202020; /* whisper divider */
 
-  /* --- THE ACCENT: one warm amber on-air tally, used sharply --- */
-  --color-accent: #f0b24a; /* live / primary transport / focus ring */
-  --color-accent-hi: #ffcf7a; /* highlit amber (glints, top-lit rims) */
-  --color-ember-soft: #f0b24a; /* alias — hot amber (active operations) */
-  --color-ember: #e39a2f; /* mid amber */
-  --color-ember-deep: #9a641b; /* banked ember (shadow side of the lamp) */
-  --color-accent-ink: #1a1206; /* text ON amber (dark, for contrast) */
+  /* --- THE ACCENT: monochrome white, used sharply (live tally / primary / focus) --- */
+  --color-accent: #f2f2f2; /* live / primary transport / focus ring (white) */
+  --color-accent-hi: #ffffff; /* pure-white highlight (glints, top-lit rims) */
+  --color-ember-soft: #dcdcdc; /* soft light-grey (active operations / eyebrow accent) */
+  --color-ember: #9a9a9a; /* mid grey */
+  --color-ember-deep: #4a4a4a; /* banked grey (shadow side of the lamp) */
+  --color-accent-ink: #0a0a0a; /* text ON the white accent (near-black, for contrast) */
 
-  /* Muted signal colors (used sparingly; still warm) */
-  --color-good: #8fbf6f; /* affirmative / connected */
-  --color-warn: #e6a94e; /* caution */
-  --color-bad: #d98a6a; /* warm terracotta error (NOT YouTube red) */
+  /* Signal colors — grayscale, distinguished by lightness (used sparingly) */
+  --color-good: #b5b5b5; /* affirmative / connected */
+  --color-warn: #dcdcdc; /* caution */
+  --color-bad: #ffffff; /* errors: brightest white */
 
   /* --- Radii --- */
   --radius-sm: 0.5rem;
@@ -69,7 +69,7 @@
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
 
   /* --- Depth / rim lighting (machined-panel feel) --- */
-  --shadow-rim: 0 1px 0 0 rgba(255, 236, 200, 0.04) inset,
+  --shadow-rim: 0 1px 0 0 rgba(255,255,255, 0.04) inset,
     0 0 0 1px rgba(0, 0, 0, 0.35), 0 18px 40px -24px rgba(0, 0, 0, 0.85);
   --shadow-inset: inset 0 2px 6px -2px rgba(0, 0, 0, 0.8),
     inset 0 0 0 1px rgba(0, 0, 0, 0.4);
@@ -77,8 +77,8 @@
 
   /* --- The amber on-air glow (token kept named --glow-red for the frozen
    *     components that reference it; defined as AMBER so no red ever shows). */
-  --glow-red: 0 0 0 1px rgba(240, 178, 74, 0.35), 0 0 16px -2px rgba(240, 178, 74, 0.55),
-    0 0 34px -6px rgba(240, 178, 74, 0.4);
+  --glow-red: 0 0 0 1px rgba(255,255,255, 0.35), 0 0 16px -2px rgba(255,255,255, 0.55),
+    0 0 34px -6px rgba(255,255,255, 0.4);
   --glow-amber: var(--glow-red);
 }
 
@@ -112,7 +112,7 @@
     /* Layered warm atmosphere: a soft amber wash top-center + banked corners,
        riding on the deep warm ink. */
     background-image:
-      radial-gradient(120% 90% at 50% -10%, rgba(240, 178, 74, 0.07), transparent 55%),
+      radial-gradient(120% 90% at 50% -10%, rgba(255,255,255, 0.07), transparent 55%),
       radial-gradient(90% 70% at 50% 120%, rgba(0, 0, 0, 0.55), transparent 60%),
       linear-gradient(180deg, var(--color-void) 0%, var(--color-ink) 22%, var(--color-ink) 100%);
     background-attachment: fixed;
@@ -164,7 +164,7 @@
   }
 
   ::selection {
-    background: rgba(240, 178, 74, 0.28);
+    background: rgba(255,255,255, 0.28);
     color: var(--color-fg);
   }
 
@@ -241,7 +241,7 @@
   .card {
     position: relative;
     background:
-      linear-gradient(180deg, rgba(255, 236, 200, 0.02), transparent 40%),
+      linear-gradient(180deg, rgba(255,255,255, 0.02), transparent 40%),
       var(--color-panel);
     border: 1px solid var(--color-line);
     border-radius: var(--radius-lg);
@@ -255,7 +255,7 @@
     inset: 0;
     border-radius: inherit;
     pointer-events: none;
-    box-shadow: inset 0 1px 0 0 rgba(255, 236, 200, 0.05);
+    box-shadow: inset 0 1px 0 0 rgba(255,255,255, 0.05);
   }
 
   /* ---- .eyebrow — mono, tracked, uppercase micro-labels (section tags,
@@ -324,8 +324,8 @@
       linear-gradient(180deg, var(--color-accent-hi), var(--color-accent) 55%, var(--color-ember) 100%);
     box-shadow:
       inset 0 1px 0 0 rgba(255, 255, 255, 0.4),
-      0 8px 22px -10px rgba(240, 178, 74, 0.65),
-      0 0 0 1px rgba(240, 178, 74, 0.2);
+      0 8px 22px -10px rgba(255,255,255, 0.65),
+      0 0 0 1px rgba(255,255,255, 0.2);
     font-weight: 700;
   }
   .pill-primary:hover {
@@ -334,7 +334,7 @@
     box-shadow:
       inset 0 1px 0 0 rgba(255, 255, 255, 0.5),
       var(--glow-amber),
-      0 10px 26px -10px rgba(240, 178, 74, 0.7);
+      0 10px 26px -10px rgba(255,255,255, 0.7);
   }
   .pill-primary:active {
     box-shadow: inset 0 2px 6px -2px rgba(120, 70, 0, 0.7);
@@ -381,7 +381,7 @@
     height: 100%;
     border-radius: 999px;
     background: linear-gradient(90deg, var(--color-ember), var(--color-accent) 70%, var(--color-accent-hi));
-    box-shadow: 0 0 10px -1px rgba(240, 178, 74, 0.6);
+    box-shadow: 0 0 10px -1px rgba(255,255,255, 0.6);
     transition: width var(--dur-slow) var(--ease-out);
   }
 
@@ -401,7 +401,7 @@
     height: 100%;
     border-radius: 2px;
     background: linear-gradient(180deg, var(--color-accent-hi), var(--color-ember));
-    box-shadow: 0 0 8px -2px rgba(240, 178, 74, 0.7);
+    box-shadow: 0 0 8px -2px rgba(255,255,255, 0.7);
     transform-origin: bottom;
     animation: vu-level 0.9s var(--ease-mech) infinite alternate;
   }
@@ -418,9 +418,9 @@
     height: 1rem;
     flex: none;
     border-radius: 50%;
-    border: 2px solid rgba(240, 178, 74, 0.22);
+    border: 2px solid rgba(255,255,255, 0.22);
     border-top-color: var(--color-accent);
-    box-shadow: 0 0 10px -3px rgba(240, 178, 74, 0.6);
+    box-shadow: 0 0 10px -3px rgba(255,255,255, 0.6);
     animation: spin 0.7s linear infinite;
   }
 
@@ -433,7 +433,7 @@
     z-index: 0;
     pointer-events: none;
     background:
-      radial-gradient(60% 100% at 50% 0%, rgba(240, 178, 74, 0.22), transparent 70%);
+      radial-gradient(60% 100% at 50% 0%, rgba(255,255,255, 0.22), transparent 70%);
     filter: blur(28px);
     opacity: 0.9;
     animation: glow-breathe 6s ease-in-out infinite;
@@ -487,8 +487,8 @@
     background: radial-gradient(circle at 35% 30%, var(--color-accent-hi) 0%, var(--color-accent) 55%, var(--color-ember-deep) 100%);
     box-shadow:
       inset 0 0 0 1px rgba(255, 255, 255, 0.35),
-      0 0 8px 1px rgba(240, 178, 74, 0.85),
-      0 0 18px 3px rgba(240, 178, 74, 0.5);
+      0 0 8px 1px rgba(255,255,255, 0.85),
+      0 0 18px 3px rgba(255,255,255, 0.5);
     animation: tally-pulse 2.4s ease-in-out infinite;
   }
 }
@@ -541,14 +541,14 @@
   0%, 100% {
     box-shadow:
       inset 0 0 0 1px rgba(255, 255, 255, 0.35),
-      0 0 8px 1px rgba(240, 178, 74, 0.85),
-      0 0 18px 3px rgba(240, 178, 74, 0.5);
+      0 0 8px 1px rgba(255,255,255, 0.85),
+      0 0 18px 3px rgba(255,255,255, 0.5);
   }
   50% {
     box-shadow:
       inset 0 0 0 1px rgba(255, 255, 255, 0.45),
-      0 0 12px 2px rgba(240, 178, 74, 1),
-      0 0 26px 5px rgba(240, 178, 74, 0.65);
+      0 0 12px 2px rgba(255,255,255, 1),
+      0 0 26px 5px rgba(255,255,255, 0.65);
   }
 }
 

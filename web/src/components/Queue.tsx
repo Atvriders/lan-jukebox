@@ -227,7 +227,7 @@ export function Queue({
                   "background var(--dur-fast) var(--ease-mech), box-shadow var(--dur-fast) var(--ease-mech)",
               }}
               onMouseEnter={(e) => {
-                e.currentTarget.style.background = "rgba(255,236,200,0.025)";
+                e.currentTarget.style.background = "rgba(255,255,255,0.025)";
                 e.currentTarget.style.boxShadow = "inset 2px 0 0 0 var(--color-accent)";
               }}
               onMouseLeave={(e) => {

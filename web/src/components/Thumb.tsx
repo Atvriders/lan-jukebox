@@ -43,7 +43,7 @@ export function Thumb({ url, size = 44 }: { url: string | null | undefined; size
         // Recessed well: warm near-black floor with a faint red-signal sheen
         // leaking from the top edge — the empty slot still reads as "powered".
         background:
-          "radial-gradient(120% 90% at 50% 0%, rgba(240,178,74,0.10), transparent 60%)," +
+          "radial-gradient(120% 90% at 50% 0%, rgba(255,255,255,0.10), transparent 60%)," +
           "linear-gradient(180deg, var(--color-raised) 0%, var(--color-sunken) 100%)",
         color: "var(--color-ink-faint)",
       }}
