@@ -102,6 +102,27 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws.lastError?.seq]);
 
+  // Action errors (add / pick / re-queue REST failures) surfaced as a transient banner.
+  // Without this a bad link, a rejected/too-long input, a failed search, or an unavailable
+  // pick is a SILENT no-op (input just clears) + an uncaught promise rejection.
+  const [actionError, setActionError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!actionError) return;
+    const t = setTimeout(() => setActionError(null), 6000);
+    return () => clearTimeout(t);
+  }, [actionError]);
+  const noteError = useCallback((e: unknown, fallback: string) => {
+    const msg =
+      e instanceof ApiError
+        ? e.status === 401
+          ? "Session expired — reload and log in again."
+          : e.message || fallback
+        : e instanceof Error && e.message
+          ? e.message
+          : fallback;
+    setActionError(msg);
+  }, []);
+
   // Wrap POST /api/control so a pause/play stamps the optimistic paused state.
   const control = useCallback((action: ControlAction, value?: ControlRequest["value"]) => {
     if (action === "pause" || action === "play") {
@@ -122,7 +143,7 @@ export function App() {
 
   if (auth === "checking") {
     return (
-      <main className="min-h-full grid place-items-center">
+      <main className="min-h-dvh grid place-items-center">
         <span className="spinner" aria-label="Loading" />
       </main>
     );
@@ -235,6 +256,15 @@ export function App() {
           Skipped &ldquo;{errorBanner.title}&rdquo; — {errorBanner.reason}
         </p>
       )}
+      {actionError && (
+        <p
+          role="alert"
+          className="card p-3 mb-4 text-sm font-mono"
+          style={{ color: "var(--color-ember-soft)" }}
+        >
+          {actionError}
+        </p>
+      )}
 
       {coldStart ? (
         <section
@@ -282,12 +312,31 @@ export function App() {
         <div className="reveal" style={{ animationDelay: "200ms" }}>
           <AddBar
             onPlay={async (input) => {
-              const r = await api.add(input);
-              return { candidates: r.candidates ?? null };
+              try {
+                const r = await api.add(input);
+                return { candidates: r.candidates ?? null };
+              } catch (e) {
+                noteError(e, "Couldn't add that — check the link or try a different search.");
+                return { candidates: null };
+              }
             }}
             onQueueAll={async (ids) => {
-              for (const id of ids) await api.pick(id);
-              return ids.length > 0;
+              let queued = 0;
+              try {
+                for (const id of ids) {
+                  await api.pick(id);
+                  queued += 1;
+                }
+              } catch (e) {
+                noteError(
+                  e,
+                  queued > 0
+                    ? `Queued ${queued} of ${ids.length} — the rest failed.`
+                    : "Couldn't queue that.",
+                );
+                return false;
+              }
+              return queued > 0;
             }}
           />
         </div>
@@ -321,7 +370,12 @@ export function App() {
           {/* Re-queue hits /api/pick (validates the bare 11-char VIDEO_ID and enqueues
               directly). /api/add would classify a bare id as a text SEARCH and enqueue
               nothing, so re-queue must NOT route through api.add. */}
-          <History history={snap?.history ?? []} onRequeue={(videoId) => void api.pick(videoId)} />
+          <History
+            history={snap?.history ?? []}
+            onRequeue={(videoId) =>
+              void api.pick(videoId).catch((e) => noteError(e, "Couldn't re-queue that."))
+            }
+          />
         </div>
 
         {currentVideoId && (

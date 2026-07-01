@@ -92,6 +92,12 @@ services:
     # join a shared external network and reach the app at http://jukebox:3018.
     ports: ["${HOST_PORT:-3018}:3018"]
     volumes: ["cache:/data/cache"]
+    # Memory ceiling so a burst of parallel yt-dlp/ffmpeg jobs (PREFETCH_DEPTH x
+    # MAX_TRANSCODE_JOBS) can't OOM-kill the host on a small VPS. 1g is ample for
+    # audio-only extraction/transcode; if you still get OOM-killed mid-song (the
+    # container restarts and resumes), lower PREFETCH_DEPTH / MAX_TRANSCODE_JOBS
+    # above and/or raise this limit.
+    mem_limit: 1g
     restart: unless-stopped
     healthcheck:
       test:

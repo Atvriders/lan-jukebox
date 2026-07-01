@@ -45,6 +45,13 @@ describe("docker-compose.yml", () => {
     expect(yml).toMatch(/\/healthz/);
   });
 
+  it("sets a mem_limit so parallel yt-dlp/ffmpeg jobs can't OOM-kill the host", () => {
+    // Regression guard: the discord-yt-music-bot was OOM-killed mid-song on a small VPS
+    // with no memory ceiling; the LAN Jukebox compose must ship one (it runs a MORE
+    // aggressive PREFETCH_DEPTH x MAX_TRANSCODE_JOBS by default).
+    expect(yml).toMatch(/mem_limit:\s*\S+/);
+  });
+
   it("uses the zero-PO-token client ladder by default", () => {
     expect(yml).toMatch(/YT_PLAYER_CLIENTS:\s*"android_vr,web_embedded,tv"/);
   });

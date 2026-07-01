@@ -105,6 +105,16 @@ wire it up:
   fresh image onto a running deployment:
   `docker compose pull && docker compose up -d --force-recreate`.
 
+## Resource limits (avoiding OOM-kills)
+
+The station fans out `yt-dlp` + `ffmpeg` jobs driven by `PREFETCH_DEPTH` (radio
+queue-ahead) and `MAX_TRANSCODE_JOBS` (parallel download/transcode). On a small,
+always-on host that burst can be OOM-killed mid-song (the container restarts and
+resumes, but the music cuts out). `docker-compose.yml` ships a `mem_limit: 1g`
+ceiling for this reason — ample for audio-only work. If you still get OOM-killed
+(`docker inspect <c> --format '{{.State.OOMKilled}}'`), **lower `PREFETCH_DEPTH`
+and/or `MAX_TRANSCODE_JOBS`** and/or raise `mem_limit`.
+
 ## Speaker PC: one-time autoplay grant + device memory
 
 Browsers block audio autoplay until the site is granted permission or the user

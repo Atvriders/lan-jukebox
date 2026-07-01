@@ -7,8 +7,9 @@ import { Thumb } from "./Thumb.js";
 // each candidate row is toggle-selectable (highlight + checkmark, aria-pressed),
 // and a primary "Queue selected (N)" button queues ALL selected candidates IN
 // candidate display order via onQueueSelected, then clears the selection and
-// calls onQueued (so the parent can close/reset the picker). Errors are surfaced
-// by the parent's queue flow (the same status banner as a single pick).
+// calls onQueued (so the parent can close/reset the picker). If onQueueSelected
+// returns false (the parent hit an error queuing — App surfaces it via the
+// action-error banner), the selection is KEPT so the user can retry.
 export function Picker({
   candidates,
   onQueueSelected,

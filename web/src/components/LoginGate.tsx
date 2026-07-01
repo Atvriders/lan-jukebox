@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { SessionInfo } from "../types.js";
-import { api } from "../lib/api.js";
+import { api, ApiError } from "../lib/api.js";
 import { getDeviceId, getDisplayName, setDisplayName } from "../lib/deviceId.js";
 
 export function LoginGate({ onAuthed }: { onAuthed: (s: SessionInfo) => void }) {
@@ -23,14 +23,23 @@ export function LoginGate({ onAuthed }: { onAuthed: (s: SessionInfo) => void }) 
       });
       onAuthed(session);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Login failed");
+      // Friendly messages for the common cases; fall back to the raw message otherwise.
+      const msg =
+        err instanceof ApiError && err.status === 401
+          ? "Wrong password — try again."
+          : err instanceof ApiError && err.status === 0
+            ? "Can't reach the station. Check your connection and try again."
+            : err instanceof Error && err.message
+              ? err.message
+              : "Login failed. Please try again.";
+      setError(msg);
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <main className="min-h-full grid place-items-center px-6 py-12">
+    <main className="min-h-dvh grid place-items-center px-6 py-12">
       <form onSubmit={submit} className="card reveal relative overflow-hidden max-w-md w-full p-10">
         <div className="hero-glow" aria-hidden="true" />
         <div className="relative z-10">
