@@ -44,13 +44,23 @@ export function applyWsMessage(prev: WsState, raw: string): WsState {
   return prev;
 }
 
-type WsAction = { raw: string } | { reset: true } | { closed: true } | { connecting: true };
+type WsAction =
+  { raw: string } | { reset: true } | { closed: true } | { connecting: true } | { forbidden: true };
 
 function reduce(s: WsState, a: WsAction): WsState {
   if ("reset" in a) return initialWsState;
+  if ("forbidden" in a) return { ...s, status: "forbidden" };
   if ("connecting" in a) return s.status === "forbidden" ? s : { ...s, status: "connecting" };
   if ("closed" in a) return { ...s, status: s.status === "forbidden" ? s.status : "closed" };
   return applyWsMessage(s, a.raw);
+}
+
+// WebSocket close codes that mean "don't retry — the connection was rejected on
+// auth/policy grounds and reconnecting will just fail the same way." The server closes an
+// unauthenticated or origin-rejected socket with 1008 (policy violation); 4403 is reserved
+// for an explicit application-level forbidden.
+function isForbiddenCloseCode(code: number | undefined): boolean {
+  return code === 1008 || code === 4403;
 }
 
 export function useStationState(): WsState & { socket: WebSocket | null } {
@@ -67,7 +77,9 @@ export function useStationState(): WsState & { socket: WebSocket | null } {
     let socket: WebSocket | null = null;
     let attempt = 0;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    const forbidden = false;
+    // Sticky once the server rejects us on auth/policy grounds (1008/4403): we stop
+    // reconnecting and surface the 'forbidden' status so the app can prompt re-login.
+    let forbidden = false;
 
     const clearRetry = () => {
       if (retryTimer !== null) {
@@ -117,15 +129,25 @@ export function useStationState(): WsState & { socket: WebSocket | null } {
         if (ws._dead) return;
         dispatch({ raw: String((e as MessageEvent).data) });
       });
-      const onDown = () => {
+      const onDown = (e?: unknown) => {
         if (ws._dead || ws !== socket) return;
         ws._dead = true;
-        dispatch({ closed: true });
         // Invariant: the exposed live socket clears on disconnect. Null it now rather
         // than waiting for the reconnect timer's teardownSocket() to run — otherwise
         // usePlayerRole would hold a CLOSED socket as "live" for the whole backoff window
         // (up to the 15s cap, or indefinitely while still offline).
         setLiveSocket(null);
+        // A 1008/4403 close is an auth/policy rejection: reconnecting would just fail the
+        // same way and hammer the server every ≤15s. Latch 'forbidden', surface it, and do
+        // NOT schedule a reconnect — the app renders the LoginGate on this status.
+        const code = (e as CloseEvent | undefined)?.code;
+        if (isForbiddenCloseCode(code)) {
+          forbidden = true;
+          clearRetry();
+          dispatch({ forbidden: true });
+          return;
+        }
+        dispatch({ closed: true });
         scheduleReconnect();
       };
       ws.addEventListener("close", onDown);

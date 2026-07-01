@@ -21,6 +21,12 @@ services:
   jukebox:
     image: ghcr.io/atvriders/lan-jukebox:latest
     pull_policy: always
+    # Run a tiny init (tini) as PID 1 so orphaned yt-dlp/ffmpeg grandchildren (yt-dlp forks
+    # ffmpeg; a SIGKILLed hung child's own children get reparented to PID 1) are reaped instead
+    # of accumulating as <defunct> zombies. Node reaps only its direct children, so on a
+    # forever-running station with continuous downloads + timeout-kills, zombies would otherwise
+    # creep toward the PID limit.
+    init: true
     environment:
       # Server
       PORT: "8080"
@@ -95,6 +101,8 @@ services:
   bgutil-pot:
     image: brainicism/bgutil-ytdlp-pot-provider:latest
     profiles: ["pot"]
+    # Reap any grandchildren the provider spawns (same PID-1 zombie concern as jukebox).
+    init: true
     restart: unless-stopped
     expose: ["4416"]
 

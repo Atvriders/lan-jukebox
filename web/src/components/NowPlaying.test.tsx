@@ -131,6 +131,19 @@ describe("NowPlaying progress bar", () => {
     screen.getByText("0:30");
   });
 
+  it("does NOT epoch-extrapolate a playing bar on the REST-seeded first render (receivedAt<=0)", () => {
+    // On initial mount App renders from the REST snapshot with receivedAt=0 (no WS frame
+    // yet). A playing track must NOT extrapolate against Date.now()-0 (≈1.7e12 ms) and pin
+    // the bar to 100% — with receivedAt<=0 we skip extrapolation and show the raw position.
+    vi.useFakeTimers();
+    vi.setSystemTime(1_700_000_000_000);
+    render(<NowPlaying item={item(25_000, 100_000)} paused={false} receivedAt={0} />);
+    const bar = screen.getByTestId("progress-fill") as HTMLElement;
+    // 25s / 100s = 25%, not clamped to 100%.
+    expect(bar.style.width).toBe("25%");
+    screen.getByText("0:25");
+  });
+
   it("renders a progress bar whose width reflects elapsed/duration", () => {
     vi.useFakeTimers();
     const t0 = 3_000_000;

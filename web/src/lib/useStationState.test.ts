@@ -36,10 +36,11 @@ class FakeWS {
     this.emit("message", { data });
   }
   // A server/network-initiated close: the socket moves to CLOSED and the 'close' event
-  // fires WITHOUT our own close() having been called (real WebSocket semantics).
-  fireClose() {
+  // fires WITHOUT our own close() having been called (real WebSocket semantics). An optional
+  // code mirrors CloseEvent.code (e.g. 1008 = policy/auth rejection).
+  fireClose(code?: number) {
     this.readyState = 3;
-    this.emit("close", {});
+    this.emit("close", code === undefined ? {} : { code });
   }
 }
 
@@ -85,5 +86,40 @@ describe("useStationState", () => {
     // until the reconnect timer eventually fires.
     expect(result.current.socket).toBeNull();
     expect(result.current.status).toBe("closed");
+  });
+  it("goes 'forbidden' on a 1008 close and does NOT schedule a reconnect", () => {
+    vi.useFakeTimers();
+    try {
+      const { result } = renderHook(() => useStationState());
+      const ws = FakeWS.instances[0]!;
+      act(() => ws.fireOpen());
+      expect(FakeWS.instances).toHaveLength(1);
+      // Server rejects an unauthenticated/origin-bad socket with 1008.
+      act(() => ws.fireClose(1008));
+      // Regression: status latches 'forbidden' (login-required), not 'closed'.
+      expect(result.current.status).toBe("forbidden");
+      expect(result.current.socket).toBeNull();
+      // No reconnect scheduled: advancing well past the 15s cap creates no new socket and
+      // stays 'forbidden' (the machinery must not hammer the server every ≤15s).
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(FakeWS.instances).toHaveLength(1);
+      expect(result.current.status).toBe("forbidden");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("still reconnects on a normal (codeless) close", () => {
+    vi.useFakeTimers();
+    try {
+      renderHook(() => useStationState());
+      const ws = FakeWS.instances[0]!;
+      act(() => ws.fireOpen());
+      act(() => ws.fireClose()); // network blip, no auth/policy code
+      // Backoff base is 1s; advancing past it spins up a fresh socket.
+      act(() => vi.advanceTimersByTime(1_100));
+      expect(FakeWS.instances.length).toBeGreaterThan(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

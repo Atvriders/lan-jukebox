@@ -8,7 +8,14 @@ import WebSocket from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { StationSnapshot } from "../types/index.js";
 import { PlayerRegistry } from "../players/registry.js";
-import { isAllowedOrigin, StationBroadcaster, registerWebsocket, type Send } from "./ws.js";
+import { BrowserPlayerSink } from "../orchestrator/browser-player-sink.js";
+import {
+  isAllowedOrigin,
+  StationBroadcaster,
+  registerWebsocket,
+  withPresence,
+  type Send,
+} from "./ws.js";
 
 const SNAP: StationSnapshot = {
   repeat: "off",
@@ -92,6 +99,38 @@ describe("StationBroadcaster.attach", () => {
     expect(sub).toHaveBeenCalledTimes(1);
     expect(sub).toHaveBeenCalledWith({ type: "state", state: SNAP });
   });
+
+  it("overlays live player-presence into the broadcast state (finding: fields never populated)", () => {
+    const station = new EventEmitter() as EventEmitter & { snapshot: () => StationSnapshot };
+    station.snapshot = () => SNAP; // orchestrator hardcodes present:false / label:null
+    const b = new StationBroadcaster();
+    const sub = vi.fn<Send>();
+    b.subscribe(sub);
+    // Presence view backed by a live registry-like source.
+    b.attach(station as never, {
+      get activePlayerDeviceId() {
+        return "d1";
+      },
+      get activePlayerLabel() {
+        return "Kitchen";
+      },
+    });
+    station.emit("changed");
+    const state = (sub.mock.calls[0]![0] as { state: StationSnapshot }).state;
+    expect(state.activePlayerPresent).toBe(true);
+    expect(state.activePlayerLabel).toBe("Kitchen");
+  });
+});
+
+describe("withPresence", () => {
+  it("fills present/label from the registry values (null deviceId => absent)", () => {
+    expect(
+      withPresence(SNAP, { activePlayerDeviceId: "d1", activePlayerLabel: "Den" }),
+    ).toMatchObject({ activePlayerPresent: true, activePlayerLabel: "Den" });
+    expect(
+      withPresence(SNAP, { activePlayerDeviceId: null, activePlayerLabel: null }),
+    ).toMatchObject({ activePlayerPresent: false, activePlayerLabel: null });
+  });
 });
 
 // Minimal sink stub matching BrowserPlayerSink's structural surface used by the handler.
@@ -99,10 +138,20 @@ function makeFakeSinkFactory() {
   const sinks: Array<{
     send: Send;
     emit: ReturnType<typeof vi.fn>;
+    onTrackEnded: ReturnType<typeof vi.fn>;
+    onPlaybackError: ReturnType<typeof vi.fn>;
     relinquish: ReturnType<typeof vi.fn>;
   }> = [];
   const factory = (send: Send) => {
-    const sink = { send, emit: vi.fn(), relinquish: vi.fn(), setSend: vi.fn() };
+    const sink = {
+      send,
+      emit: vi.fn(),
+      // ws.ts routes client-originated end/error through these guarded methods, not raw emit.
+      onTrackEnded: vi.fn(),
+      onPlaybackError: vi.fn(),
+      relinquish: vi.fn(),
+      setSend: vi.fn(),
+    };
     sinks.push(sink);
     return sink as never;
   };
@@ -263,12 +312,21 @@ describe("registerWebsocket integration", () => {
     ws.close();
   });
 
-  it("trackEnded emits 'trackEnd' on the per-socket sink", async () => {
+  it("trackEnded routes through the sink's guarded onTrackEnded()", async () => {
     h = await boot({ authed: true });
     const ws = await openHello(h.url);
     ws.send(JSON.stringify({ type: "trackEnded" }));
     await new Promise((r) => setTimeout(r, 50));
-    expect(h.sinkFactory.sinks[0]?.emit).toHaveBeenCalledWith("trackEnd");
+    expect(h.sinkFactory.sinks[0]?.onTrackEnded).toHaveBeenCalledTimes(1);
+    ws.close();
+  });
+
+  it("playbackError routes through the sink's guarded onPlaybackError(message)", async () => {
+    h = await boot({ authed: true });
+    const ws = await openHello(h.url);
+    ws.send(JSON.stringify({ type: "playbackError", message: "audio decode failed" }));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(h.sinkFactory.sinks[0]?.onPlaybackError).toHaveBeenCalledWith("audio decode failed");
     ws.close();
   });
 
@@ -319,5 +377,63 @@ describe("registerWebsocket integration", () => {
     expect(ourIntervals).toHaveLength(0);
     ws.close();
     spy.mockRestore();
+  });
+});
+
+// End-to-end crash guard: a real BrowserPlayerSink (NOT the fake vi.fn() sink) so the actual
+// EventEmitter throw-on-listener-less-'error' semantics are exercised.
+describe("playbackError from a non-Player socket must NOT crash the process", () => {
+  async function bootRealSink() {
+    const app = Fastify();
+    await app.register(fastifyWebsocket);
+    app.addHook("onRequest", async (req) => {
+      (req as { session?: { authed?: boolean; deviceId?: string; displayName?: string } }).session =
+        { authed: true, deviceId: "d1", displayName: "PC" };
+    });
+    const station = Object.assign(new EventEmitter(), {
+      snapshot: () => SNAP,
+      attachSink: vi.fn(),
+      detachSink: vi.fn(),
+      resume: vi.fn(),
+      pause: vi.fn(),
+      reportPosition: vi.fn(),
+    });
+    const dir = mkdtempSync(join(tmpdir(), "lj-ws-real-"));
+    const registry = new PlayerRegistry({ dir, station: station as never, now: () => 1 });
+    await registry.init();
+    registerWebsocket(app as never, {
+      broadcaster: new StationBroadcaster(),
+      registry,
+      allowedOrigins: ["http://localhost"],
+      // REAL sink factory — mirrors the one composed in production (app.ts).
+      makeSink: (send) => {
+        const sink = new BrowserPlayerSink();
+        sink.setSend(send);
+        return sink as never;
+      },
+      station: station as never,
+    });
+    await app.listen({ port: 0, host: "127.0.0.1" });
+    const addr = app.server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+    return { app, url: `ws://127.0.0.1:${port}/ws` };
+  }
+
+  it("does not raise an uncaughtException when a Remote (never became Player) reports playbackError", async () => {
+    const { app, url } = await bootRealSink();
+    const seen: Error[] = [];
+    const onUncaught = (e: Error) => seen.push(e);
+    process.on("uncaughtException", onUncaught);
+    try {
+      const ws = await openHello(url); // hello only — this socket is NOT the active Player
+      ws.send(JSON.stringify({ type: "playbackError", message: "audio decode failed" }));
+      // Give the (synchronous) handler a beat; a crash would surface as an uncaughtException.
+      await new Promise((r) => setTimeout(r, 80));
+      expect(seen).toEqual([]);
+      ws.close();
+    } finally {
+      process.off("uncaughtException", onUncaught);
+      await app.close();
+    }
   });
 });

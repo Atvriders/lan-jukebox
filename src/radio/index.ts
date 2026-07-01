@@ -5,7 +5,7 @@ import type { StationController } from "../orchestrator/index.js";
 
 export interface RadioDeps {
   youtube: Pick<YouTubeService, "related" | "artistTracks">;
-  station: Pick<StationController, "seed" | "queue" | "enqueue">;
+  station: Pick<StationController, "seed" | "queue" | "enqueue" | "setUpcomingRadio">;
   settings: () => { autoplay: boolean; autoplaySource: AutoplaySource };
   recentWindow?: number;
 }
@@ -83,12 +83,29 @@ export class RadioEngine {
   async ensureAhead(lowWater = 1): Promise<void> {
     // Append radio tracks until the explicit upcoming list reaches lowWater (or we run dry).
     // Bounded by lowWater so a no-candidate result terminates the loop.
+    let enqueued = false;
     for (let guard = 0; guard < lowWater + 1; guard++) {
       const upcoming = this.deps.station.queue.snapshot().upcoming.length;
-      if (upcoming >= lowWater) return;
+      if (upcoming >= lowWater) break;
       const next = await this.nextCandidate();
-      if (!next) return;
+      if (!next) break;
       await this.deps.station.enqueue(next, AUTOPLAY_REQUESTER);
+      enqueued = true;
     }
+    // Publish the radio-tagged upcoming items as the UI "upcoming-radio preview" so the field
+    // reflects reality (radio picks are appended into the explicit `upcoming` queue tagged
+    // fromRadio, so the preview mirrors those rather than a separate pre-resolved buffer). Without
+    // this, setUpcomingRadio had zero runtime callers and the preview was permanently empty.
+    // ONLY when we actually enqueued: setUpcomingRadio emits "changed" → radioTopUp → ensureAhead,
+    // so publishing unconditionally (even when nothing was added) would recurse forever.
+    if (enqueued) this.publishPreview();
+  }
+
+  /** Mirror the current radio-tagged upcoming items into the station's upcoming-radio preview. */
+  private publishPreview(): void {
+    const radioUpcoming = this.deps.station.queue
+      .snapshot()
+      .upcoming.filter((i) => i.fromRadio === true);
+    this.deps.station.setUpcomingRadio(radioUpcoming);
   }
 }

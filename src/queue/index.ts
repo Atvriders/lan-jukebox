@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import type { QueueItem, QueueSnapshot, Requester, TrackMeta } from "../types/index.js";
+import type { AudioInfo, QueueItem, QueueSnapshot, Requester, TrackMeta } from "../types/index.js";
 import { Mutex } from "../util/mutex.js";
 
 export interface QueueOptions {
@@ -30,6 +30,18 @@ export class Queue extends EventEmitter {
 
   get current(): QueueItem | null {
     return this._current;
+  }
+
+  /**
+   * Record the real audio format on the current item once its file has been downloaded.
+   * Satisfies QueueItem.audio's contract ("null until the file has been downloaded") so the
+   * NowPlaying format badge can render and the audio route can serve playable formats as-is.
+   * No-op if there is no current item or the videoId no longer matches (a race advanced past it).
+   */
+  setCurrentAudio(videoId: string, audio: AudioInfo | null): void {
+    if (!this._current || this._current.meta.videoId !== videoId) return;
+    this._current.audio = audio;
+    this.emitChange();
   }
 
   snapshot(): QueueSnapshot {
@@ -126,6 +138,20 @@ export class Queue extends EventEmitter {
       this._upcoming.push(...recycled);
       this.emitChange();
       return recycled.length;
+    });
+  }
+
+  /**
+   * Seed `_history` from a persisted snapshot on restart (the History panel would otherwise be
+   * empty even though the snapshot faithfully saved it). Keeps only the most recent `historyMax`
+   * entries. Caller is responsible for per-item validation. Does NOT touch `_played` (the
+   * repeat="all" recycle set restarts empty after a restart).
+   */
+  restoreHistory(items: QueueItem[]): Promise<void> {
+    return this.mutex.runExclusive(() => {
+      const trimmed = items.slice(-this.historyMax).map((i) => ({ ...i }));
+      this._history = trimmed;
+      this.emitChange();
     });
   }
 

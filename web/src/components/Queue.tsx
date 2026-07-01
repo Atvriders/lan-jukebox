@@ -135,6 +135,7 @@ export function Queue({
   autoplay,
   autoplaySource,
   onToggleAutoplay,
+  onChangeSource,
 }: {
   items: QueueItem[];
   current: CurrentItem | null;
@@ -148,8 +149,10 @@ export function Queue({
   onClear: () => void;
   autoplay: boolean;
   autoplaySource: AutoplaySource;
-  /** Emits the new engaged state; App threads it (with the source) to POST /settings. */
+  /** Emits the new engaged state; App threads it to POST /settings. */
   onToggleAutoplay: (on: boolean) => void;
+  /** Emits the newly-selected autoplay source; App threads it to POST /settings. */
+  onChangeSource: (source: AutoplaySource) => void;
 }) {
   return (
     <section className="card p-5 sm:p-6">
@@ -158,13 +161,13 @@ export function Queue({
           <p className="eyebrow">Up next</p>
           {/* Autoplay lives in the header so the queue running dry never means a hard
               stop — flip it and the station keeps broadcasting from YouTube's feed.
-              onChangeSource re-uses onToggleAutoplay's engaged state (unchanged) while
-              the App merges the source into the same /settings patch. */}
+              onChangeSource passes the newly-selected source straight through; the App
+              threads it to POST /settings so the Radio/Artist choice actually persists. */}
           <AutoplaySwitch
             autoplay={autoplay}
             autoplaySource={autoplaySource}
             onToggleAutoplay={onToggleAutoplay}
-            onChangeSource={() => onToggleAutoplay(autoplay)}
+            onChangeSource={onChangeSource}
           />
         </div>
         <div className="flex items-center gap-3">
@@ -303,7 +306,7 @@ export function Queue({
                   Play next
                 </button>
                 <button
-                  aria-label="Move up"
+                  aria-label={`Move up: ${it.meta.title}`}
                   disabled={i === 0}
                   onClick={() => onReorder(it.id, i - 1)}
                   className="pill pill-ghost"
@@ -312,7 +315,7 @@ export function Queue({
                   ▲
                 </button>
                 <button
-                  aria-label="Move down"
+                  aria-label={`Move down: ${it.meta.title}`}
                   disabled={i === items.length - 1}
                   onClick={() => onReorder(it.id, i + 1)}
                   className="pill pill-ghost"

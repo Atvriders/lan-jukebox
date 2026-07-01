@@ -3,6 +3,7 @@ import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DeviceRecord, DeviceRegistryFile, StationSnapshot } from "../types/index.js";
 import { DEVICE_REGISTRY_FILE, readDeviceRegistry } from "./persist.js";
+import { getRootLogger } from "../util/logger.js";
 
 /** Per-socket audio sink the registry forwards to the station + can relinquish. */
 export interface RegistrySink {
@@ -23,6 +24,28 @@ export interface PlayerRegistryDeps {
   now?: () => number;
 }
 
+/**
+ * Upper bound on retained device records. deviceId + label are client-controlled
+ * and unbounded (spec forbids rate-limiting), so an authed client re-logging with
+ * fresh deviceIds could grow the map/file without limit — every `hello` also does
+ * an O(N) synchronous JSON.stringify + write on the event loop. When the cap is
+ * exceeded we LRU-evict by lastSeen, but never evict preferred speakers (device
+ * memory is the point of the registry).
+ */
+export const MAX_DEVICES = 500;
+
+/** A DeviceRecord that survived per-field validation on restore. */
+function isValidDeviceRecord(d: unknown): d is DeviceRecord {
+  return (
+    typeof d === "object" &&
+    d !== null &&
+    typeof (d as DeviceRecord).deviceId === "string" &&
+    typeof (d as DeviceRecord).label === "string" &&
+    typeof (d as DeviceRecord).lastSeen === "number" &&
+    typeof (d as DeviceRecord).isPreferredSpeaker === "boolean"
+  );
+}
+
 export class PlayerRegistry {
   private readonly dir: string;
   private readonly station: StationLike;
@@ -39,7 +62,16 @@ export class PlayerRegistry {
 
   async init(): Promise<void> {
     const file = await readDeviceRegistry(this.dir);
-    this.devices = new Map((file?.devices ?? []).map((d) => [d.deviceId, { ...d }]));
+    // Tolerant restore: the read guard only checks version + Array.isArray, so a
+    // JSON-valid file can still carry malformed entries (null, non-string
+    // deviceId, …). Skip bad records per-item instead of letting one corrupt row
+    // throw out of init() and brick startup of the always-on station (mirrors the
+    // orchestrator's isValidQueueItem/isValidSeed per-item skip on snapshot restore).
+    this.devices = new Map(
+      (file?.devices ?? [])
+        .filter((d): d is DeviceRecord => isValidDeviceRecord(d))
+        .map((d) => [d.deviceId, { ...d }]),
+    );
   }
 
   private toFile(): DeviceRegistryFile {
@@ -51,32 +83,74 @@ export class PlayerRegistry {
   }
 
   private persist(): void {
-    // Synchronous atomic write (stage to tmp sibling, then rename over the
-    // target) so `touch` stays synchronous AND the file is on disk before the
-    // caller's next read — a fire-and-forget async write would race the read.
-    mkdirSync(this.dir, { recursive: true });
-    const target = join(this.dir, DEVICE_REGISTRY_FILE);
-    // Unique per-write tmp (pid + random) so this write never collides with the
-    // async writeDeviceRegistry or a second registry instance sharing the dir.
-    const tmp = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.toFile()));
-    renameSync(tmp, target);
+    // Best-effort bookkeeping: log-and-continue on any fs failure instead of
+    // throwing. persist() runs inside the WS 'message' handler (touch) and the
+    // /api/speaker handler (remember/forget), neither of which wraps it; an
+    // uncaught throw (ENOSPC, EACCES, read-only/immutable volume) would reach
+    // process.on('uncaughtException') and exit(1) — killing the always-playing
+    // station over a lost registry write, which violates the 'never stops'
+    // invariant. Losing persistence is acceptable; crashing is not. Mirrors the
+    // async station-snapshot writer's .catch (src/index.ts:53).
+    try {
+      // Synchronous atomic write (stage to tmp sibling, then rename over the
+      // target) so `touch` stays synchronous AND the file is on disk before the
+      // caller's next read — a fire-and-forget async write would race the read.
+      mkdirSync(this.dir, { recursive: true });
+      const target = join(this.dir, DEVICE_REGISTRY_FILE);
+      // Unique per-write tmp (pid + random) so this write never collides with the
+      // async writeDeviceRegistry or a second registry instance sharing the dir.
+      const tmp = `${target}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
+      writeFileSync(tmp, JSON.stringify(this.toFile()));
+      renameSync(tmp, target);
+    } catch (err) {
+      // Log-and-continue via the process-wide logger (same instance main() wires
+      // up). Persistence loss is tolerable — a crash is not.
+      getRootLogger().error({ err }, "device-registry persist failed (continuing)");
+    }
   }
 
   touch(deviceId: string, label: string): void {
+    const now = this.now();
     const existing = this.devices.get(deviceId);
     if (existing) {
+      // Skip the O(N) serialize + synchronous write when nothing meaningful
+      // changed. lastSeen is refreshed in-memory regardless, but a reconnect that
+      // only bumps lastSeen (same label) does NOT need to rewrite the whole file
+      // on the hot reconnect path — the value is derivable/best-effort and is
+      // re-persisted on the next real change.
+      const changed = existing.label !== label;
       existing.label = label;
-      existing.lastSeen = this.now();
+      existing.lastSeen = now;
+      if (!changed) return;
     } else {
       this.devices.set(deviceId, {
         deviceId,
         label,
-        lastSeen: this.now(),
+        lastSeen: now,
         isPreferredSpeaker: false,
       });
+      this.enforceCap();
     }
     this.persist();
+  }
+
+  /**
+   * Bound the map: when it exceeds MAX_DEVICES, LRU-evict the oldest by lastSeen,
+   * but never evict preferred speakers (they carry the device-memory the registry
+   * exists for) or the currently-active player. Called only on inserts, so the
+   * map settles at MAX_DEVICES rather than growing without limit.
+   */
+  private enforceCap(): void {
+    if (this.devices.size <= MAX_DEVICES) return;
+    const evictable = [...this.devices.values()]
+      .filter((d) => !d.isPreferredSpeaker && d.deviceId !== this._activeDeviceId)
+      .sort((a, b) => a.lastSeen - b.lastSeen);
+    let toRemove = this.devices.size - MAX_DEVICES;
+    for (const rec of evictable) {
+      if (toRemove <= 0) break;
+      this.devices.delete(rec.deviceId);
+      toRemove--;
+    }
   }
 
   get activePlayerDeviceId(): string | null {

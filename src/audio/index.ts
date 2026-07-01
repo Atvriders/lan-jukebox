@@ -6,10 +6,11 @@ import type { AudioCache } from "../cache/index.js";
 import type { YouTubeService } from "../youtube/index.js";
 import type { Semaphore } from "../util/semaphore.js";
 import { chooseDelivery, transcodeToM4a } from "./format.js";
+import { requireSession } from "../auth/password.js";
 
 export interface AudioRouteDeps {
   cache: AudioCache;
-  youtube: Pick<YouTubeService, "download">;
+  youtube: Pick<YouTubeService, "download" | "resolve">;
   cacheDir: string;
   downloads: Semaphore;
 }
@@ -23,6 +24,19 @@ export interface AudioRouteDeps {
  * Promise eliminates both. Cleared in a finally so a failed resolve doesn't poison the key.
  */
 const inFlight = new Map<string, Promise<{ path: string; contentType: string } | null>>();
+
+/**
+ * Per-videoId single-flight guard for the TRANSCODE leg specifically. The download inFlight
+ * map only guards the uncached path — but the fast path in ensureFile returns before taking
+ * that lock whenever the ORIGINAL source is already cached. For a cached-but-needs-transcode
+ * id, two concurrent requests would both reach the transcode block, both see cache.get(m4aKey)
+ * null, and both spawn ffmpeg writing the SAME `${videoId}.transcoded.m4a` (ffmpeg runs with
+ * `-y` + `-movflags +faststart`), interleaving their writes into a corrupt file that then gets
+ * register()+pin()'d and served. Coalescing on the m4a key so the second caller awaits the
+ * first transcode eliminates the duplicate ffmpeg + the destructive concurrent write. Cleared
+ * in a finally so a failed transcode doesn't poison the key.
+ */
+const transcodeInFlight = new Map<string, Promise<{ path: string; contentType: string } | null>>();
 
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 
@@ -101,7 +115,18 @@ async function resolveFile(
 
   if (!path) {
     try {
-      const result = await deps.downloads.run(() => deps.youtube.download(videoId, deps.cacheDir));
+      // Resolve the track first so we can thread its duration into download(): that scales the
+      // yt-dlp timeout for long mixes/concerts instead of killing them at the short default.
+      // Best-effort — a resolve failure falls back to an unscaled download rather than 404ing.
+      let durationSec: number | null | undefined;
+      try {
+        durationSec = (await deps.youtube.resolve(videoId)).durationSec;
+      } catch {
+        durationSec = undefined;
+      }
+      const result = await deps.downloads.run(() =>
+        deps.youtube.download(videoId, deps.cacheDir, { durationSec }),
+      );
       deps.cache.register(videoId, result.path, result.audio);
       deps.cache.pin(videoId);
       path = result.path;
@@ -118,15 +143,36 @@ async function resolveFile(
   }
 
   // Transcode once to a sibling .m4a, then cache + pin THAT under a derived key so
-  // the original key still maps to the (now superseded) source until evicted.
+  // the original key still maps to the (now superseded) source until evicted. Single-flighted
+  // on the m4a key so two concurrent requests (both past the cached-source fast path) can't
+  // both spawn ffmpeg writing the same destPath and corrupt it — the second awaits the first.
   const m4aKey = `${videoId}.m4a`;
   const cachedTranscode = deps.cache.get(m4aKey);
   if (cachedTranscode) {
     return { path: cachedTranscode, contentType: "audio/mp4" };
   }
+  const existingTranscode = transcodeInFlight.get(m4aKey);
+  if (existingTranscode) return existingTranscode;
+  const transcodeWork = runTranscode(deps, path, m4aKey).finally(() => {
+    transcodeInFlight.delete(m4aKey);
+  });
+  transcodeInFlight.set(m4aKey, transcodeWork);
+  return transcodeWork;
+}
+
+/** Spawn ffmpeg once for a cache-miss transcode, register+pin the result. Coalesced by caller. */
+async function runTranscode(
+  deps: AudioRouteDeps,
+  sourcePath: string,
+  m4aKey: string,
+): Promise<{ path: string; contentType: string } | null> {
+  // Re-check under the single-flight entry: a coalesced predecessor may have just produced it.
+  const cached = deps.cache.get(m4aKey);
+  if (cached) return { path: cached, contentType: "audio/mp4" };
+  const videoId = m4aKey.replace(/\.m4a$/, "");
   const destPath = join(deps.cacheDir, `${videoId}.transcoded.m4a`);
   try {
-    await deps.downloads.run(() => transcodeToM4a(path!, destPath));
+    await deps.downloads.run(() => transcodeToM4a(sourcePath, destPath));
     deps.cache.register(m4aKey, destPath, { codec: "aac", bitrateKbps: 192, sampleRateHz: 48000 });
     deps.cache.pin(m4aKey);
     return { path: destPath, contentType: "audio/mp4" };
@@ -183,6 +229,17 @@ async function serveFile(
 /** Registers GET /audio/:trackId on `app`. Standalone plugin; server/app.ts wires it. */
 export function registerAudioRoute(app: FastifyInstance, deps: AudioRouteDeps): void {
   app.get<{ Params: { trackId: string } }>("/audio/:trackId", async (req, reply) => {
+    // Gate on the shared-password session exactly like every /api route. This route is
+    // reachable at the public PUBLIC_BASE_URL behind a bring-your-own tunnel, and the single
+    // shared password is the ONLY thing protecting the station. Without this check the route
+    // was unauthenticated: (1) anyone could stream any cached track's full audio password-free,
+    // and (2) an anonymous caller could enumerate valid 11-char video ids and force unbounded
+    // yt-dlp downloads + transcodes through the download semaphore (no rate-limiting by
+    // invariant), exhausting download slots, CPU, disk, and the host's YouTube egress. The
+    // Player's same-origin <audio src="/audio/<id>"> sends the sid cookie automatically, so
+    // legitimate playback still passes. Check BEFORE the id-format check so unauthenticated
+    // callers get 401 and never reach ensureFile()/youtube.download().
+    if (!(await requireSession(req, reply))) return;
     const { trackId } = req.params;
     if (!VIDEO_ID_RE.test(trackId)) {
       return reply.code(404).send({ error: "not_found" });

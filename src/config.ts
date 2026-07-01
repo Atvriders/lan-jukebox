@@ -11,7 +11,10 @@ export function intEnv(
   fallback: number,
   opts?: { min?: number; max?: number },
 ): number {
-  const raw = env[key];
+  // Trim first so a whitespace-only value (a stray tab/newline from docker-compose/CI) is
+  // treated as unset rather than parsed: Number("  ") === 0, which would silently pass the
+  // finite/integer checks and yield 0 (disabling prefetch, or throwing a misleading ">= 1").
+  const raw = env[key]?.trim();
   if (raw === undefined || raw === "") return fallback;
   const n = Number(raw);
   if (!Number.isFinite(n) || !Number.isInteger(n)) {
@@ -27,7 +30,9 @@ export function intEnv(
 }
 
 export function strEnv(env: Env, key: string): string | null {
-  const raw = env[key];
+  // Trim so a whitespace-only value is treated as unset (null) rather than returned as a
+  // real value, matching intEnv's handling.
+  const raw = env[key]?.trim();
   return raw === undefined || raw === "" ? null : raw;
 }
 

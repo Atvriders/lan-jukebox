@@ -1,6 +1,8 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, readdir } from "node:fs/promises";
 import { rmSync, statSync } from "node:fs";
+import { join } from "node:path";
 import type { AudioInfo } from "../types/index.js";
+import { getRootLogger } from "../util/logger.js";
 
 interface CacheEntry {
   videoId: string;
@@ -22,6 +24,40 @@ export class AudioCache {
 
   async init(): Promise<void> {
     await mkdir(this.dir, { recursive: true });
+    await this.reconcile();
+  }
+
+  /**
+   * Adopt audio files left in the cache dir by prior runs into the in-memory index so they
+   * (a) count toward totalBytes()/maxBytes and (b) participate in LRU eviction. The index is
+   * never persisted (the station snapshot carries only queue/seed/settings), so without this
+   * every restart would start with an empty map while a persistent CACHE_DIR volume still held
+   * every file previous runs downloaded — those files would be untracked forever, never counted
+   * and never evicted, so real disk usage grows unbounded across restarts on a station meant to
+   * run indefinitely. Reconciling (rather than purging) lets a restart REUSE cached audio
+   * instead of re-downloading it, while still honoring the cap.
+   *
+   * Only files whose name matches a known audio artifact are adopted; sidecar JSON
+   * (station-snapshot / device-registry) and half-written `.tmp` staging files are ignored so
+   * they are never served or evicted. Adopted entries are unpinned (pins are re-applied at
+   * runtime when a track becomes current), and derive their cache KEY exactly as the runtime
+   * register() calls do, so a later re-register overwrites the same entry rather than orphaning it.
+   */
+  private async reconcile(): Promise<void> {
+    let names: string[];
+    try {
+      names = await readdir(this.dir);
+    } catch {
+      return; // dir unreadable — nothing to reconcile
+    }
+    for (const name of names) {
+      const key = cacheKeyForFile(name);
+      if (key === null) continue;
+      // Skip anything already registered (defensive: reconcile runs once at init, but never
+      // clobber a live entry) and let register() do the stat/size guard + eviction bookkeeping.
+      if (this.entries.has(key)) continue;
+      this.register(key, join(this.dir, name));
+    }
   }
 
   has(videoId: string): boolean {
@@ -74,7 +110,17 @@ export class AudioCache {
         if (e.pinned) continue;
         if (victim === null || e.lastUsed < victim.lastUsed) victim = e;
       }
-      if (victim === null) break; // Can't evict anymore, will exceed limit but can't help it
+      if (victim === null) {
+        // Every remaining entry is pinned: eviction can't reclaim more, so the cache is about to
+        // exceed maxBytes with no recovery path. Surface it (rather than silently over-filling)
+        // so an operator has a signal before the disk fills. A leaked/never-unpinned entry is the
+        // usual cause — see the pin-lifecycle fix in the orchestrator/audio route.
+        getRootLogger().warn(
+          { totalBytes: this.totalBytes(), incomingBytes: size, maxBytes: this.maxBytes },
+          "audio cache over CACHE_MAX_MB: all remaining entries pinned, cannot evict",
+        );
+        break;
+      }
       const victimPath = victim.filePath;
       this.entries.delete(victim.videoId);
       try {
@@ -109,6 +155,26 @@ export class AudioCache {
     for (const e of this.entries.values()) total += e.sizeBytes;
     return total;
   }
+}
+
+// Map a cache-dir filename back to the cache KEY the runtime would register it under, or null
+// if the file is not a recognized audio artifact (so reconcile skips snapshot/registry JSON and
+// `.tmp` staging files). Mirrors the two register() call sites:
+//   download  -> register("<id>",     "<id>.<ext>")            key = the 11-char video id
+//   transcode -> register("<id>.m4a", "<id>.transcoded.m4a")   key = "<id>.m4a"
+const RECONCILE_ID = "[A-Za-z0-9_-]{11}";
+const TRANSCODED_RE = new RegExp(`^(${RECONCILE_ID})\\.transcoded\\.m4a$`);
+// Any other single-extension file named "<id>.<ext>" is a raw download/prefetch artifact.
+const DOWNLOAD_RE = new RegExp(`^(${RECONCILE_ID})\\.[A-Za-z0-9]+$`);
+function cacheKeyForFile(name: string): string | null {
+  const t = TRANSCODED_RE.exec(name);
+  if (t) return `${t[1]!}.m4a`;
+  // Guard AFTER the transcode check: "<id>.transcoded.m4a" also matches a naive "<id>.<ext>"
+  // pattern, but its ext ("transcoded") is not the raw form — exclude it explicitly.
+  if (name.includes(".transcoded.")) return null;
+  const d = DOWNLOAD_RE.exec(name);
+  if (d) return d[1]!;
+  return null;
 }
 
 // statSync via the promise API is awkward in register() (sync needed before evict bookkeeping);

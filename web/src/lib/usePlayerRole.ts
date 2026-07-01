@@ -15,6 +15,16 @@ export function usePlayerRole(
   const [volume, setVolume] = useState(100);
   const [error, setError] = useState<string | null>(null);
   const lastPosSentRef = useRef(0);
+  // Web Audio graph used to honor the 0..200 boost contract: HTMLMediaElement.volume is
+  // spec-capped at 1.0, so anything above 100% would be a silent no-op. Routing the element
+  // through a GainNode (gain = pct/100) lets 101..200% actually amplify. Created lazily on
+  // the first setVolume that needs it (a user gesture will have unlocked the AudioContext),
+  // and reused thereafter. The latest requested pct is remembered so the graph, once wired,
+  // can adopt it immediately.
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const gainNodeRef = useRef<GainNode | null>(null);
+  const gainSourceElRef = useRef<HTMLAudioElement | null>(null);
+  const desiredPctRef = useRef(100);
   // Telemetry-binding bookkeeping: the element/socket currently wired up and its teardown.
   const boundElRef = useRef<HTMLAudioElement | null>(null);
   const boundWsRef = useRef<WebSocket | null>(null);
@@ -33,6 +43,54 @@ export function usePlayerRole(
     if (!socket) return;
     if (socket.readyState === undefined || socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(msg));
+    }
+  };
+
+  /**
+   * Apply a 0..200(pct) volume to `el`. For pct <= 100 the native element.volume is enough
+   * (no Web Audio needed, so autoplay/permission behavior is unchanged). For pct > 100 we
+   * must amplify via a GainNode, since element.volume is spec-capped at 1.0. The graph is
+   * built lazily and only when boost is actually requested; if the AudioContext can't be
+   * created (unsupported / no user gesture yet) we fall back to element.volume = 1.0 so the
+   * setting is at least at max rather than silent.
+   */
+  const applyVolume = (el: HTMLAudioElement, pct: number) => {
+    desiredPctRef.current = pct;
+    const clampedPct = Math.max(0, pct);
+    if (clampedPct <= 100) {
+      // Below unity: native volume is exact. Keep any existing gain node at unity so a
+      // previously-boosted graph doesn't keep amplifying.
+      el.volume = clampedPct / 100;
+      if (gainNodeRef.current) gainNodeRef.current.gain.value = 1;
+      return;
+    }
+    // Boost path: element at max, GainNode carries the >1.0 factor.
+    el.volume = 1;
+    const AudioCtx =
+      (globalThis as { AudioContext?: typeof AudioContext }).AudioContext ??
+      (globalThis as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return; // No Web Audio: element is already at max (1.0).
+    try {
+      let ctx = audioCtxRef.current;
+      if (!ctx) {
+        ctx = new AudioCtx();
+        audioCtxRef.current = ctx;
+      }
+      void ctx.resume?.();
+      // Wire (or re-wire) the element into the graph. createMediaElementSource can only be
+      // called once per element, so re-create the source only when the element changes.
+      if (gainSourceElRef.current !== el || !gainNodeRef.current) {
+        const source = ctx.createMediaElementSource(el);
+        const gain = ctx.createGain();
+        source.connect(gain);
+        gain.connect(ctx.destination);
+        gainNodeRef.current = gain;
+        gainSourceElRef.current = el;
+      }
+      gainNodeRef.current.gain.value = clampedPct / 100;
+    } catch {
+      // Graph construction failed (e.g. element already sourced by a stale ctx): leave the
+      // element at max volume so the setting is not silent.
     }
   };
 
@@ -86,14 +144,31 @@ export function usePlayerRole(
   };
 
   // Announce / relinquish the player role on the speaker transition.
+  //
+  // The socket is exposed to us the instant it is created — often still CONNECTING (before
+  // its 'open' event), and the reference does NOT change when it transitions to OPEN. send()
+  // only transmits over an OPEN socket, so announcing immediately here would silently drop
+  // the frame on every reconnect (network blip, tab backgrounding, backoff), and the effect
+  // would never re-run to retry — the remembered speaker would lose the Player role. So:
+  // announce now if already OPEN, otherwise attach a one-shot 'open' listener that announces
+  // once the socket actually opens. The listener is removed on cleanup.
   useEffect(() => {
     if (!ws) return;
-    if (isSpeaker) {
-      send({ type: "becomePlayer" });
-    } else {
-      send({ type: "relinquishPlayer" });
-      audioRef.current?.pause();
+    const announce = () => {
+      if (isSpeaker) {
+        send({ type: "becomePlayer" });
+      } else {
+        send({ type: "relinquishPlayer" });
+        audioRef.current?.pause();
+      }
+    };
+    // readyState === undefined covers test fakes that omit it (treated as sendable/open).
+    if (ws.readyState === undefined || ws.readyState === WebSocket.OPEN) {
+      announce();
+      return;
     }
+    ws.addEventListener("open", announce);
+    return () => ws.removeEventListener("open", announce);
   }, [ws, isSpeaker]);
 
   // Server → player command frames.
@@ -148,7 +223,7 @@ export function usePlayerRole(
           break;
         case "setVolume": {
           const pct = msg.pct;
-          el.volume = Math.max(0, Math.min(1, pct / 100));
+          applyVolume(el, pct);
           setVolume(pct);
           break;
         }
@@ -172,6 +247,11 @@ export function usePlayerRole(
       boundCleanupRef.current = null;
       boundElRef.current = null;
       boundWsRef.current = null;
+      gainNodeRef.current = null;
+      gainSourceElRef.current = null;
+      const ctx = audioCtxRef.current;
+      audioCtxRef.current = null;
+      void ctx?.close?.();
     };
   }, []);
 

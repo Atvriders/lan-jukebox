@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import type {
+  AudioInfo,
   CurrentItem,
   PreparingState,
   QueueItem,
@@ -20,13 +21,19 @@ export interface StationControllerDeps {
   settings?: Partial<StationSettings>;
   download: (
     videoId: string,
-    opts?: { onProgress?: (pct: number) => void },
-  ) => Promise<{ path: string }>;
-  pin?: (videoId: string, path: string) => void;
+    opts?: { onProgress?: (pct: number) => void; durationSec?: number | null },
+  ) => Promise<{ path: string; audio: AudioInfo | null }>;
+  pin?: (videoId: string, path: string, audio: AudioInfo | null) => void;
   unpin?: (videoId: string) => void;
-  prefetch?: (videoId: string) => Promise<void>;
+  prefetch?: (videoId: string, durationSec?: number | null) => Promise<void>;
   now?: () => number;
   onSettingsChanged?: (s: StationSettings) => void;
+  // Injectable timer for the dry-hold radio self-retry (defaults to global setTimeout/clearTimeout).
+  // Overridable so tests can drive the backoff deterministically without real wall-clock waits.
+  setTimeout?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  clearTimeout?: (h: ReturnType<typeof setTimeout>) => void;
+  /** Base backoff (ms) for the dry-hold radio retry; doubles each attempt up to a cap. */
+  radioRetryBaseMs?: number;
 }
 
 export class StationController extends EventEmitter {
@@ -47,18 +54,66 @@ export class StationController extends EventEmitter {
   private startedAt: number | null = null;
   private pausedAt: number | null = null;
   private pausedAccumMs = 0;
+  // The queue-item id currently loaded+playing on the sink (null = nothing live). Lets an
+  // enqueue-race double-schedule of startNextLocked short-circuit instead of restarting the
+  // just-started head from 0 (redundant reload/pin + a visible restart).
+  private liveItemId: string | null = null;
+  // The videoId whose cache entry (source + derived `${videoId}.m4a` transcode) is currently
+  // pinned. Unpinned when a different track becomes current so pins don't grow without bound
+  // and the LRU can honor CACHE_MAX_MB (spec: cache is bounded; the station plays forever).
+  private pinnedVideoId: string | null = null;
+  // True while loadCurrentLocked is awaiting a download. Lets seek()/pause() (which run OUTSIDE
+  // the station lock) detect that a load is in flight and defer their effect to completion.
+  private _loading = false;
+  // Set by pause() when it runs WHILE a load is in flight: the load then completes PAUSED (prepare
+  // the audio but don't auto-play) so a pause issued mid-download survives instead of being lost.
+  // Distinct from the dry-hold `_paused` state, which a fresh load intentionally clears + plays.
+  private _pausedDuringLoad = false;
+  // A seek issued while a load is in flight (download still awaiting) — applied when the load
+  // completes so the concurrent seek's position isn't clobbered by the original startMs.
+  private pendingSeekMs: number | null = null;
   // radio hooks (wired by RadioEngine in 1.6; null = no radio, hold-paused on drain).
   private radioContinuation: (() => Promise<TrackMeta | null>) | null = null;
   private radioTopUp: (() => void) | null = null;
   private upcomingRadio: QueueItem[] = [];
+  // Dry-hold radio self-retry: when the queue drains and radioContinuation() returns null
+  // because of a TRANSIENT upstream failure (related()/artistTracks() swallow all errors to []),
+  // the station would otherwise stay parked in dry-hold forever until a human intervenes —
+  // violating "when the queue drains it autoplays related tracks forever". Schedule a bounded,
+  // backing-off re-attempt so a blip (bgutil POT briefly down, momentary rate-limit) self-heals.
+  private radioRetryHandle: ReturnType<typeof setTimeout> | null = null;
+  private radioRetryAttempt = 0;
+  // Consecutive download-failure counter. A YouTube-side outage (metadata resolves but every
+  // download fails: expired URL, PoTokenSabr, disk full) would otherwise walk the whole candidate
+  // list firing a rapid BURST of failed yt-dlp spawns + related() fetches with zero backoff. A
+  // short, capped inter-attempt delay degrades that into a slow retry instead of a thundering herd.
+  private downloadFailStreak = 0;
+  private static readonly DOWNLOAD_FAIL_BACKOFF_CAP_MS = 30_000;
+  private static readonly DOWNLOAD_FAIL_BACKOFF_BASE_MS = 1_000;
+  private readonly setTimeoutFn: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  private readonly clearTimeoutFn: (h: ReturnType<typeof setTimeout>) => void;
+  private readonly radioRetryBaseMs: number;
+  private static readonly RADIO_RETRY_CAP_MS = 60_000;
+  private static readonly RADIO_RETRY_MAX_ATTEMPTS = 10;
 
   constructor(private readonly deps: StationControllerDeps) {
     super();
     this.now = deps.now ?? (() => Date.now());
+    this.setTimeoutFn = deps.setTimeout ?? ((fn, ms) => setTimeout(fn, ms));
+    this.clearTimeoutFn = deps.clearTimeout ?? ((h) => clearTimeout(h));
+    this.radioRetryBaseMs = deps.radioRetryBaseMs ?? 5_000;
     this.queue = deps.queue ?? new Queue();
     this._settings = applySettingsPatch({ ...DEFAULT_SETTINGS }, deps.settings ?? {});
     this.queue.on("prefetch", (videoId: string | null) => {
-      if (videoId && this.deps.prefetch) void this.deps.prefetch(videoId);
+      if (videoId && this.deps.prefetch) {
+        // The queue emits the upcoming-head videoId; look up its duration from the same
+        // head item so the prefetch download's yt-dlp timeout can auto-scale for long
+        // tracks (mirrors loadCurrentLocked threading item.meta.durationSec).
+        const head = this.queue.snapshot().upcoming[0];
+        const durationSec =
+          head && head.meta.videoId === videoId ? head.meta.durationSec : undefined;
+        void this.deps.prefetch(videoId, durationSec);
+      }
     });
     this.queue.on("changed", () => {
       this.emit("changed");
@@ -137,14 +192,31 @@ export class StationController extends EventEmitter {
       await this.advanceAndPlayLocked("archive");
     });
   };
-  private readonly onSinkError = (): void => {
+  private readonly onSinkError = (message?: unknown): void => {
     const gen = this.playGeneration;
+    const reason = typeof message === "string" && message ? message : "playback error";
     void this.lock.runExclusive(async () => {
       if (gen !== this.playGeneration) return;
       this.playGeneration += 1;
+      // Surface the failed track to the UI BEFORE we discard it (the item is still `current`),
+      // so the client's "Skipped '<title>' — <reason>" banner can name what was dropped.
+      this.emitTrackError(this.queue.current, reason);
       await this.advanceAndPlayLocked("discard"); // failed track is NOT archived to history
     });
   };
+
+  /**
+   * Emit a {@link ServerBroadcastMessage} `trackError` payload over the "trackError" event so the
+   * composition root can broadcast it to every subscriber. Best-effort: a missing item is a no-op.
+   */
+  private emitTrackError(item: QueueItem | null, reason: string): void {
+    if (!item) return;
+    this.emit("trackError", {
+      videoId: item.meta.videoId,
+      title: item.meta.title,
+      reason,
+    });
+  }
 
   private async resumeOrStartLocked(): Promise<void> {
     this._dryHeld = false;
@@ -160,6 +232,12 @@ export class StationController extends EventEmitter {
    * track / radio / dry-hold. The single advance path for trackEnd/error/skip/jump.
    */
   private async advanceAndPlayLocked(disposition: "archive" | "discard"): Promise<void> {
+    // repeat="one": a CLEAN end replays the SAME current from 0 (an error still advances, so a
+    // broken track can never wedge the station on itself forever).
+    if (disposition === "archive" && this._settings.repeat === "one" && this.queue.current) {
+      await this.loadCurrentLocked(0);
+      return;
+    }
     // Decide where to go BEFORE retiring `current`, so a dry queue keeps the finished track
     // as `current` (spec §3/§4: hold paused with current/position preserved, no teardown).
     const hasUpcoming = this.queue.snapshot().upcoming.length > 0;
@@ -167,17 +245,25 @@ export class StationController extends EventEmitter {
       const radioMeta = this.radioContinuation ? await this.radioContinuation() : null;
       if (radioMeta) {
         await this.queue.add(radioMeta, AUTOPLAY_REQUESTER, true);
+      } else if (this._settings.repeat === "all" && (await this.queue.requeueHistory()) > 0) {
+        // repeat="all": explicit queue dry AND radio yielded nothing → re-cycle the FULL played
+        // set (incl. the just-finished current) back into `upcoming`. requeueHistory clears
+        // `current`, so the promotion below plays the recycled head instead of dry-holding.
       } else {
-        // queue dry, no radio: hold paused. On a CLEAN end keep the finished track as `current`
-        // (spec §3/§4: current/position preserved, no teardown). On an ERROR discard the failed
-        // track (it must not stay displayed as now-playing). startNextLocked retires either.
+        // queue dry, no radio, nothing to recycle: hold paused. On a CLEAN end keep the finished
+        // track as `current` (spec §3/§4: current/position preserved, no teardown). On an ERROR
+        // discard the failed track (it must not stay displayed as now-playing).
         if (disposition === "discard") await this.queue.discardCurrent();
         this.enterDryHoldLocked();
         return;
       }
     }
-    if (disposition === "archive") await this.queue.advance();
-    else await this.queue.discardCurrent();
+    // requeueHistory() already retired `current` (set it to null); only archive/discard when a
+    // live current still needs retiring. playNextLocked then promotes the head.
+    if (this.queue.current) {
+      if (disposition === "archive") await this.queue.advance();
+      else await this.queue.discardCurrent();
+    }
     await this.playNextLocked();
   }
 
@@ -192,6 +278,52 @@ export class StationController extends EventEmitter {
     this._dryHeld = true;
     this.freezePosition();
     this.emit("changed");
+    // If radio COULD have produced a track (autoplay on, a seed exists, a continuation is wired)
+    // but returned null, the drain was a TRANSIENT upstream failure (related() swallows all
+    // errors to []) — not a genuine cold start. Schedule a backing-off retry so the always-on
+    // station resumes autoplay on its own instead of parking forever (spec: drains autoplay
+    // related tracks forever). A true cold start (no seed) schedules nothing.
+    if (this._settings.autoplay && this._seed !== null && this.radioContinuation !== null) {
+      this.scheduleRadioRetryLocked();
+    }
+  }
+
+  /** Arm the next backing-off dry-hold radio retry (idempotent — replaces any pending timer). */
+  private scheduleRadioRetryLocked(): void {
+    this.cancelRadioRetry();
+    if (this.radioRetryAttempt >= StationController.RADIO_RETRY_MAX_ATTEMPTS) return;
+    const delay = Math.min(
+      StationController.RADIO_RETRY_CAP_MS,
+      this.radioRetryBaseMs * 2 ** this.radioRetryAttempt,
+    );
+    this.radioRetryAttempt += 1;
+    this.radioRetryHandle = this.setTimeoutFn(() => {
+      this.radioRetryHandle = null;
+      const gen = this.playGeneration;
+      void this.lock.runExclusive(async () => {
+        // Only retry if we are STILL dry-held on the same generation and nothing has intervened
+        // (a manual enqueue/resume/skip clears _dryHeld and cancels this). Re-attempt radio; if it
+        // still yields nothing, enterDryHoldLocked re-arms the next (longer) backoff.
+        if (gen !== this.playGeneration || !this._dryHeld || !this.sink) return;
+        await this.startNextLocked();
+      });
+    }, delay);
+  }
+
+  /** Cancel any pending dry-hold radio retry and reset the backoff (call when leaving dry-hold). */
+  private cancelRadioRetry(): void {
+    if (this.radioRetryHandle !== null) {
+      this.clearTimeoutFn(this.radioRetryHandle);
+      this.radioRetryHandle = null;
+    }
+  }
+
+  /** Await `ms` via the injectable timer (0 resolves immediately so tests need no fake clock). */
+  private delay(ms: number): Promise<void> {
+    if (ms <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.setTimeoutFn(() => resolve(), ms);
+    });
   }
 
   /**
@@ -210,6 +342,18 @@ export class StationController extends EventEmitter {
 
   // Core never-stopping advance: promote head → if none, ask radio → if none, hold paused.
   private async playNextLocked(): Promise<void> {
+    // Spurious auto-start guard (enqueue-race): if `current` is already the live, actively-playing
+    // track (not paused, not dry-held), a second scheduled startNextLocked would re-load+restart it
+    // from 0. Two near-simultaneous cold-start enqueues both observe current===null and both
+    // schedule this; the first plays the head, so the second must be a no-op here.
+    if (
+      this.queue.current &&
+      this.liveItemId === this.queue.current.id &&
+      !this._paused &&
+      !this._dryHeld
+    ) {
+      return;
+    }
     if (!this.queue.current) {
       const item = await this.queue.advance();
       if (!item) {
@@ -233,12 +377,17 @@ export class StationController extends EventEmitter {
       this.emit("changed");
       return;
     }
+    // A new load supersedes any seek that targeted the previous load window.
+    this.pendingSeekMs = null;
     this.setPreparing({
       videoId: item.meta.videoId,
       title: item.meta.title,
       phase: "resolving",
     });
     let path: string;
+    let audio: AudioInfo | null;
+    this._pausedDuringLoad = false; // fresh load window; only a pause() during THIS load counts
+    this._loading = true; // a load is in flight → pause()/seek() defer to completion
     try {
       this.setPreparing({
         videoId: item.meta.videoId,
@@ -247,6 +396,9 @@ export class StationController extends EventEmitter {
         percent: 0,
       });
       const res = await this.deps.download(item.meta.videoId, {
+        // Thread the track duration so the yt-dlp timeout auto-scales for long
+        // mixes/concerts instead of being SIGKILLed at the short default.
+        durationSec: item.meta.durationSec,
         onProgress: (pct) =>
           this.setPreparing({
             videoId: item.meta.videoId,
@@ -256,27 +408,87 @@ export class StationController extends EventEmitter {
           }),
       });
       path = res.path;
-    } catch {
+      audio = res.audio;
+    } catch (err) {
+      this._loading = false;
       // download failed → discard + try the next (radio/next track). Best-effort.
       this.setPreparing(null);
+      // Surface the failure to the UI (banner) BEFORE discarding, while `item` is still known.
+      const reason = err instanceof Error && err.message ? err.message : "download failed";
+      this.emitTrackError(item, reason);
       await this.queue.discardCurrent();
+      // Back off before walking to the next candidate so a mass-failure (whole-feed outage) is a
+      // slow retry, not a tight burst of yt-dlp spawns + related() fetches. Delay grows with the
+      // consecutive-failure streak up to a cap; a successful load resets the streak to 0.
+      this.downloadFailStreak += 1;
+      // The FIRST failure advances immediately (an isolated bad track shouldn't add latency);
+      // only a RUN of consecutive failures (a whole-feed outage) backs off, doubling up to a cap,
+      // so a mass failure degrades into a slow retry instead of a thundering burst of yt-dlp spawns.
+      const backoff =
+        this.downloadFailStreak <= 1
+          ? 0
+          : Math.min(
+              StationController.DOWNLOAD_FAIL_BACKOFF_CAP_MS,
+              StationController.DOWNLOAD_FAIL_BACKOFF_BASE_MS * 2 ** (this.downloadFailStreak - 2),
+            );
+      await this.delay(backoff);
       await this.playNextLocked();
       return;
     }
-    this.deps.pin?.(item.meta.videoId, path);
+    this._loading = false;
+    // Forward the real audio format so /audio/:id can serve playable opus/webm/m4a as-is (not
+    // transcode) and the NowPlaying format badge can render. Pin under the same audio so the
+    // cache carries it too.
+    this.queue.setCurrentAudio(item.meta.videoId, audio);
+    // Release the PREVIOUS track's pin before pinning the new one, so pins don't accumulate
+    // without bound and defeat LRU eviction (spec: the cache honors CACHE_MAX_MB; a station that
+    // plays forever must not pin every track it ever played). The unpin dep also releases the
+    // derived `${videoId}.m4a` transcode key (see src/index.ts wiring). Skip when the same
+    // videoId is re-pinned (repeat="one") so we never unpin the track we are about to pin.
+    if (this.pinnedVideoId && this.pinnedVideoId !== item.meta.videoId) {
+      this.deps.unpin?.(this.pinnedVideoId);
+    }
+    this.deps.pin?.(item.meta.videoId, path, audio);
+    this.pinnedVideoId = item.meta.videoId;
     this.setPreparing(null);
     this.playGeneration += 1; // fresh live track → re-arm the advance guard
-    this._paused = false;
+    this.liveItemId = item.id;
     this._dryHeld = false;
-    this.markTrackStarted(startMs);
-    this.sink.play({ audioUrl: `/audio/${item.meta.videoId}`, startMs });
+    // A track is live again: cancel any pending dry-hold radio retry and reset its backoff so a
+    // future drain starts fresh from the base delay. Also reset the download-failure streak.
+    this.cancelRadioRetry();
+    this.radioRetryAttempt = 0;
+    this.downloadFailStreak = 0;
+    // A concurrent seek during the (awaited) download re-anchored the position; honor it over the
+    // original startMs so the user's seek is not clobbered when the load completes.
+    const effectiveStartMs = this.pendingSeekMs ?? startMs;
+    this.pendingSeekMs = null;
+    // A pause() issued WHILE this track was still downloading must survive: prepare/anchor the
+    // audio but load it PAUSED (no play, keep _paused=true) so playback doesn't start behind the
+    // user's back. Otherwise this is an intentional (re)start — clear _paused and play. Note we
+    // key off _pausedDuringLoad, NOT the plain _paused flag: a dry-hold sets _paused=true too, and
+    // an intentional restart out of dry-hold must resume playback.
+    if (this._pausedDuringLoad) {
+      this._paused = true;
+      this._pausedDuringLoad = false;
+      this.markTrackStarted(effectiveStartMs, true);
+      this.sink.load({ audioUrl: `/audio/${item.meta.videoId}`, startMs: effectiveStartMs });
+    } else {
+      this._paused = false;
+      this.markTrackStarted(effectiveStartMs);
+      this.sink.play({ audioUrl: `/audio/${item.meta.videoId}`, startMs: effectiveStartMs });
+    }
     this.emit("changed");
   }
 
   skip(): void {
-    const gen = this.playGeneration;
+    // Explicit user action: do NOT gate on the trackEnd/error generation guard. That guard exists
+    // to de-dup stale end/error signals; applying it here would drop a Skip pressed during a load
+    // window (loadCurrentLocked bumps the generation on completion, so the captured gen would be
+    // stale by the time this closure runs). The lock serializes us, so we always act on the live
+    // state; bump the generation ourselves so any in-flight/late end signal for the skipped track
+    // can't also advance.
     void this.lock.runExclusive(async () => {
-      if (gen !== this.playGeneration) return;
       this.playGeneration += 1;
       this._dryHeld = false;
       await this.queue.advance();
@@ -286,6 +498,10 @@ export class StationController extends EventEmitter {
   pause(): void {
     this._paused = true;
     this._dryHeld = false; // a manual pause is deliberate; it is not the dry-queue hold
+    // If a load is in flight, record that the pause happened DURING it so loadCurrentLocked lands
+    // the track PAUSED instead of auto-playing over the user's pause when the download completes.
+    if (this._loading) this._pausedDuringLoad = true;
+    this.cancelRadioRetry(); // a deliberate stop cancels the auto-resume retry
     this.freezePosition();
     this.sink?.pause();
     this.emit("changed");
@@ -294,9 +510,9 @@ export class StationController extends EventEmitter {
     // When holding paused on a dry queue, resume() restarts the station: advance past the
     // finished (held) track into whatever is now queued / radio (spec §3/§4 never-stops).
     if (this._dryHeld && this.sink) {
-      const gen = this.playGeneration;
+      // Explicit user action: no generation gate (see skip()). The lock serializes us; bump the
+      // generation so a stale end/error can't also fire.
       void this.lock.runExclusive(async () => {
-        if (gen !== this.playGeneration) return;
         this.playGeneration += 1;
         await this.startNextLocked();
       });
@@ -317,6 +533,10 @@ export class StationController extends EventEmitter {
     if (!Number.isFinite(positionMs) || positionMs < 0 || (max > 0 && positionMs > max)) {
       throw new RangeError("positionMs out of range");
     }
+    // A seek issued while the track is still downloading is remembered and applied when the load
+    // completes (loadCurrentLocked reads pendingSeekMs), so the in-flight load's original startMs
+    // does not clobber it.
+    if (this._loading) this.pendingSeekMs = positionMs;
     this.markTrackStarted(positionMs, this._paused);
     this.sink?.seek(positionMs);
     this.emit("changed");
@@ -347,9 +567,9 @@ export class StationController extends EventEmitter {
     if (idx === -1) return false;
     // Move the target to the head, then advance into it.
     await this.queue.reorder(itemId, 0);
-    const gen = this.playGeneration;
+    // Explicit user action: no generation gate (see skip()). Otherwise a Jump pressed during a
+    // load window would reorder the item to the head yet never force-play it.
     await this.lock.runExclusive(async () => {
-      if (gen !== this.playGeneration) return;
       this.playGeneration += 1;
       this._dryHeld = false;
       await this.queue.advance();
@@ -422,6 +642,15 @@ export class StationController extends EventEmitter {
     this.upcomingRadio = Array.isArray(file.upcomingRadio)
       ? file.upcomingRadio.filter((i) => StationController.isValidQueueItem(i))
       : [];
+    // Restore the persisted history so the History panel is not empty after a restart. The
+    // snapshot faithfully saves history, but the queue's `_history` ring starts empty and only
+    // advance() appends to it — without this the whole pre-restart history is silently lost.
+    // Per-item validated with the same guard as the explicit queue below.
+    if (Array.isArray(file.history)) {
+      await this.queue.restoreHistory(
+        file.history.filter((i) => StationController.isValidQueueItem(i)),
+      );
+    }
     const items: QueueItem[] = [
       ...(file.current ? [file.current] : []),
       ...(Array.isArray(file.queue) ? file.queue : []),

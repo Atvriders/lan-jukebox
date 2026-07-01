@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { loadConfig, loadWebConfig, loadMediaConfig, loadStationConfig } from "./config.js";
+import {
+  loadConfig,
+  loadWebConfig,
+  loadMediaConfig,
+  loadStationConfig,
+  intEnv,
+  strEnv,
+} from "./config.js";
 
 const SECRET = "x".repeat(32);
 const base = {
@@ -48,6 +55,10 @@ describe("loadMediaConfig", () => {
   it("treats MAX_TRACK_DURATION_SEC=0 as no ceiling (null)", () => {
     expect(loadMediaConfig({ MAX_TRACK_DURATION_SEC: "0" }).maxTrackDurationSec).toBeNull();
   });
+  it("loads historyMaxItems from HISTORY_MAX_ITEMS (default 100) so it can be wired to the Queue", () => {
+    expect(loadMediaConfig({}).historyMaxItems).toBe(100);
+    expect(loadMediaConfig({ HISTORY_MAX_ITEMS: "500" }).historyMaxItems).toBe(500);
+  });
 });
 
 describe("loadStationConfig (station never auto-stops — no auto-stop field)", () => {
@@ -59,6 +70,31 @@ describe("loadStationConfig (station never auto-stops — no auto-stop field)", 
     // Regression guard: the station runs forever, so no auto-stop key may exist.
     const autoStopKey = ["idle", "Timeout", "Ms"].join("");
     expect(Object.keys(s)).not.toContain(autoStopKey);
+  });
+});
+
+describe("intEnv / strEnv treat whitespace-only values as unset (not 0 / not a real value)", () => {
+  // Regression: intEnv only short-circuited on raw === undefined || "". A whitespace-only
+  // value (a stray tab/newline from docker-compose/CI) slipped through, and Number("  ")
+  // === 0 passed the finite/integer checks — silently returning 0 (disabling prefetch, or
+  // throwing a misleading ">= 1" for min>=1 fields). strEnv had the same gap. Both now trim.
+  it("intEnv returns the fallback for a whitespace-only value instead of 0", () => {
+    expect(intEnv({ PREFETCH_DEPTH: "  " }, "PREFETCH_DEPTH", 1, { min: 0 })).toBe(1);
+    expect(intEnv({ PREFETCH_DEPTH: "\t\n" }, "PREFETCH_DEPTH", 3, { min: 0 })).toBe(3);
+  });
+  it("intEnv does NOT throw a misleading '>= 1' for a whitespace-only min>=1 field", () => {
+    expect(() => intEnv({ CACHE_MAX_MB: "  " }, "CACHE_MAX_MB", 2048, { min: 1 })).not.toThrow();
+    expect(intEnv({ CACHE_MAX_MB: "  " }, "CACHE_MAX_MB", 2048, { min: 1 })).toBe(2048);
+  });
+  it("intEnv still trims a real numeric value with surrounding whitespace", () => {
+    expect(intEnv({ PORT: " 9000 " }, "PORT", 8080)).toBe(9000);
+  });
+  it("strEnv returns null for a whitespace-only value instead of the raw whitespace", () => {
+    expect(strEnv({ YT_PROXY: "  " }, "YT_PROXY")).toBeNull();
+    expect(strEnv({ YT_PROXY: "\t" }, "YT_PROXY")).toBeNull();
+  });
+  it("prefetchDepth falls back to 1 (not 0) when PREFETCH_DEPTH is whitespace-only", () => {
+    expect(loadStationConfig({ PREFETCH_DEPTH: "  " }).prefetchDepth).toBe(1);
   });
 });
 

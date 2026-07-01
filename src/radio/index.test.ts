@@ -20,16 +20,24 @@ function fakeStation(
   snap: { current: QueueItem | null; upcoming: QueueItem[]; history: QueueItem[] },
 ) {
   const enqueued: TrackMeta[] = [];
+  const upcomingRadio: QueueItem[][] = [];
   return {
     station: {
       seed,
       queue: { snapshot: () => snap },
       enqueue: vi.fn(async (m: TrackMeta) => {
         enqueued.push(m);
+        // Mirror the real Queue.add: radio adds land in `upcoming` tagged fromRadio, so
+        // publishPreview() can mirror them into the upcoming-radio preview.
+        snap.upcoming.push({ ...item(m.videoId), fromRadio: true });
         return item(m.videoId);
+      }),
+      setUpcomingRadio: vi.fn((items: QueueItem[]) => {
+        upcomingRadio.push(items);
       }),
     },
     enqueued,
+    upcomingRadio,
   };
 }
 const radioSettings = () => ({ autoplay: true, autoplaySource: "radio" as AutoplaySource });
@@ -204,6 +212,7 @@ describe("RadioEngine", () => {
         snap.upcoming.push(item(m.videoId));
         return item(m.videoId);
       }),
+      setUpcomingRadio: vi.fn(),
     };
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
@@ -225,6 +234,7 @@ describe("RadioEngine", () => {
       seed: meta("aaaaaaaaaaa"),
       queue: { snapshot: () => snap },
       enqueue: vi.fn(async (m: TrackMeta) => item(m.videoId)),
+      setUpcomingRadio: vi.fn(),
     };
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
@@ -233,5 +243,59 @@ describe("RadioEngine", () => {
     });
     await expect(r.ensureAhead(2)).resolves.toBeUndefined();
     expect(station.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("publishes the radio-tagged upcoming items to the upcoming-radio preview after enqueuing", async () => {
+    // Finding: setUpcomingRadio had ZERO production callers, so the UI upcoming-radio preview was
+    // permanently empty. ensureAhead must mirror its radio-tagged picks into the preview.
+    const related = vi.fn(async () => [meta("sssssssssss"), meta("ttttttttttt")]);
+    const snap = {
+      current: item("aaaaaaaaaaa"),
+      upcoming: [] as QueueItem[],
+      history: [] as QueueItem[],
+    };
+    const preview: QueueItem[][] = [];
+    const station = {
+      seed: meta("aaaaaaaaaaa"),
+      queue: { snapshot: () => snap },
+      enqueue: vi.fn(async (m: TrackMeta) => {
+        // Real Queue tags radio adds fromRadio:true in `upcoming`.
+        snap.upcoming.push({ ...item(m.videoId), fromRadio: true });
+        return item(m.videoId);
+      }),
+      setUpcomingRadio: vi.fn((items: QueueItem[]) => preview.push(items)),
+    };
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      settings: radioSettings,
+    });
+    await r.ensureAhead(2);
+    expect(station.setUpcomingRadio).toHaveBeenCalled();
+    // The last publish reflects the two radio-tagged picks now in `upcoming`.
+    expect(preview.at(-1)?.map((i) => i.meta.videoId)).toEqual(["sssssssssss", "ttttttttttt"]);
+  });
+
+  it("does NOT publish the preview when nothing was enqueued (avoids infinite changed→topUp loop)", async () => {
+    const related = vi.fn(async () => [] as TrackMeta[]);
+    const snap = {
+      current: item("aaaaaaaaaaa"),
+      upcoming: [item("bbbbbbbbbbb")], // already at lowWater
+      history: [] as QueueItem[],
+    };
+    const station = {
+      seed: meta("aaaaaaaaaaa"),
+      queue: { snapshot: () => snap },
+      enqueue: vi.fn(),
+      setUpcomingRadio: vi.fn(),
+    };
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      settings: radioSettings,
+    });
+    await r.ensureAhead(1);
+    expect(station.enqueue).not.toHaveBeenCalled();
+    expect(station.setUpcomingRadio).not.toHaveBeenCalled();
   });
 });

@@ -80,6 +80,25 @@ describe("runYtDlp", () => {
     await expect(p).rejects.toThrow(/EPIPE/);
   });
 
+  it("SIGKILLs the child when child.stdout emits 'error' (no orphaned process leak)", async () => {
+    // Regression: the stdout 'error' handler clears the timeout timer — the ONLY future
+    // SIGKILL for the child. If a read error (EPIPE/ECONNRESET on the pipe) fires while
+    // yt-dlp is still alive, without an explicit kill here the process is orphaned forever
+    // (leaking a live child per occurrence on a station that runs indefinitely). The handler
+    // must force-kill BEFORE rejecting so no error branch leaves a running child with no kill.
+    const proc = new EventEmitter() as FakeProc;
+    proc.stdout = new Readable({ read() {} }); // never ends, never 'close' — only the error path settles
+    proc.stderr = new Readable({ read() {} });
+    proc.kill = vi.fn();
+    spawnMock.mockReturnValue(proc);
+
+    const p = runYtDlp(["-J"], 1000);
+    queueMicrotask(() => proc.stdout.emit("error", new Error("EPIPE")));
+    await expect(p).rejects.toThrow(/EPIPE/);
+    // SIGKILL is unignorable; a regression to no kill (or SIGTERM) would leave the child alive.
+    expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
   it("does not crash when child.stderr emits 'error' (stderr error is swallowed)", async () => {
     // A read error on the diagnostic stderr stream must not crash the process. With an
     // 'error' listener attached it is swallowed; the run still resolves when 'close' fires.

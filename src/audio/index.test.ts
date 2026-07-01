@@ -4,8 +4,13 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import cookie from "@fastify/cookie";
+import session from "@fastify/session";
 import { AudioCache } from "../cache/index.js";
 import { Semaphore } from "../util/semaphore.js";
+import { MemorySessionStore } from "../auth/session-store.js";
+import { registerAuthRoutes } from "../auth/password.js";
+import type { WebConfig } from "../config.js";
 
 vi.mock("./format.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./format.js")>();
@@ -68,6 +73,20 @@ describe("parseRange", () => {
   });
 });
 
+// Minimal WebConfig for the session/auth plugins the /audio route now depends on.
+const TEST_CFG: WebConfig = {
+  publicBaseUrl: "https://j",
+  viewerPassword: "letmein",
+  allowNoPassword: false,
+  sessionSecret: "x".repeat(32),
+  port: 8080,
+  host: "0.0.0.0",
+  trustProxy: true,
+  allowedWsOrigins: ["https://j"],
+  nodeEnv: "test",
+  secureCookies: false,
+};
+
 describe("GET /audio/:trackId", () => {
   let dir: string;
   let app: FastifyInstance;
@@ -87,14 +106,48 @@ describe("GET /audio/:trackId", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  function build(youtube: { download: ReturnType<typeof vi.fn> }) {
+  // Register the real cookie/session/auth plumbing so the /audio route's requireSession gate
+  // can be exercised end-to-end (login via /api/login, then serve with the sid cookie). After
+  // building we log in and patch app.inject so every existing test's request carries the auth
+  // cookie by default — the sid cookie is same-origin, exactly as the Player's <audio> element
+  // sends it. `rawInject` (the un-patched original) is kept for the unauthenticated 401 test.
+  let rawInject!: FastifyInstance["inject"];
+  async function build(youtube: { download: ReturnType<typeof vi.fn> }) {
     app = Fastify();
+    await app.register(cookie);
+    await app.register(session, {
+      secret: TEST_CFG.sessionSecret,
+      cookieName: "sid",
+      store: new MemorySessionStore({ sweepMs: 0 }) as never,
+      saveUninitialized: false,
+      rolling: true,
+      cookie: { path: "/", httpOnly: true, secure: false, sameSite: "lax", maxAge: 1000 },
+    });
+    registerAuthRoutes(app, TEST_CFG);
     registerAudioRoute(app, {
       cache,
       youtube: youtube as never,
       cacheDir: dir,
       downloads: new Semaphore(2),
     });
+
+    rawInject = app.inject.bind(app);
+    const loginRes = await rawInject({
+      method: "POST",
+      url: "/api/login",
+      payload: { password: TEST_CFG.viewerPassword, displayName: "Ada", deviceId: "dev-1" },
+    });
+    const set = loginRes.headers["set-cookie"];
+    const raw = Array.isArray(set) ? (set[0] as string) : (set as string);
+    const authCookie = raw.split(";")[0]!;
+
+    // Auto-attach the auth cookie to every inject unless the caller already set one.
+    app.inject = ((opts: unknown) => {
+      const o = (opts ?? {}) as { headers?: Record<string, unknown> };
+      const headers = { ...(o.headers ?? {}) };
+      if (!("cookie" in headers)) headers.cookie = authCookie;
+      return rawInject({ ...(o as object), headers } as never);
+    }) as FastifyInstance["inject"];
     return app;
   }
 
@@ -106,7 +159,7 @@ describe("GET /audio/:trackId", () => {
 
   it("404s when trackId is not a valid YouTube id (download never attempted)", async () => {
     const download = vi.fn();
-    build({ download });
+    await build({ download });
     const res = await app.inject({ method: "GET", url: "/audio/not-an-id" });
     expect(res.statusCode).toBe(404);
     expect(download).not.toHaveBeenCalled();
@@ -114,7 +167,7 @@ describe("GET /audio/:trackId", () => {
 
   it("404s when the track cannot be downloaded (download throws)", async () => {
     const download = vi.fn().mockRejectedValue(new Error("unavailable"));
-    build({ download });
+    await build({ download });
     const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
     expect(res.statusCode).toBe(404);
     expect(download).toHaveBeenCalledTimes(1);
@@ -124,7 +177,7 @@ describe("GET /audio/:trackId", () => {
     const body = Buffer.from("0123456789abcdef"); // 16 bytes
     await seedCached(ID, "webm", body);
     const download = vi.fn(); // must NOT be called — already cached
-    build({ download });
+    await build({ download });
 
     const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
     expect(res.statusCode).toBe(200);
@@ -138,7 +191,7 @@ describe("GET /audio/:trackId", () => {
   it("serves a partial body (206) with Content-Range for a Range request", async () => {
     const body = Buffer.from("0123456789abcdef"); // 16 bytes
     await seedCached(ID, "webm", body);
-    build({ download: vi.fn() });
+    await build({ download: vi.fn() });
 
     const res = await app.inject({
       method: "GET",
@@ -157,7 +210,7 @@ describe("GET /audio/:trackId", () => {
     // ignored and the full representation is returned with 200 — never a hard 416 failure.
     const body = Buffer.from("0123456789abcdef"); // 16 bytes
     await seedCached(ID, "webm", body);
-    build({ download: vi.fn() });
+    await build({ download: vi.fn() });
 
     const res = await app.inject({
       method: "GET",
@@ -173,7 +226,7 @@ describe("GET /audio/:trackId", () => {
   it("ignores a multi-range request and serves the full body (200), not 416", async () => {
     const body = Buffer.from("0123456789abcdef"); // 16 bytes
     await seedCached(ID, "webm", body);
-    build({ download: vi.fn() });
+    await build({ download: vi.fn() });
 
     const res = await app.inject({
       method: "GET",
@@ -189,7 +242,7 @@ describe("GET /audio/:trackId", () => {
   it("416s with Content-Range bytes */size on an unsatisfiable range", async () => {
     const body = Buffer.from("0123456789abcdef"); // 16 bytes
     await seedCached(ID, "webm", body);
-    build({ download: vi.fn() });
+    await build({ download: vi.fn() });
 
     const res = await app.inject({
       method: "GET",
@@ -208,7 +261,7 @@ describe("GET /audio/:trackId", () => {
       await writeFile(p, body);
       return { path: p, audio: { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 } };
     });
-    build({ download });
+    await build({ download });
 
     expect(cache.has(ID)).toBe(false);
     const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
@@ -216,7 +269,10 @@ describe("GET /audio/:trackId", () => {
     expect(res.headers["content-type"]).toBe("audio/webm");
     expect(res.rawPayload.equals(body)).toBe(true);
     expect(download).toHaveBeenCalledTimes(1);
-    expect(download).toHaveBeenCalledWith(ID, dir);
+    // resolveFile threads the resolved durationSec into download() as a third options arg.
+    // This bare youtube stub has no resolve(), so that lookup is caught and durationSec is
+    // undefined — download is still invoked with (id, dir, { durationSec: undefined }).
+    expect(download).toHaveBeenCalledWith(ID, dir, { durationSec: undefined });
     // registered + pinned: a second request must NOT re-download.
     expect(cache.has(ID)).toBe(true);
     const res2 = await app.inject({ method: "GET", url: `/audio/${ID}` });
@@ -224,11 +280,54 @@ describe("GET /audio/:trackId", () => {
     expect(download).toHaveBeenCalledTimes(1);
   });
 
+  it("threads the resolved durationSec into download() so the yt-dlp timeout can auto-scale", async () => {
+    // Regression: the /audio route called youtube.download(id, dir) with NO opts, so
+    // scaleDownloadTimeout could never scale and a long track was SIGKILLed at the short
+    // default. The route now resolves the track first and forwards its durationSec.
+    const body = Buffer.from("long-mix-bytes");
+    const download = vi.fn(async (videoId: string, outDir: string) => {
+      const p = join(outDir, `${videoId}.webm`);
+      await writeFile(p, body);
+      return { path: p, audio: { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 } };
+    });
+    const resolve = vi.fn(async (videoId: string) => ({
+      videoId,
+      title: "Long Mix",
+      channel: "c",
+      durationSec: 5400, // a ~90-min mix
+      isLive: false,
+      thumbnailUrl: null,
+    }));
+    // build()'s param is typed { download }, but the route uses resolve too — pass both.
+    await build({ download, resolve } as never);
+
+    const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
+    expect(res.statusCode).toBe(200);
+    expect(resolve).toHaveBeenCalledWith(ID);
+    expect(download).toHaveBeenCalledWith(ID, dir, { durationSec: 5400 });
+  });
+
+  it("falls back to an unscaled download (durationSec undefined) when resolve() fails", async () => {
+    // A resolve failure must NOT 404 the request — the route downloads unscaled instead.
+    const body = Buffer.from("bytes");
+    const download = vi.fn(async (videoId: string, outDir: string) => {
+      const p = join(outDir, `${videoId}.webm`);
+      await writeFile(p, body);
+      return { path: p, audio: { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 } };
+    });
+    const resolve = vi.fn().mockRejectedValue(new Error("unavailable"));
+    await build({ download, resolve } as never);
+
+    const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
+    expect(res.statusCode).toBe(200);
+    expect(download).toHaveBeenCalledWith(ID, dir, { durationSec: undefined });
+  });
+
   it("transcodes a non-playable source and serves it as audio/mp4", async () => {
     const body = Buffer.from("fake-mp3-bytes");
     // mp3 codec in an mp3 container -> chooseDelivery returns needsTranscode:true
     await seedCached(ID, "mp3", body, "mp3");
-    build({ download: vi.fn() });
+    await build({ download: vi.fn() });
 
     const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
     expect(res.statusCode).toBe(200);
@@ -250,10 +349,47 @@ describe("GET /audio/:trackId", () => {
     expect((transcodeToM4a as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
   });
 
+  it("single-flights the transcode: concurrent requests for a cached-but-untranscoded id spawn ONE ffmpeg", async () => {
+    // Regression: the fast path (cached SOURCE) returned before the download single-flight lock,
+    // so two concurrent requests both reached the transcode block, both saw cache.get(m4aKey)
+    // null, and both spawned ffmpeg writing the SAME destPath — corrupting it. The transcode leg
+    // must now coalesce on the m4a key so only one ffmpeg runs.
+    const body = Buffer.from("fake-mp3-bytes");
+    await seedCached(ID, "mp3", body, "mp3"); // cached source that needs transcoding
+    await build({ download: vi.fn() });
+
+    const { transcodeToM4a } = await import("./format.js");
+    (transcodeToM4a as ReturnType<typeof vi.fn>).mockClear(); // count only THIS test's calls
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    (transcodeToM4a as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      async (src: string, dest: string) => {
+        await gate; // hold both callers past the cache-miss + coalesce gate
+        const { copyFile } = await import("node:fs/promises");
+        await copyFile(src, dest);
+      },
+    );
+
+    const r1 = app.inject({ method: "GET", url: `/audio/${ID}` });
+    const r2 = app.inject({ method: "GET", url: `/audio/${ID}` });
+    await new Promise((r) => setImmediate(r));
+    release();
+    const [res1, res2] = await Promise.all([r1, r2]);
+
+    expect(res1.statusCode).toBe(200);
+    expect(res2.statusCode).toBe(200);
+    expect(res1.headers["content-type"]).toBe("audio/mp4");
+    expect(res2.headers["content-type"]).toBe("audio/mp4");
+    // The transcode single-flight collapsed the duplicate ffmpeg.
+    expect((transcodeToM4a as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+  });
+
   it("removes the partial .transcoded.m4a and 404s when the transcode fails", async () => {
     const body = Buffer.from("fake-mp3-bytes");
     await seedCached(ID, "mp3", body, "mp3");
-    build({ download: vi.fn() });
+    await build({ download: vi.fn() });
 
     const destPath = join(dir, `${ID}.transcoded.m4a`);
     const { transcodeToM4a } = await import("./format.js");
@@ -284,7 +420,7 @@ describe("GET /audio/:trackId", () => {
       await writeFile(p, body);
       return { path: p, audio: { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 } };
     });
-    build({ download });
+    await build({ download });
 
     const r1 = app.inject({ method: "GET", url: `/audio/${ID}` });
     const r2 = app.inject({ method: "GET", url: `/audio/${ID}` });
@@ -299,5 +435,32 @@ describe("GET /audio/:trackId", () => {
     expect(res2.rawPayload.equals(body)).toBe(true);
     // The single-flight guard collapsed the duplicate download.
     expect(download).toHaveBeenCalledTimes(1);
+  });
+
+  // Regression: the /audio route must be gated on the shared-password session exactly like the
+  // /api routes. An unauthenticated caller must get 401 and never reach the id-format check,
+  // ensureFile(), or youtube.download() — closing the content-bypass + unauthenticated
+  // resource-abuse gap. A logged-in caller (sid cookie, as the same-origin <audio> sends it)
+  // still gets served.
+  it("401s an unauthenticated request BEFORE any id check or download", async () => {
+    const body = Buffer.from("0123456789abcdef");
+    await seedCached(ID, "webm", body);
+    const download = vi.fn();
+    await build({ download });
+
+    // rawInject bypasses the auto-cookie wrapper -> genuinely anonymous request.
+    const res = await rawInject({ method: "GET", url: `/audio/${ID}` });
+    expect(res.statusCode).toBe(401);
+    expect(download).not.toHaveBeenCalled();
+
+    // An invalid id while unauthenticated must ALSO 401 (auth checked before VIDEO_ID_RE),
+    // never leaking the 404 that would reveal the id-format check ran.
+    const bad = await rawInject({ method: "GET", url: "/audio/not-an-id" });
+    expect(bad.statusCode).toBe(401);
+
+    // The same cached track IS served once authenticated (app.inject auto-attaches the cookie).
+    const ok = await app.inject({ method: "GET", url: `/audio/${ID}` });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.rawPayload.equals(body)).toBe(true);
   });
 });

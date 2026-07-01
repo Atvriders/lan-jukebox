@@ -17,7 +17,11 @@ function useDisplayedMs(
     const iv = setInterval(() => tick((n) => n + 1), 500);
     return () => clearInterval(iv);
   }, [paused, receivedAt]);
-  const raw = paused ? positionMs : positionMs + (Date.now() - receivedAt);
+  // receivedAt<=0 means "no real timestamp yet" (the REST-seeded first render before any
+  // WS 'state' frame). Extrapolating against it would be Date.now() - 0 ≈ epoch-scale ms,
+  // pinning a playing bar to 100%. Treat it as no extrapolation until a real frame arrives.
+  const base = receivedAt > 0 ? Date.now() - receivedAt : 0;
+  const raw = paused ? positionMs : positionMs + base;
   const upper = durationMs > 0 ? durationMs : Infinity;
   return Math.max(0, Math.min(raw, upper));
 }

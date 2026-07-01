@@ -56,7 +56,9 @@ describe("usePlayerRole", () => {
     expect(el.volume).toBeCloseTo(0.5);
     expect(result.current.volume).toBe(50);
   });
-  it("clamps setVolume above 100% to 1.0 on the element but keeps the pct for the UI", () => {
+  it("keeps the element at max for >100% and reports the pct (no Web Audio available)", () => {
+    // With no AudioContext (jsdom default), boost can't amplify; the element is pinned to
+    // max (1.0) rather than left silent, and the UI still reflects the requested pct.
     const ws = makeWs();
     const { result } = renderHook(() => usePlayerRole(ws as unknown as WebSocket, true));
     const el = document.createElement("audio");
@@ -66,6 +68,78 @@ describe("usePlayerRole", () => {
     act(() => ws.fireMessage(JSON.stringify({ type: "setVolume", pct: 150 })));
     expect(el.volume).toBe(1);
     expect(result.current.volume).toBe(150);
+  });
+  it("amplifies above 100% through a Web Audio GainNode (gain = pct/100) when available", () => {
+    // Regression: the 100..200% half of the slider must actually boost, not be a silent
+    // no-op. element.volume is spec-capped at 1.0, so >100% is carried by a GainNode.
+    const gain = { gain: { value: 1 }, connect: vi.fn() };
+    const source = { connect: vi.fn() };
+    const ctx = {
+      createMediaElementSource: vi.fn(() => source),
+      createGain: vi.fn(() => gain),
+      destination: {},
+      resume: vi.fn(),
+      close: vi.fn(),
+    };
+    class AudioCtx {
+      createMediaElementSource = ctx.createMediaElementSource;
+      createGain = ctx.createGain;
+      destination = ctx.destination;
+      resume = ctx.resume;
+      close = ctx.close;
+    }
+    vi.stubGlobal("AudioContext", AudioCtx);
+    try {
+      const ws = makeWs();
+      const { result } = renderHook(() => usePlayerRole(ws as unknown as WebSocket, true));
+      const el = document.createElement("audio");
+      act(() => {
+        (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current = el;
+      });
+      act(() => ws.fireMessage(JSON.stringify({ type: "setVolume", pct: 200 })));
+      // Element is pinned at unity; the GainNode carries the 2.0x boost.
+      expect(el.volume).toBe(1);
+      expect(gain.gain.value).toBe(2);
+      // Graph is wired: source → gain → destination.
+      expect(source.connect).toHaveBeenCalledWith(gain);
+      expect(gain.connect).toHaveBeenCalledWith(ctx.destination);
+      expect(result.current.volume).toBe(200);
+      // Dropping back to <=100% must relax the gain to unity so it stops amplifying.
+      act(() => ws.fireMessage(JSON.stringify({ type: "setVolume", pct: 40 })));
+      expect(el.volume).toBeCloseTo(0.4);
+      expect(gain.gain.value).toBe(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+  it("re-sends becomePlayer when a CONNECTING socket later opens (reconnect survival)", () => {
+    // Regression: on a WS reconnect the socket is exposed while still CONNECTING; send()
+    // only transmits over an OPEN socket, so an immediate becomePlayer would be dropped and
+    // never retried — the remembered speaker would silently lose the Player role. The hook
+    // must announce once the socket actually fires 'open'.
+    const listeners: Record<string, ((e: unknown) => void)[]> = {};
+    const ws = {
+      OPEN: 1,
+      readyState: 0, // CONNECTING
+      sent: [] as string[],
+      send(d: string) {
+        this.sent.push(d);
+      },
+      addEventListener(t: string, fn: (e: unknown) => void) {
+        (listeners[t] ??= []).push(fn);
+      },
+      removeEventListener() {},
+      fireOpen() {
+        this.readyState = 1;
+        (listeners.open ?? []).forEach((fn) => fn({}));
+      },
+    };
+    renderHook(() => usePlayerRole(ws as unknown as WebSocket, true));
+    // Nothing sent yet: the socket was CONNECTING when the effect ran.
+    expect(ws.sent.map((m) => JSON.parse(m).type)).not.toContain("becomePlayer");
+    // Socket opens → the deferred announcement fires.
+    act(() => ws.fireOpen());
+    expect(ws.sent.map((m) => JSON.parse(m).type)).toContain("becomePlayer");
   });
   it("reports trackEnded on the audio 'ended' event", () => {
     const ws = makeWs();

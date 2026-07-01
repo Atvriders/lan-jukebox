@@ -76,6 +76,7 @@ function fakeRegistry() {
   // REST /api/speaker reaches only the sink-free actions; claim is WS-only (needs a socket sink).
   return {
     activePlayerDeviceId: null as string | null,
+    activePlayerLabel: null as string | null,
     isSpeaker: vi.fn((d: string) => d === "dev-1"),
     release: vi.fn(() => ({ activePlayerDeviceId: null })),
     remember: vi.fn((d: string) => ({ activePlayerDeviceId: d })),
@@ -143,6 +144,21 @@ describe("GET /api/state", () => {
     expect(body.seed).toBeNull();
     expect(body.isThisDeviceSpeaker).toBe(true);
     expect(registry.isSpeaker).toHaveBeenCalledWith("dev-1");
+    await app.close();
+  });
+
+  it("fills player-presence from the registry, overriding the orchestrator's false/null defaults", async () => {
+    // Finding: /api/state spread the snapshot (present:false, label:null) and never filled these,
+    // so the header speaker indicator was dead. The registry values must win.
+    const registry = fakeRegistry();
+    registry.activePlayerDeviceId = "dev-1";
+    registry.activePlayerLabel = "Living Room";
+    const { app } = await build({ registry: registry as never });
+    const c = await login(app);
+    const res = await app.inject({ method: "GET", url: "/api/state", headers: { cookie: c } });
+    const body = res.json();
+    expect(body.activePlayerPresent).toBe(true);
+    expect(body.activePlayerLabel).toBe("Living Room");
     await app.close();
   });
 });
@@ -480,6 +496,59 @@ describe("GET /api/lyrics", () => {
     expect(res.statusCode).toBe(200);
     expect(res.json().lyrics).toBe("la la");
     expect(lyrics).toHaveBeenCalledWith(expect.objectContaining({ videoId: "vvvvvvvvvvv" }));
+    await app.close();
+  });
+
+  it("honors the client-supplied trackId over snapshot().current (no wrong-track lyrics on a race)", async () => {
+    // Regression: the handler ignored req.query.trackId and always used snapshot().current, so a
+    // track advancing between the client's fetch decision and the server handling it returned the
+    // NEW current's lyrics for the OLD trackId. The requested id (resolvable via youtube.resolve
+    // when not in the snapshot) must win.
+    const station = fakeStation();
+    station.snapshot.mockReturnValue({
+      repeat: "off",
+      autoplay: true,
+      autoplaySource: "radio",
+      volume: 100,
+      maxTrackDurationSec: 0,
+      // current has ALREADY advanced to a different track than the one the client asked about.
+      current: {
+        id: "y",
+        meta: meta("nnnnnnnnnnn", "New Song"),
+        requester: { deviceId: "d", displayName: "n", source: "user" },
+        addedAt: 0,
+        audio: null,
+        fromRadio: false,
+        positionMs: 0,
+        durationMs: 1000,
+      },
+      upcoming: [],
+      upcomingRadio: [],
+      history: [],
+      seed: null,
+      paused: false,
+      preparing: null,
+      activePlayerPresent: true,
+      activePlayerLabel: "PC",
+    } as never);
+    // youtube.resolve returns metadata for the requested id (not in the snapshot).
+    const youtube = { resolve: vi.fn(async (id: string) => meta(id, "Requested Song")) };
+    const lyrics = vi.fn(async (m: { videoId: string }) => ({
+      lyrics: `lyrics for ${m.videoId}`,
+      source: "lyrics.ovh",
+    }));
+    const { app } = await build({ station, youtube, lyrics } as never);
+    const c = await login(app);
+    const res = await app.inject({
+      method: "GET",
+      url: "/api/lyrics?trackId=ooooooooooo", // the OLD track the client is still displaying
+      headers: { cookie: c },
+    });
+    expect(res.statusCode).toBe(200);
+    // Lyrics correspond to the REQUESTED id, not the (already-advanced) current track.
+    expect(lyrics).toHaveBeenCalledWith(expect.objectContaining({ videoId: "ooooooooooo" }));
+    expect(lyrics).not.toHaveBeenCalledWith(expect.objectContaining({ videoId: "nnnnnnnnnnn" }));
+    expect(res.json().lyrics).toBe("lyrics for ooooooooooo");
     await app.close();
   });
 });

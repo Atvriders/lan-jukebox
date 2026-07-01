@@ -1,10 +1,11 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StationSnapshot } from "../types/index.js";
-import { readDeviceRegistry } from "./persist.js";
-import { PlayerRegistry } from "./registry.js";
+import { getRootLogger } from "../util/logger.js";
+import { DEVICE_REGISTRY_FILE, readDeviceRegistry } from "./persist.js";
+import { MAX_DEVICES, PlayerRegistry } from "./registry.js";
 
 function makeStation() {
   return {
@@ -222,5 +223,122 @@ describe("PlayerRegistry.onDisconnect", () => {
     reg.onDisconnect("d1", sink);
     expect(reg.activePlayerDeviceId).toBeNull();
     expect(station.pause).toHaveBeenCalled();
+  });
+});
+
+// --------------------------------------------------------------------------
+// Regression: persist() must NEVER throw out of touch/remember/forget — a
+// registry-write failure (read-only/immutable volume, ENOSPC, EACCES) would
+// otherwise reach process.on('uncaughtException') and exit(1), killing the
+// always-playing station. Best-effort persistence: log-and-continue.
+// --------------------------------------------------------------------------
+describe("PlayerRegistry persist crash-safety (station NEVER stops)", () => {
+  // Turning the target path into a DIRECTORY makes the atomic rename() onto it
+  // fail (EISDIR / ENOTEMPTY) — a filesystem-independent way to force a persist
+  // write failure without needing a truly read-only volume in the test sandbox.
+  async function breakTarget(): Promise<void> {
+    const target = join(dir, DEVICE_REGISTRY_FILE);
+    await rm(target, { recursive: true, force: true });
+    await mkdir(target);
+  }
+
+  it("touch() logs-and-continues (does NOT throw) when persist fails", async () => {
+    const errSpy = vi.spyOn(getRootLogger(), "error").mockImplementation(() => getRootLogger());
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => 1 });
+    await reg.init();
+    await breakTarget();
+    expect(() => reg.touch("d1", "PC")).not.toThrow();
+    expect(errSpy).toHaveBeenCalled(); // failure surfaced, not swallowed silently
+    errSpy.mockRestore();
+  });
+
+  it("remember()/forget() do not throw when persist fails", async () => {
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => 1 });
+    await reg.init();
+    reg.touch("d1", "PC"); // first write succeeds
+    const errSpy = vi.spyOn(getRootLogger(), "error").mockImplementation(() => getRootLogger());
+    await breakTarget();
+    expect(() => reg.remember("d1")).not.toThrow();
+    expect(() => reg.forget("d1")).not.toThrow();
+    errSpy.mockRestore();
+  });
+});
+
+// --------------------------------------------------------------------------
+// Regression: init() must tolerate a JSON-valid file with malformed device
+// entries (the read guard only checks version + Array.isArray). One bad record
+// must not throw out of init() and brick startup of the always-on station.
+// --------------------------------------------------------------------------
+describe("PlayerRegistry.init tolerant per-record restore", () => {
+  it("skips a null / malformed device entry instead of throwing", async () => {
+    await writeFile(
+      join(dir, DEVICE_REGISTRY_FILE),
+      JSON.stringify({
+        version: 1,
+        savedAt: 0,
+        devices: [
+          null,
+          { deviceId: 123, label: "numeric id", lastSeen: 1, isPreferredSpeaker: false }, // non-string id
+          { deviceId: "good", label: "Good", lastSeen: 5, isPreferredSpeaker: true },
+          { deviceId: "nolabel", lastSeen: 6, isPreferredSpeaker: false }, // missing label
+        ],
+      }),
+    );
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => 1 });
+    await expect(reg.init()).resolves.toBeUndefined();
+    // Only the fully-valid record survived; the good preferred speaker still works.
+    reg.onConnect("good", makeSink());
+    expect(reg.activePlayerDeviceId).toBe("good");
+    // The malformed numeric-id record was dropped (no numeric Map key poisoning).
+    expect(reg.activePlayerDeviceId).not.toBe(123 as unknown as string);
+  });
+});
+
+// --------------------------------------------------------------------------
+// Regression: the device map / file must not grow without bound, and an
+// unchanged reconnect must not rewrite the whole file on the hot path.
+// --------------------------------------------------------------------------
+describe("PlayerRegistry device-map bound + no-op write skip", () => {
+  it("caps retained devices at MAX_DEVICES, LRU-evicting oldest non-preferred", async () => {
+    let t = 0;
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => ++t });
+    await reg.init();
+    // Insert well past the cap, each with an increasing lastSeen.
+    for (let i = 0; i < MAX_DEVICES + 50; i++) reg.touch(`d${i}`, `L${i}`);
+    const file = await readDeviceRegistry(dir);
+    expect(file?.devices.length).toBe(MAX_DEVICES);
+    // The oldest (d0) was evicted; the newest survives.
+    const ids = new Set(file?.devices.map((d) => d.deviceId));
+    expect(ids.has("d0")).toBe(false);
+    expect(ids.has(`d${MAX_DEVICES + 49}`)).toBe(true);
+  });
+
+  it("never evicts a preferred speaker even when it is the oldest", async () => {
+    let t = 0;
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => ++t });
+    await reg.init();
+    reg.touch("keep", "Preferred"); // oldest device
+    reg.remember("keep"); // mark preferred
+    for (let i = 0; i < MAX_DEVICES + 50; i++) reg.touch(`d${i}`, `L${i}`);
+    const file = await readDeviceRegistry(dir);
+    const ids = new Set(file?.devices.map((d) => d.deviceId));
+    expect(ids.has("keep")).toBe(true);
+    expect(file?.devices.length).toBe(MAX_DEVICES);
+  });
+
+  it("does NOT rewrite the file when a reconnect only bumps lastSeen (same label)", async () => {
+    let t = 0;
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => ++t });
+    await reg.init();
+    reg.touch("d1", "PC");
+    const before = await readFile(join(dir, DEVICE_REGISTRY_FILE), "utf8");
+    reg.touch("d1", "PC"); // same label -> no-op persist
+    const after = await readFile(join(dir, DEVICE_REGISTRY_FILE), "utf8");
+    expect(after).toBe(before); // file untouched (lastSeen only bumped in memory)
+    // A real label change DOES persist.
+    reg.touch("d1", "PC renamed");
+    const changed = await readFile(join(dir, DEVICE_REGISTRY_FILE), "utf8");
+    expect(changed).not.toBe(before);
+    expect(JSON.parse(changed).devices[0].label).toBe("PC renamed");
   });
 });

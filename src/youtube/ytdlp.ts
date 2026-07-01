@@ -52,6 +52,16 @@ export function runYtDlp(
     // rejection instead. If 'close' has already settled the promise, this reject is a no-op.
     child.stdout.on("error", (err) => {
       clearTimeout(timer);
+      // Clearing the timer above removes the ONLY future SIGKILL for this child. A stdout
+      // read error (EPIPE / ECONNRESET on the pipe) can fire while yt-dlp is still alive and
+      // downloading; without an explicit kill here the process is orphaned forever (leaking a
+      // live child per occurrence on a station that runs indefinitely). Force-kill before we
+      // reject so no error branch can leave a running child with no kill path.
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already dead / unkillable — nothing more we can do.
+      }
       reject(err);
     });
     child.stderr.on("error", () => {

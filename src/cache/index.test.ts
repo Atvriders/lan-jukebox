@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AudioCache } from "./index.js";
+import { setRootLogger } from "../util/logger.js";
 
 let dir: string;
 beforeEach(async () => {
@@ -67,6 +68,30 @@ describe("AudioCache", () => {
     expect(cache.has("bbbbbbbbbbb")).toBe(false);
     expect(cache.has("ccccccccccc")).toBe(true);
     expect(cache.totalBytes()).toBe(300);
+  });
+
+  it("warns (not silently) when it exceeds maxBytes because every remaining entry is pinned", async () => {
+    // Regression: the eviction loop breaks with `victim === null` when all entries are pinned,
+    // leaving the cache over-cap with no recovery path and (previously) no signal. It must log a
+    // warning so an operator has visibility before the disk fills.
+    const warn = vi.fn();
+    setRootLogger({ warn, error: vi.fn(), info: vi.fn() } as never);
+    try {
+      const cache = new AudioCache(dir, 500);
+      await cache.init();
+      cache.register("aaaaaaaaaaa", await makeFile("aaaaaaaaaaa.webm", 300));
+      cache.pin("aaaaaaaaaaa");
+      cache.register("bbbbbbbbbbb", await makeFile("bbbbbbbbbbb.webm", 300));
+      cache.pin("bbbbbbbbbbb");
+      // Both pinned, total 600 > 500. Registering a 300-byte 'c' can evict nothing → over-cap.
+      cache.register("ccccccccccc", await makeFile("ccccccccccc.webm", 300));
+      expect(warn).toHaveBeenCalled();
+      expect(cache.totalBytes()).toBeGreaterThan(500); // genuinely over-cap, as the warning says
+    } finally {
+      // Restore a real logger so later tests aren't left with the spy.
+      const { createLogger } = await import("../util/logger.js");
+      setRootLogger(createLogger("silent"));
+    }
   });
 
   it("does not over-evict innocent entries when re-registering an existing id", async () => {
@@ -172,6 +197,38 @@ describe("AudioCache", () => {
     cache.register("ghostvideoid", "/tmp/definitely-not-a-real-file.m4a");
     expect(cache.has("ghostvideoid")).toBe(false);
     expect(cache.get("ghostvideoid")).toBeNull();
+  });
+
+  it("reconciles pre-existing cache files on init() so they count + become evictable", async () => {
+    // Regression: the index is purely in-memory and never persisted, so a restart used to start
+    // with an empty map while the persistent CACHE_DIR volume still held every file prior runs
+    // downloaded — those files were untracked forever (never counted toward maxBytes, never
+    // eviction victims), so real disk usage grew unbounded across restarts. init() must scan
+    // the dir and ADOPT the audio files it finds.
+    //
+    // Simulate a prior run's leftovers, then init() a FRESH cache over the same dir.
+    await makeFile("aaaaaaaaaaa.webm", 300); // raw download -> key "aaaaaaaaaaa"
+    await makeFile("bbbbbbbbbbb.m4a", 200); // raw m4a download -> key "bbbbbbbbbbb"
+    await makeFile("ccccccccccc.transcoded.m4a", 100); // transcode artifact -> key "ccccccccccc.m4a"
+    // Non-audio sidecars that must be IGNORED (never served, never evicted):
+    await makeFile("station-snapshot.json", 50);
+    await makeFile("station-snapshot.json.1234.abcd.tmp", 40);
+
+    const cache = new AudioCache(dir, 1000);
+    await cache.init();
+
+    // Audio files adopted under the exact keys the runtime register() calls use.
+    expect(cache.has("aaaaaaaaaaa")).toBe(true);
+    expect(cache.get("aaaaaaaaaaa")).toBe(join(dir, "aaaaaaaaaaa.webm"));
+    expect(cache.has("bbbbbbbbbbb")).toBe(true);
+    expect(cache.has("ccccccccccc.m4a")).toBe(true);
+    expect(cache.get("ccccccccccc.m4a")).toBe(join(dir, "ccccccccccc.transcoded.m4a"));
+    // Sidecar JSON / tmp files are NOT adopted, so their bytes don't count and they can't be served.
+    expect(cache.totalBytes()).toBe(600); // 300 + 200 + 100 only
+    // Adopted entries are unpinned, so they participate in LRU eviction (would exceed cap otherwise).
+    cache.register("ddddddddddd", await makeFile("ddddddddddd.webm", 500)); // 600+500=1100 > 1000
+    expect(cache.totalBytes()).toBeLessThanOrEqual(1000);
+    expect(cache.has("ddddddddddd")).toBe(true);
   });
 
   afterEach(async () => {

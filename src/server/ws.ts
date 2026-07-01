@@ -20,9 +20,34 @@ export interface StationLike {
   on(event: "changed", listener: () => void): unknown;
 }
 
+/**
+ * Live player-presence source (the PlayerRegistry). The orchestrator's snapshot() hardcodes the
+ * player-presence fields to false/null ("server fills the player-presence fields"); the server
+ * producer sites overlay the registry's real values so the UI speaker indicator
+ * ("● {label} live" vs "○ no speaker") reflects reality instead of being permanently dead.
+ */
+export interface PlayerPresence {
+  readonly activePlayerDeviceId: string | null;
+  readonly activePlayerLabel: string | null;
+}
+
+/** Enrich a raw orchestrator snapshot with the registry's live player-presence fields. */
+export function withPresence(
+  state: StationSnapshot,
+  presence: PlayerPresence | undefined,
+): StationSnapshot {
+  if (!presence) return state;
+  return {
+    ...state,
+    activePlayerPresent: presence.activePlayerDeviceId !== null,
+    activePlayerLabel: presence.activePlayerLabel,
+  };
+}
+
 export class StationBroadcaster {
   private readonly subs = new Set<Send>();
   private attached = false;
+  private presence: PlayerPresence | undefined;
 
   subscribe(send: Send): void {
     this.subs.add(send);
@@ -42,11 +67,14 @@ export class StationBroadcaster {
       }
     }
   }
-  attach(station: StationLike): void {
+  attach(station: StationLike, presence?: PlayerPresence): void {
+    if (presence) this.presence = presence;
     if (this.attached) return;
     this.attached = true;
     station.on("changed", () => {
-      this.broadcast({ type: "state", state: station.snapshot() });
+      // Overlay the live player-presence so every broadcast 'state' carries a real speaker
+      // indicator (the orchestrator can't know who the active Player is — the registry owns that).
+      this.broadcast({ type: "state", state: withPresence(station.snapshot(), this.presence) });
     });
   }
 }
@@ -72,7 +100,15 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
     }
   });
 
-  deps.broadcaster.attach(deps.station);
+  // Attach with a live presence view backed by the registry (getters read fresh each broadcast).
+  deps.broadcaster.attach(deps.station, {
+    get activePlayerDeviceId() {
+      return deps.registry.activePlayerDeviceId;
+    },
+    get activePlayerLabel() {
+      return deps.registry.activePlayerLabel;
+    },
+  });
 
   app.get("/ws", { websocket: true }, (socket: WsWebSocket, req: FastifyRequest) => {
     const session = (
@@ -104,8 +140,15 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
         case "hello":
           deps.registry.touch(deviceId, label);
           deps.registry.onConnect(deviceId, sink);
-          // Every subscriber gets an immediate {type:'state'} after a successful hello.
-          send({ type: "state", state: deps.station.snapshot() });
+          // Every subscriber gets an immediate {type:'state'} after a successful hello — enriched
+          // with the live player-presence fields (same overlay as the broadcast path).
+          send({
+            type: "state",
+            state: withPresence(deps.station.snapshot(), {
+              activePlayerDeviceId: deps.registry.activePlayerDeviceId,
+              activePlayerLabel: deps.registry.activePlayerLabel,
+            }),
+          });
           break;
         case "becomePlayer":
           deps.registry.claim(deviceId, sink);
@@ -117,10 +160,16 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
           deps.station.reportPosition(msg.ms);
           break;
         case "trackEnded":
-          sink.emit("trackEnd");
+          // Route through the sink's guarded API (destroyed short-circuit) rather than a raw
+          // emit, keeping all sink-event policy in one place.
+          sink.onTrackEnded();
           break;
         case "playbackError":
-          sink.emit("error", new Error(msg.message));
+          // MUST go through onPlaybackError (not a raw emit("error")): a listener-less
+          // EventEmitter throws synchronously on an "error" emit, and only the active-Player
+          // sink has an "error" listener. onPlaybackError no-ops when there is none, so a
+          // playbackError frame from a non-Player socket can never crash the station.
+          sink.onPlaybackError(msg.message);
           break;
       }
     });

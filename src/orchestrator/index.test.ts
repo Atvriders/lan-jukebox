@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { StationController } from "./index.js";
+import { Queue } from "../queue/index.js";
 import { BrowserPlayerSink } from "./browser-player-sink.js";
 import type { Requester, TrackMeta, ServerPlayerMessage } from "../types/index.js";
 
@@ -21,7 +22,7 @@ function fakeSink() {
   return { sink, sent };
 }
 function controller() {
-  const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a` }));
+  const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
   const c = new StationController({ download, now: () => 1_000 });
   return { c, download };
 }
@@ -134,7 +135,7 @@ describe("StationController core", () => {
   it("updateSettings clamps via applySettingsPatch and fires onSettingsChanged", async () => {
     const onSettingsChanged = vi.fn();
     const c = new StationController({
-      download: vi.fn(async (id) => ({ path: id })),
+      download: vi.fn(async (id) => ({ path: id, audio: null })),
       onSettingsChanged,
     });
     const out = c.updateSettings({ volume: 999, repeat: "all" });
@@ -204,9 +205,11 @@ describe("StationController core", () => {
     const download = vi.fn(async (id: string) => {
       calls += 1;
       if (id === "bbbbbbbbbbb") throw new Error("dl fail");
-      return { path: `/cache/${id}.m4a` };
+      return { path: `/cache/${id}.m4a`, audio: null };
     });
-    const c = new StationController({ download, now: () => 1_000 });
+    // radioRetryBaseMs:0 neutralizes the download-failure backoff so the dry-hold is reached
+    // synchronously (the backoff's real duration is exercised elsewhere).
+    const c = new StationController({ download, now: () => 1_000, radioRetryBaseMs: 0 });
     const { sink } = fakeSink();
     await c.enqueue(meta("aaaaaaaaaaa"), user);
     await c.enqueue(meta("bbbbbbbbbbb"), user);
@@ -261,6 +264,44 @@ describe("StationController core", () => {
     expect(radio[0]?.meta.videoId).toBe("rrrrrrrrrrr");
   });
 
+  it("restore() rehydrates persisted history into the snapshot (History panel survives restart)", async () => {
+    const { c } = controller();
+    const hist = (id: string) => ({
+      id: `h-${id}`,
+      meta: meta(id),
+      requester: user,
+      addedAt: 0,
+      audio: null,
+      fromRadio: false,
+    });
+    await c.restore({
+      version: 1,
+      savedAt: 0,
+      seed: meta("aaaaaaaaaaa"),
+      current: null,
+      positionMs: 0,
+      queue: [],
+      upcomingRadio: [],
+      history: [
+        hist("aaaaaaaaaaa"),
+        {
+          id: "bad",
+          meta: null,
+          requester: null,
+          addedAt: 0,
+          audio: null,
+          fromRadio: false,
+        } as never,
+        hist("bbbbbbbbbbb"),
+      ],
+      settings: c.settings,
+      activePlayerDeviceId: null,
+    });
+    const restored = c.snapshot().history;
+    // The malformed middle entry is skipped; the two valid ones are restored in order.
+    expect(restored.map((i) => i.meta.videoId)).toEqual(["aaaaaaaaaaa", "bbbbbbbbbbb"]);
+  });
+
   it("restore() coerces a non-finite positionMs to 0 (never serializes NaN)", async () => {
     const { c } = controller();
     const cur = {
@@ -297,5 +338,412 @@ describe("StationController core", () => {
     expect(s.volume).toBe(100);
     expect(Array.isArray(s.upcomingRadio)).toBe(true);
     expect(s.activePlayerPresent).toBe(false);
+  });
+
+  it("emits a 'trackError' (videoId/title/reason) when the browser reports a playback error", async () => {
+    const { c } = controller();
+    const { sink } = fakeSink();
+    const errors: Array<{ videoId: string; title: string; reason: string }> = [];
+    c.on("trackError", (e) => errors.push(e as (typeof errors)[number]));
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    sink.onPlaybackError("decode failed");
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    expect(errors).toEqual([
+      { videoId: "aaaaaaaaaaa", title: "aaaaaaaaaaa", reason: "decode failed" },
+    ]);
+  });
+
+  it("emits a 'trackError' when the download fails, then skips to the next track", async () => {
+    const download = vi.fn(async (id: string) => {
+      if (id === "aaaaaaaaaaa") throw new Error("410 gone");
+      return { path: `/cache/${id}.m4a`, audio: null };
+    });
+    const c = new StationController({ download, now: () => 1_000 });
+    const { sink } = fakeSink();
+    const errors: Array<{ videoId: string; title: string; reason: string }> = [];
+    c.on("trackError", (e) => errors.push(e as (typeof errors)[number]));
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.attachSink(sink);
+    // The failed download is discarded and the station advances to the next track.
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    expect(errors).toEqual([{ videoId: "aaaaaaaaaaa", title: "aaaaaaaaaaa", reason: "410 gone" }]);
+  });
+
+  it("does not emit a duplicate 'trackError' for a stale error+trackEnd pair (advance-once guard)", async () => {
+    const { c } = controller();
+    const { sink } = fakeSink();
+    const errors: unknown[] = [];
+    c.on("trackError", (e) => errors.push(e));
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    sink.onPlaybackError("boom");
+    sink.onTrackEnded(); // stale — same generation, must be ignored (no second trackError)
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    expect(errors).toHaveLength(1);
+  });
+});
+
+describe("StationController threads track duration into download/prefetch (timeout auto-scaling)", () => {
+  // Regression: scaleDownloadTimeout() scales the yt-dlp timeout by track duration, but every
+  // caller omitted durationSec, so long mixes/concerts were SIGKILLed at the short default.
+  // The controller must forward item.meta.durationSec to BOTH the download dep (current track)
+  // and the prefetch dep (upcoming head) so the timeout can scale.
+  it("passes the current item's durationSec into the download dep", async () => {
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    const c = new StationController({ download, now: () => 1_000 });
+    const sink = new BrowserPlayerSink();
+    sink.setSend(() => {});
+    await c.enqueue(meta("aaaaaaaaaaa", 4200), user); // a ~70-min mix
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(download).toHaveBeenCalled());
+    // The 2nd arg is the opts object — it must carry the track's real duration, not undefined.
+    expect(download).toHaveBeenCalledWith(
+      "aaaaaaaaaaa",
+      expect.objectContaining({ durationSec: 4200 }),
+    );
+  });
+
+  it("passes the upcoming head's durationSec into the prefetch dep", async () => {
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    const prefetch = vi.fn(async () => {});
+    const c = new StationController({ download, prefetch, now: () => 1_000 });
+    const sink = new BrowserPlayerSink();
+    sink.setSend(() => {});
+    // Head plays; the second item becomes the prefetch target (upcoming head).
+    await c.enqueue(meta("aaaaaaaaaaa", 100), user);
+    await c.enqueue(meta("bbbbbbbbbbb", 5400), user); // a ~90-min concert
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(prefetch).toHaveBeenCalledWith("bbbbbbbbbbb", 5400));
+  });
+});
+
+describe("StationController honors an injected Queue's historyMax (HISTORY_MAX_ITEMS wiring)", () => {
+  // Regression: index.ts constructed StationController WITHOUT a queue dep, so the configured
+  // HISTORY_MAX_ITEMS never reached the Queue (fell back to the default 100). The controller
+  // must use the injected Queue, whose historyMax bounds the history ring.
+  it("bounds the history ring to the injected Queue's historyMax", async () => {
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    const queue = new Queue({ historyMax: 2 });
+    const c = new StationController({ queue, download, now: () => 1_000 });
+    const sink = new BrowserPlayerSink();
+    sink.setSend(() => {});
+    for (const id of ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc", "ddddddddddd"]) {
+      await c.enqueue(meta(id), user);
+    }
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    // Cleanly finish three tracks; with historyMax=2 the ring must never exceed 2 entries.
+    sink.onTrackEnded();
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    sink.onTrackEnded();
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("ccccccccccc"));
+    sink.onTrackEnded();
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("ddddddddddd"));
+    expect(c.snapshot().history.length).toBeLessThanOrEqual(2);
+  });
+});
+
+describe("StationController pin/unpin lifecycle (cache pins must not grow without bound)", () => {
+  // Regression: deps.unpin was declared+wired but never called, so every played track stayed
+  // pinned forever, defeating LRU eviction and eventually filling the disk. The controller must
+  // unpin the PREVIOUS track when a different track becomes current.
+  it("unpins the previous track's videoId when the next track loads", async () => {
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    const pin = vi.fn();
+    const unpin = vi.fn();
+    const c = new StationController({ download, pin, unpin, now: () => 1_000 });
+    const sink = new BrowserPlayerSink();
+    sink.setSend(() => {});
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    expect(pin).toHaveBeenCalledWith("aaaaaaaaaaa", expect.any(String), null);
+    expect(unpin).not.toHaveBeenCalled(); // nothing to unpin on the first track
+    sink.onTrackEnded();
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    // The now-retired track is unpinned; the fresh one is pinned.
+    expect(unpin).toHaveBeenCalledWith("aaaaaaaaaaa");
+    expect(pin).toHaveBeenCalledWith("bbbbbbbbbbb", expect.any(String), null);
+  });
+});
+
+describe("StationController dry-hold radio self-retry (transient outage must self-heal)", () => {
+  // Regression: when the queue drained and radioContinuation() returned null for a TRANSIENT
+  // failure, the station parked in dry-hold forever with no self-retry, violating "when the queue
+  // drains it autoplays related tracks forever". Entering dry-hold with a seed present + a radio
+  // continuation wired must schedule a backing-off re-attempt.
+  it("re-attempts radio on a timer and resumes autoplay when it recovers", async () => {
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    let fire: (() => void) | null = null;
+    const setTimeoutFn = vi.fn((fn: () => void) => {
+      fire = fn;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    });
+    const clearTimeoutFn = vi.fn();
+    // Radio fails the first time (transient), then recovers.
+    let radioUp = false;
+    const c = new StationController({
+      download,
+      now: () => 1_000,
+      setTimeout: setTimeoutFn,
+      clearTimeout: clearTimeoutFn,
+      radioRetryBaseMs: 5_000,
+    });
+    c.setRadioContinuation(async () => (radioUp ? meta("rrrrrrrrrrr") : null));
+    const sink = new BrowserPlayerSink();
+    sink.setSend(() => {});
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    sink.onTrackEnded(); // queue drains, radio returns null → dry-hold + a scheduled retry
+    await vi.waitFor(() => expect(c.isPaused).toBe(true));
+    expect(setTimeoutFn).toHaveBeenCalled(); // a retry was armed
+    // Upstream recovers; fire the retry timer.
+    radioUp = true;
+    expect(fire).not.toBeNull();
+    fire!();
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("rrrrrrrrrrr"));
+    expect(c.isPaused).toBe(false);
+  });
+
+  it("does NOT schedule a radio retry on a genuine cold start (no seed)", async () => {
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    const setTimeoutFn = vi.fn((fn: () => void) => {
+      void fn;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    });
+    const c = new StationController({
+      download,
+      now: () => 1_000,
+      setTimeout: setTimeoutFn,
+      clearTimeout: vi.fn(),
+    });
+    c.setRadioContinuation(async () => null);
+    const sink = new BrowserPlayerSink();
+    sink.setSend(() => {});
+    c.attachSink(sink); // no seed, nothing queued → cold dry-hold
+    await vi.waitFor(() => expect(c.isPaused).toBe(true));
+    expect(setTimeoutFn).not.toHaveBeenCalled();
+  });
+});
+
+describe("StationController download-failure backoff (mass outage must not burst yt-dlp)", () => {
+  // Regression: a whole-feed download outage walked the candidate list with ZERO delay, firing a
+  // tight burst of failed yt-dlp spawns. A failed download must back off (via the injectable timer)
+  // before walking to the next candidate.
+  it("backs off (via the injectable timer) on CONSECUTIVE download failures, but not the first", async () => {
+    // a & b fail (consecutive), c succeeds.
+    const download = vi.fn(async (id: string) => {
+      if (id === "aaaaaaaaaaa" || id === "bbbbbbbbbbb") throw new Error("410 gone");
+      return { path: `/cache/${id}.m4a`, audio: null };
+    });
+    const delays: number[] = [];
+    const setTimeoutFn = vi.fn((fn: () => void, ms: number) => {
+      delays.push(ms);
+      fn(); // resolve immediately so the test doesn't wait real wall-clock
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    });
+    const c = new StationController({
+      download,
+      now: () => 1_000,
+      setTimeout: setTimeoutFn,
+      clearTimeout: vi.fn(),
+    });
+    const sink = new BrowserPlayerSink();
+    sink.setSend(() => {});
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    await c.enqueue(meta("ccccccccccc"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("ccccccccccc"));
+    // The SECOND consecutive failure (b) applied a non-zero backoff before walking to c; the
+    // first (a) did not, so an isolated bad track never adds latency.
+    expect(delays.some((d) => d > 0)).toBe(true);
+  });
+});
+
+// A download dep whose resolution the test controls, so we can exercise the mid-load window
+// (pause/seek/skip arriving WHILE a track is still downloading).
+function deferredDownload() {
+  let resolveFn: (() => void) | null = null;
+  const download = vi.fn(
+    (id: string) =>
+      new Promise<{ path: string; audio: null }>((res) => {
+        resolveFn = () => res({ path: `/cache/${id}.m4a`, audio: null });
+      }),
+  );
+  return { download, resolve: () => resolveFn?.() };
+}
+
+describe("StationController repeat mode (finding: repeat was stored/broadcast but never enforced)", () => {
+  it('repeat="one" replays the SAME current from 0 on a clean track end (does not advance)', async () => {
+    const { c } = controller();
+    const { sink, sent } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    c.updateSettings({ repeat: "one" });
+    const loadsBefore = sent.filter((m) => m.type === "load").length;
+    sink.onTrackEnded(); // clean end under repeat="one" → replay A, NOT advance to B
+    await vi.waitFor(() =>
+      expect(sent.filter((m) => m.type === "load").length).toBeGreaterThan(loadsBefore),
+    );
+    expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"); // still A
+    expect(c.snapshot().upcoming.map((i) => i.meta.videoId)).toEqual(["bbbbbbbbbbb"]); // B untouched
+  });
+
+  it('repeat="all" re-cycles the played set when the queue drains (no radio) instead of dry-holding', async () => {
+    const { c } = controller();
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.updateSettings({ repeat: "all" });
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    sink.onTrackEnded(); // A → B
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    sink.onTrackEnded(); // queue now dry, no radio → repeat="all" recycles [A, B] and plays A again
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    expect(c.isPaused).toBe(false); // NOT dry-held
+    expect(c.snapshot().upcoming.map((i) => i.meta.videoId)).toEqual(["bbbbbbbbbbb"]); // B re-queued
+  });
+
+  it('repeat="off" (default) still advances normally on a clean end', async () => {
+    const { c } = controller();
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    sink.onTrackEnded();
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+  });
+});
+
+describe("StationController persisted-history restore (finding: history saved but never restored)", () => {
+  it("restore() populates the history ring from file.history (validated, honoring historyMax)", async () => {
+    const queue = new Queue({ historyMax: 2 });
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    const c = new StationController({ queue, download, now: () => 1_000 });
+    const hist = (id: string) => ({
+      id: `h-${id}`,
+      meta: meta(id),
+      requester: user,
+      addedAt: 0,
+      audio: null,
+      fromRadio: false,
+    });
+    await c.restore({
+      version: 1,
+      savedAt: 0,
+      seed: meta("aaaaaaaaaaa"),
+      current: null,
+      positionMs: 0,
+      queue: [],
+      upcomingRadio: [],
+      // three entries + one malformed; historyMax=2 keeps the most recent two valid ones.
+      history: [
+        hist("hhhhhhhhhh1"),
+        {
+          id: "bad",
+          meta: null,
+          requester: null,
+          addedAt: 0,
+          audio: null,
+          fromRadio: false,
+        } as never,
+        hist("hhhhhhhhhh2"),
+        hist("hhhhhhhhhh3"),
+      ],
+      settings: c.settings,
+      activePlayerDeviceId: null,
+    });
+    const restored = c.snapshot().history.map((i) => i.meta.videoId);
+    expect(restored).toEqual(["hhhhhhhhhh2", "hhhhhhhhhh3"]); // trimmed to historyMax, malformed dropped
+  });
+});
+
+describe("StationController forwards AudioInfo (finding: audio dropped → QueueItem.audio stays null)", () => {
+  it("sets the current QueueItem.audio and pins with the real audio after download", async () => {
+    const audioInfo = { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 };
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: audioInfo }));
+    const pin = vi.fn();
+    const c = new StationController({ download, pin, now: () => 1_000 });
+    const sink = new BrowserPlayerSink();
+    sink.setSend(() => {});
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    // QueueItem.audio is populated (contract: null until downloaded, then the real format).
+    await vi.waitFor(() => expect(c.snapshot().current?.audio).toEqual(audioInfo));
+    // pin is called WITH the audio so the cache/audio-route can serve playable formats as-is.
+    expect(pin).toHaveBeenCalledWith("aaaaaaaaaaa", expect.any(String), audioInfo);
+  });
+});
+
+describe("StationController mid-load user controls (concurrency findings)", () => {
+  it("a pause() during an in-flight download survives: the track loads paused, no auto-play", async () => {
+    const { download, resolve } = deferredDownload();
+    const c = new StationController({ download, now: () => 1_000 });
+    const { sink, sent } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(download).toHaveBeenCalled()); // load is in flight (awaiting)
+    c.pause(); // user pauses WHILE downloading
+    resolve(); // download completes
+    await vi.waitFor(() => expect(sent.some((m) => m.type === "load")).toBe(true));
+    expect(c.isPaused).toBe(true); // pause survived
+    expect(sent.some((m) => m.type === "play")).toBe(false); // did NOT auto-play over the pause
+  });
+
+  it("a seek() during an in-flight download is applied to the completed load's start position", async () => {
+    const { download, resolve } = deferredDownload();
+    const c = new StationController({ download, now: () => 1_000 });
+    const { sink, sent } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa", 100), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(download).toHaveBeenCalled());
+    await c.seek(30_000); // seek WHILE downloading
+    resolve();
+    await vi.waitFor(() => expect(sent.some((m) => m.type === "load")).toBe(true));
+    const load = sent.find((m) => m.type === "load");
+    expect(load && "startMs" in load ? load.startMs : -1).toBe(30_000); // seek honored, not startMs 0
+  });
+
+  it("a skip() pressed while a track is loading is NOT dropped by the generation guard", async () => {
+    const { download, resolve } = deferredDownload();
+    const c = new StationController({ download, now: () => 1_000 });
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(download).toHaveBeenCalledWith("aaaaaaaaaaa", expect.anything()));
+    c.skip(); // pressed WHILE A is still downloading — must not be a silent no-op
+    resolve(); // A's download completes; skip's queued advance then runs
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+  });
+});
+
+describe("StationController enqueue-race auto-start (finding: redundant reload restarts the head)", () => {
+  it("two near-simultaneous cold-start enqueues do not re-load/restart the head track", async () => {
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    const c = new StationController({ download, now: () => 1_000 });
+    const { sink } = fakeSink();
+    c.attachSink(sink); // sink attached, nothing queued (cold start, current === null)
+    // Fire two enqueues back-to-back before the first auto-start settles.
+    await Promise.all([c.enqueue(meta("aaaaaaaaaaa"), user), c.enqueue(meta("bbbbbbbbbbb"), user)]);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    // Let any spurious second auto-start settle, then assert the head was downloaded exactly once
+    // (a redundant reload would have called download("aaaaaaaaaaa", …) twice).
+    await new Promise((r) => setTimeout(r, 20));
+    expect(download.mock.calls.filter((call) => call[0] === "aaaaaaaaaaa")).toHaveLength(1);
   });
 });

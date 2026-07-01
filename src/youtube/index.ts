@@ -515,7 +515,12 @@ export class YouTubeService {
         f.startsWith(`${videoId}.`) &&
         !f.endsWith(".part") &&
         !f.endsWith(".ytdl") &&
-        !f.endsWith(".temp"),
+        !f.endsWith(".temp") &&
+        // Exclude the transcode artifact the audio route writes into this same cacheDir
+        // (`${videoId}.transcoded.m4a`). It also matches `${videoId}.` and persists across
+        // an evict-then-redownload of the source, so without this the find could return the
+        // STALE transcode as the freshly-downloaded source (path/metadata mismatch).
+        !f.endsWith(".transcoded.m4a"),
     );
     if (!produced) {
       throw new YtError(

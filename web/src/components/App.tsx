@@ -16,6 +16,7 @@ import { PlayerPanel } from "./PlayerPanel.js";
 import { AddBar } from "./AddBar.js";
 import { Controls } from "./Controls.js";
 import { NowPlaying } from "./NowPlaying.js";
+import { Preparing } from "./Preparing.js";
 import { Queue } from "./Queue.js";
 import { History } from "./History.js";
 import { Lyrics } from "./Lyrics.js";
@@ -128,7 +129,10 @@ export function App() {
       </main>
     );
   }
-  if (auth === "anon") {
+  // Login-required: either the REST probe returned 401 (auth === "anon"), or the WS was
+  // closed 1008/4403 (ws.status === "forbidden") because the session cookie is missing/
+  // expired. Both surface the LoginGate rather than looping reconnects.
+  if (auth === "anon" || ws.status === "forbidden") {
     return (
       <LoginGate
         onAuthed={(s) => {
@@ -179,13 +183,41 @@ export function App() {
         <p className="eyebrow" style={{ color: "var(--color-ember-soft)" }}>
           LAN Jukebox
         </p>
-        <span className="font-mono text-xs" style={{ color: "var(--color-ink-faint)" }}>
-          {snap?.activePlayerPresent
-            ? `● ${snap.activePlayerLabel ?? "speaker"} live`
-            : "○ no speaker"}
+        {/* Live region so a screen reader is told when the station's speaker comes/goes — a
+            critical state for an always-playing radio (no speaker = nothing produces audio). The
+            text alone ("… live" / "No speaker") conveys the state; the ●/○ glyph is decorative. */}
+        <span
+          role="status"
+          aria-live="polite"
+          className="font-mono text-xs"
+          style={{ color: "var(--color-ink-faint)" }}
+        >
+          {snap?.activePlayerPresent ? (
+            <>
+              <span aria-hidden>● </span>
+              {`${snap.activePlayerLabel ?? "speaker"} live`}
+            </>
+          ) : (
+            <>
+              <span aria-hidden>○ </span>
+              No speaker
+            </>
+          )}
         </span>
       </header>
 
+      {(ws.status === "connecting" || ws.status === "closed") && (
+        <p
+          role="status"
+          aria-live="polite"
+          className="card p-3 mb-4 text-sm font-mono"
+          style={{ color: "var(--color-ink-faint)" }}
+        >
+          {ws.status === "connecting"
+            ? "Reconnecting to the station…"
+            : "Connection lost — the console is showing the last known state while it reconnects."}
+        </p>
+      )}
       {playerError && (
         <p
           role="alert"
@@ -224,6 +256,10 @@ export function App() {
             canSeek={wantsSpeaker}
             onSeek={(positionMs) => void control("seek", positionMs)}
           />
+          {/* Live download/processing progress for the track being fetched. Returns null
+              when nothing is preparing, so it's safe to always mount alongside NowPlaying;
+              a long download (a 2.5h mix takes minutes) then reads as WORKING, not stuck. */}
+          <Preparing preparing={snap?.preparing ?? null} />
         </div>
       )}
 
@@ -275,11 +311,15 @@ export function App() {
             autoplay={snap?.autoplay ?? true}
             autoplaySource={snap?.autoplaySource ?? "radio"}
             onToggleAutoplay={(on) => void control("settings", { autoplay: on })}
+            onChangeSource={(source) => void control("settings", { autoplaySource: source })}
           />
         </div>
 
         <div className="reveal" style={{ animationDelay: "320ms" }}>
-          <History history={snap?.history ?? []} onRequeue={(videoId) => void api.add(videoId)} />
+          {/* Re-queue hits /api/pick (validates the bare 11-char VIDEO_ID and enqueues
+              directly). /api/add would classify a bare id as a text SEARCH and enqueue
+              nothing, so re-queue must NOT route through api.add. */}
+          <History history={snap?.history ?? []} onRequeue={(videoId) => void api.pick(videoId)} />
         </div>
 
         {currentVideoId && (

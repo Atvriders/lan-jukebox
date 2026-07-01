@@ -42,6 +42,10 @@ export function registerRest(app: FastifyInstance, deps: RestDeps): void {
     const snap = deps.station.snapshot();
     const body: StationStateResponse = {
       ...snap,
+      // The orchestrator hardcodes the player-presence fields to false/null; the server fills them
+      // from the registry so the header speaker indicator ("● {label} live") is not dead UI.
+      activePlayerPresent: deps.registry.activePlayerDeviceId !== null,
+      activePlayerLabel: deps.registry.activePlayerLabel,
       isThisDeviceSpeaker: info ? deps.registry.isSpeaker(info.deviceId) : false,
     };
     return reply.send(body);
@@ -216,8 +220,38 @@ export function registerRest(app: FastifyInstance, deps: RestDeps): void {
 
   app.get<{ Querystring: { trackId?: string } }>("/api/lyrics", async (req, reply) => {
     if (!(await requireSession(req, reply))) return;
-    const current = deps.station.snapshot().current;
-    if (!current) return reply.send({ lyrics: null, source: "lyrics.ovh" } satisfies LyricsResult);
-    return reply.send(await lyricsOf(current.meta));
+    const snap = deps.station.snapshot();
+    const trackId = req.query.trackId;
+    // Honor the client-supplied trackId (the client keys lyrics on the CURRENT videoId and mounts
+    // Lyrics with key={currentVideoId}). Ignoring it and always using snapshot().current returns
+    // WRONG-track lyrics whenever the track advances between the client's decision to fetch and the
+    // server handling the request (radio autoplay/skip/track-end). Resolve the requested id from
+    // the live snapshot (current/upcoming/history) first, then fall back to a network resolve; only
+    // when no trackId is supplied do we default to the live current.
+    let meta: TrackMeta | null = null;
+    if (trackId && VIDEO_ID.test(trackId)) {
+      const fromSnapshot =
+        (snap.current?.meta.videoId === trackId ? snap.current.meta : null) ??
+        snap.upcoming.find((i) => i.meta.videoId === trackId)?.meta ??
+        snap.history.find((i) => i.meta.videoId === trackId)?.meta ??
+        null;
+      if (fromSnapshot) {
+        meta = fromSnapshot;
+      } else {
+        // Not in the snapshot (e.g. a just-advanced track): resolve its metadata directly.
+        // Best-effort — a resolve failure falls through to the null-lyrics response below.
+        try {
+          meta = await deps.youtube.resolve(trackId);
+        } catch {
+          meta = null;
+        }
+      }
+    } else if (!trackId) {
+      meta = snap.current?.meta ?? null;
+    }
+    if (!meta) {
+      return reply.send({ lyrics: null, source: "lyrics.ovh" } satisfies LyricsResult);
+    }
+    return reply.send(await lyricsOf(meta));
   });
 }

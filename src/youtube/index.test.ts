@@ -522,6 +522,19 @@ describe("YouTubeService.download", () => {
     expect(args).toContain("--no-part");
   });
 
+  it("never selects the stale `.transcoded.m4a` sibling as the produced source file", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yt-"));
+    // A stale transcode from a prior play (the audio route writes it into this same cacheDir)
+    // that persisted after the source was evicted, then the freshly-downloaded source. It also
+    // matches `${id}.` and none of the .part/.ytdl/.temp suffixes, so the bare predicate could
+    // return it; download() must pick the fresh source instead.
+    await writeFile(join(dir, "dQw4w9WgXcQ.transcoded.m4a"), "STALE-TRANSCODE");
+    await writeFile(join(dir, "dQw4w9WgXcQ.opus"), "fresh-source");
+    runMock.mockResolvedValue(ok("AUDIOFMT::opus|160|165|48000\n"));
+    const res = await new YouTubeService(cfg).download("dQw4w9WgXcQ", dir);
+    expect(res.path).toBe(join(dir, "dQw4w9WgXcQ.opus"));
+  });
+
   it("falls back to the next player client when the first download fails, then succeeds", async () => {
     const dir = await mkdtemp(join(tmpdir(), "yt-"));
     await writeFile(join(dir, "dQw4w9WgXcQ.webm"), "fakeaudio");

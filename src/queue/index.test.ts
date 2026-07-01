@@ -121,4 +121,32 @@ describe("Queue", () => {
     expect(q.current).toBeNull();
     expect(q.snapshot().upcoming).toEqual([]);
   });
+
+  it("restoreHistory() seeds the history ring on restart, trimmed to historyMax", async () => {
+    const q = newQueue(); // historyMax = 2
+    const hist = (id: string) => ({
+      id,
+      meta: meta(id),
+      requester,
+      addedAt: 0,
+      audio: null,
+      fromRadio: false,
+    });
+    await q.restoreHistory([hist("aaaaaaaaaaa"), hist("bbbbbbbbbbb"), hist("ccccccccccc")]);
+    // Keeps the most recent historyMax (2) entries.
+    expect(q.snapshot().history.map((i) => i.meta.videoId)).toEqual(["bbbbbbbbbbb", "ccccccccccc"]);
+  });
+
+  it("setCurrentAudio() records the real audio on the current item (no-op on videoId mismatch)", async () => {
+    const q = newQueue();
+    await q.add(meta("aaaaaaaaaaa"), requester);
+    await q.advance(); // current = aaa, audio null
+    expect(q.current?.audio).toBeNull();
+    const info = { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 };
+    q.setCurrentAudio("aaaaaaaaaaa", info);
+    expect(q.current?.audio).toEqual(info);
+    // A stale videoId (already advanced past) must not clobber the current item's audio.
+    q.setCurrentAudio("zzzzzzzzzzz", null);
+    expect(q.current?.audio).toEqual(info);
+  });
 });

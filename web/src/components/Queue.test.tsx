@@ -52,6 +52,7 @@ function renderQueue(props: Partial<Parameters<typeof Queue>[0]> = {}) {
       autoplay={false}
       autoplaySource="radio"
       onToggleAutoplay={noop}
+      onChangeSource={noop}
       {...props}
     />,
   );
@@ -130,6 +131,19 @@ describe("Queue power tools", () => {
     expect(onReorder).toHaveBeenCalledTimes(1);
   });
 
+  it("Move up/down have unique per-track accessible names (screen-reader disambiguation)", () => {
+    // Regression: both buttons used the fixed generic labels "Move up"/"Move down", so a screen
+    // reader announced identical names for every row. The label must carry the track title.
+    renderQueue();
+    // Exact per-track names resolve to exactly one button each (would throw if non-unique).
+    expect(screen.getByRole("button", { name: "Move up: b" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Move down: a" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Move up: c" })).toBeInTheDocument();
+    // No button carries the old bare generic name.
+    expect(screen.queryByRole("button", { name: "Move up" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Move down" })).toBeNull();
+  });
+
   it("Remove calls onRemove with the row's id", () => {
     const onRemove = vi.fn();
     renderQueue({ onRemove });
@@ -163,6 +177,7 @@ describe("Queue power tools", () => {
         autoplay={false}
         autoplaySource="radio"
         onToggleAutoplay={noop}
+        onChangeSource={noop}
       />,
     );
     expect((screen.getByRole("button", { name: /shuffle/i }) as HTMLButtonElement).disabled).toBe(
@@ -244,5 +259,18 @@ describe("Queue autoplay toggle", () => {
     renderQueue({ autoplay: true, onToggleAutoplay });
     fireEvent.click(screen.getByRole("switch", { name: /autoplay|auto-discover/i }));
     expect(onToggleAutoplay).toHaveBeenCalledWith(false);
+  });
+
+  it("calls onChangeSource with the selected source (not onToggleAutoplay) when the picker changes", () => {
+    // Regression: the source select used to be hardwired to onToggleAutoplay(autoplay),
+    // discarding the chosen value so Artist mode was unreachable. It must now emit the
+    // actual selection through onChangeSource and NOT re-fire the autoplay toggle.
+    const onChangeSource = vi.fn();
+    const onToggleAutoplay = vi.fn();
+    // The source picker only renders while autoplay is engaged.
+    renderQueue({ autoplay: true, autoplaySource: "radio", onChangeSource, onToggleAutoplay });
+    fireEvent.change(screen.getByLabelText(/autoplay source/i), { target: { value: "artist" } });
+    expect(onChangeSource).toHaveBeenCalledWith("artist");
+    expect(onToggleAutoplay).not.toHaveBeenCalled();
   });
 });

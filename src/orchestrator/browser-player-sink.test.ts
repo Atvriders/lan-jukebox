@@ -50,6 +50,27 @@ describe("BrowserPlayerSink", () => {
     expect(err).toHaveBeenCalledWith("decode failed");
   });
 
+  it("onPlaybackError() on a sink with NO 'error' listener does NOT throw (station-crash guard)", () => {
+    // Node's EventEmitter throws synchronously on emit('error') with zero listeners. A
+    // playbackError WS frame from a non-Player socket (whose sink has no 'error' listener)
+    // must be dropped, not thrown — otherwise it escapes the ws message callback as an
+    // uncaughtException and crashes the always-on station.
+    const sink = new BrowserPlayerSink();
+    expect(sink.listenerCount("error")).toBe(0);
+    expect(() => sink.onPlaybackError("audio decode failed")).not.toThrow();
+  });
+
+  it("onPlaybackError() emits once a listener IS attached (active Player), still no throw when detached again", () => {
+    const sink = new BrowserPlayerSink();
+    const err = vi.fn();
+    sink.on("error", err);
+    sink.onPlaybackError("boom");
+    expect(err).toHaveBeenCalledWith("boom");
+    sink.off("error", err);
+    expect(() => sink.onPlaybackError("boom again")).not.toThrow();
+    expect(err).toHaveBeenCalledTimes(1);
+  });
+
   it("no send attached → commands are silently dropped (no throw)", () => {
     const sink = new BrowserPlayerSink();
     expect(() => sink.play({ audioUrl: "/audio/x", startMs: 0 })).not.toThrow();

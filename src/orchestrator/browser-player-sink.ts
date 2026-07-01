@@ -29,6 +29,12 @@ export class BrowserPlayerSink extends EventEmitter {
     this.emitMsg({ type: "load", audioUrl: opts.audioUrl, startMs: opts.startMs });
     this.emitMsg({ type: "play" });
   }
+  // Load the track into the browser <audio> WITHOUT starting playback. Used when a pause()
+  // arrived while the track was still downloading: the audio is prepared/anchored but held
+  // paused so playback doesn't start behind the user's back once the load completes.
+  load(opts: { audioUrl: string; startMs: number }): void {
+    this.emitMsg({ type: "load", audioUrl: opts.audioUrl, startMs: opts.startMs });
+  }
   pause(): void {
     this.emitMsg({ type: "pause" });
   }
@@ -61,9 +67,19 @@ export class BrowserPlayerSink extends EventEmitter {
     if (this.destroyed) return;
     this.emit("trackEnd");
   }
-  /** ws.ts → client {type:"playbackError",message}: the browser failed to play the track. */
+  /**
+   * ws.ts → client {type:"playbackError",message}: the browser failed to play the track.
+   *
+   * Node's EventEmitter THROWS synchronously when an "error" event is emitted with zero
+   * "error" listeners. Only the active-Player sink has one (StationController.attachSink);
+   * any other authenticated socket's sink does not. Since a "playbackError" frame arrives
+   * over the WS from an arbitrary authenticated client, an unguarded emit would let a single
+   * frame throw out of the ws message callback → uncaughtException → process.exit — taking
+   * down the always-on station (spec §3/§4 never-stops). Drop the signal when there is no
+   * listener rather than throwing: a non-active/detached sink has nothing to advance.
+   */
   onPlaybackError(message: string): void {
-    if (this.destroyed) return;
+    if (this.destroyed || this.listenerCount("error") === 0) return;
     this.emit("error", message);
   }
 

@@ -3,6 +3,7 @@ import { YouTubeService } from "./youtube/index.js";
 import { AudioCache } from "./cache/index.js";
 import { Semaphore } from "./util/semaphore.js";
 import { StationController } from "./orchestrator/index.js";
+import { Queue } from "./queue/index.js";
 import { DEFAULT_SETTINGS } from "./types/index.js";
 import { RadioEngine } from "./radio/index.js";
 import { PlayerRegistry } from "./players/registry.js";
@@ -59,27 +60,59 @@ async function main(): Promise<void> {
   // StationController owns the queue + sink; its deps are the download fn + cache pin/unpin +
   // settings + onSettingsChanged (see StationControllerDeps, Task 1.5). It does NOT take the
   // youtube/radio objects directly — the radio plugs in via setRadioContinuation / setRadioTopUp.
+  // Inject the Queue built with the configured history ring size so HISTORY_MAX_ITEMS is
+  // actually honored (StationController would otherwise default to new Queue() = 100).
+  const queue = new Queue({ historyMax: media.historyMaxItems });
   const station = new StationController({
+    queue,
     // The controller's download dep reports progress as a plain percent number, while
     // YouTubeService.download reports a DownloadProgress record — bridge the two here.
+    // durationSec is forwarded so YouTubeService.download can auto-scale the yt-dlp
+    // timeout for long mixes/concerts instead of killing them at the short default.
     download: (videoId, opts) =>
       youtube.download(videoId, media.cacheDir, {
+        durationSec: opts?.durationSec,
         onProgress: opts?.onProgress ? (p) => opts.onProgress!(p.percent) : undefined,
       }),
-    // Register the freshly-downloaded file in the LRU cache, then pin it so the audio route
-    // can serve it and it is not evicted while it is the current track.
-    pin: (videoId, path) => {
-      cache.register(videoId, path);
+    // Register the freshly-downloaded file in the LRU cache WITH its real audio format, then pin
+    // it so the audio route can serve it AND (crucially) serve a browser-playable opus/webm/m4a
+    // as-is instead of transcoding — chooseDelivery treats a null audio as "must transcode", so
+    // dropping the AudioInfo here forced a redundant ffmpeg pass on every orchestrator-downloaded
+    // track. Not evicted while it is the current track.
+    pin: (videoId, path, audio) => {
+      cache.register(videoId, path, audio);
       cache.pin(videoId);
     },
-    unpin: (videoId) => cache.unpin(videoId),
-    prefetch: (videoId) =>
-      downloads.run(() => youtube.download(videoId, media.cacheDir)).then(() => {}),
+    // Unpin BOTH the source key and the derived `${videoId}.m4a` transcode key: the audio route
+    // pins the transcode under that derived key (audio/index.ts) and nothing else ever unpins it,
+    // so without this the transcoded .m4a of every played track would stay pinned forever and
+    // grow the cache past CACHE_MAX_MB. Releasing both here lets the LRU reclaim them.
+    unpin: (videoId) => {
+      cache.unpin(videoId);
+      cache.unpin(`${videoId}.m4a`);
+    },
+    // Prefetch the upcoming head. Register the resulting file in the LRU cache (NOT pinned)
+    // so its bytes are tracked + evictable and loadCurrentLocked can hit it instead of
+    // re-downloading. Without register() the file was an untracked on-disk orphan the
+    // CACHE_MAX_MB cap could never reclaim. durationSec scales the timeout for long tracks.
+    prefetch: (videoId, durationSec) =>
+      downloads
+        .run(() => youtube.download(videoId, media.cacheDir, { durationSec }))
+        .then((r) => {
+          cache.register(videoId, r.path, r.audio);
+        })
+        .catch(() => {}),
     settings: { ...DEFAULT_SETTINGS, maxTrackDurationSec: media.maxTrackDurationSec ?? 0 },
     onSettingsChanged: () => scheduleSnapshot(),
   });
   // Persist queue/settings/playback changes (debounced) so the station survives a restart.
   station.on("changed", scheduleSnapshot);
+
+  // A track that fails to download or play is discarded and skipped; surface WHY to every
+  // subscriber so the client's "Skipped '<title>' — <reason>" banner is not dead UI.
+  station.on("trackError", (e: { videoId: string; title: string; reason: string }) => {
+    broadcaster.broadcast({ type: "trackError", ...e });
+  });
 
   // RadioEngine deps are { youtube, station, settings } (Task 1.6). Wire it into the controller
   // via the continuation hooks so a drained queue pulls the next related/artist track forever.
