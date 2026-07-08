@@ -54,6 +54,9 @@ function parseLogLevel(raw: string | null): string {
 
 export function loadMediaConfig(env: Env = process.env): MediaConfig {
   const maxDur = strEnv(env, "MAX_TRACK_DURATION_SEC");
+  // SponsorBlock: unset/empty → music-focused default; a literal "off" → disabled (null);
+  // any other value → that raw CSV, passed straight through to yt-dlp.
+  const sponsorblockRaw = strEnv(env, "YT_SPONSORBLOCK");
   return {
     cacheDir: strEnv(env, "CACHE_DIR") ?? "/data/cache",
     cacheMaxBytes: intEnv(env, "CACHE_MAX_MB", 2048, { min: 1 }) * 1024 * 1024,
@@ -69,6 +72,12 @@ export function loadMediaConfig(env: Env = process.env): MediaConfig {
     // Inline cookies.txt CONTENT pasted straight into compose — materialized to a file at
     // startup (see materializeCookies) since yt-dlp's --cookies only accepts a path.
     ytCookiesText: strEnv(env, "YT_COOKIES_TEXT"),
+    sponsorblockCategories:
+      sponsorblockRaw === null
+        ? "music_offtopic,intro,outro,sponsor,selfpromo,preview,interaction"
+        : sponsorblockRaw.toLowerCase() === "off"
+          ? null
+          : sponsorblockRaw,
     poTokenProviderUrl: strEnv(env, "PO_TOKEN_PROVIDER_URL"),
     playerClients: strEnv(env, "YT_PLAYER_CLIENTS") ?? "android_vr,web_embedded,tv",
     ytdlpTimeoutMs: intEnv(env, "YTDLP_TIMEOUT_MS", 60_000, { min: 1 }),
@@ -132,6 +141,8 @@ export function loadStationConfig(env: Env = process.env): StationConfig {
     prefetchDepth: intEnv(env, "PREFETCH_DEPTH", 1, { min: 0 }),
     // Must be >= 1: a Semaphore(0) deadlocks (no download ever acquires a slot).
     maxConcurrentDownloads: intEnv(env, "MAX_TRANSCODE_JOBS", 2, { min: 1 }),
+    // 0 = no cap (radio autoplay never skips on length); user-requested tracks are never capped.
+    maxAutoplayDurationSec: intEnv(env, "RADIO_MAX_AUTOPLAY_SEC", 900, { min: 0 }),
     logLevel: parseLogLevel(strEnv(env, "LOG_LEVEL")),
   };
 }

@@ -7,6 +7,9 @@ export interface RadioDeps {
   youtube: Pick<YouTubeService, "related" | "artistTracks">;
   station: Pick<StationController, "seed" | "queue" | "enqueue" | "setUpcomingRadio">;
   settings: () => { autoplay: boolean; autoplaySource: AutoplaySource };
+  /** Radio autoplay skips candidates longer than this many seconds; 0 = no cap. User-requested
+   * tracks bypass this — the cap lives only here in the radio engine, never on explicit adds. */
+  maxAutoplayDurationSec: number;
   recentWindow?: number;
 }
 
@@ -54,30 +57,72 @@ export class RadioEngine {
     return seen;
   }
 
+  /**
+   * True when a radio candidate is usable: real videoId, not a live stream, not recently seen, and
+   * (when a cap is configured) not longer than the autoplay duration cap. A candidate with unknown
+   * duration (durationSec == null) is NOT rejected by the cap — we can't tell. User-requested tracks
+   * bypass this cap entirely; it lives only here in the radio engine.
+   */
+  private eligible(c: TrackMeta, seen: Set<string>): boolean {
+    if (!c.videoId || c.isLive || seen.has(c.videoId)) return false;
+    const cap = this.deps.maxAutoplayDurationSec;
+    if (cap > 0 && c.durationSec != null && c.durationSec > cap) return false;
+    return true;
+  }
+
+  /**
+   * Best-effort fetch of related/artist tracks off one source track. Resolves to an array (possibly
+   * empty) or null on any error / contract violation — NEVER throws (nextCandidate must not throw).
+   * A dep that resolves to a non-array (null/undefined/contract violation) idles too.
+   */
+  private async fetchCandidates(
+    source: TrackMeta,
+    autoplaySource: AutoplaySource,
+  ): Promise<TrackMeta[] | null> {
+    try {
+      const result =
+        autoplaySource === "artist"
+          ? await this.deps.youtube.artistTracks(source)
+          : await this.deps.youtube.related(source.videoId);
+      return Array.isArray(result) ? result : null;
+    } catch {
+      return null; // best-effort: a source error idles, never throws
+    }
+  }
+
   async nextCandidate(): Promise<TrackMeta | null> {
     const { autoplay, autoplaySource } = this.deps.settings();
     if (!autoplay) return null;
     const seed = this.deps.station.seed;
     if (seed === null) return null;
 
-    let candidates: TrackMeta[];
-    try {
-      const result =
-        autoplaySource === "artist"
-          ? await this.deps.youtube.artistTracks(seed)
-          : await this.deps.youtube.related(seed.videoId);
-      // A dep that resolves to a non-array (null/undefined/contract violation) idles too, rather
-      // than throwing out of nextCandidate (best-effort: a source error idles, never throws).
-      if (!Array.isArray(result)) return null;
-      candidates = result;
-    } catch {
-      return null; // best-effort: a source error idles, never throws
-    }
     const seen = this.seenIds();
-    const next = candidates.find((c) => c.videoId && !c.isLive && !seen.has(c.videoId));
-    if (!next) return null;
-    this.remember(next.videoId);
-    return next;
+
+    // PRIMARY source: the user's explicit seed. Mine related/artist tracks off it.
+    const primary = await this.fetchCandidates(seed, autoplaySource);
+    if (primary === null) return null;
+    const next = primary.find((c) => this.eligible(c, seen));
+    if (next) {
+      this.remember(next.videoId);
+      return next;
+    }
+
+    // RE-SEED FALLBACK (never-stops invariant): the primary seed's related pool is exhausted — every
+    // candidate is already seen/live/too-long. Without this, nextCandidate would return null forever
+    // and the station would dry-hold PERMANENTLY. Fall back ONCE to the most-recently-played history
+    // track as an alternate related-source so discovery keeps flowing. The user's explicit seed
+    // stays PRIMARY; the alternate is only used when the primary is dry (one extra fetch, no loops).
+    const history = this.deps.station.queue.snapshot().history;
+    const alt = [...history]
+      .reverse()
+      .find((i) => i.meta?.videoId && i.meta.videoId !== seed.videoId)?.meta;
+    if (!alt) return null;
+    const fallback = await this.fetchCandidates(alt, autoplaySource);
+    if (fallback === null) return null;
+    const altNext = fallback.find((c) => this.eligible(c, seen));
+    if (!altNext) return null;
+    this.remember(altNext.videoId);
+    return altNext;
   }
 
   async ensureAhead(lowWater = 1): Promise<void> {

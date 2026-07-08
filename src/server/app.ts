@@ -18,7 +18,7 @@ import { registerWebsocket, StationBroadcaster } from "./ws.js";
 import { BrowserPlayerSink } from "../orchestrator/browser-player-sink.js";
 import type { WebConfig } from "../config.js";
 import type { StationController } from "../orchestrator/index.js";
-import type { YouTubeService } from "../youtube/index.js";
+import type { YouTubeService, DownloadOptions, DownloadResult } from "../youtube/index.js";
 import type { PlayerRegistry } from "../players/registry.js";
 import type { AudioCache } from "../cache/index.js";
 import type { Semaphore } from "../util/semaphore.js";
@@ -32,6 +32,10 @@ export interface AppDeps {
   cache: AudioCache;
   cacheDir: string; // = media.cacheDir; the audio route downloads/transcodes into it
   downloads: Semaphore;
+  // Shared coalesced downloader (src/index.ts): consults the cache first + de-dupes concurrent
+  // fetches of the same videoId with the orchestrator's prefetch/load path. Threaded into the
+  // audio route so a browser preload can't spawn a second yt-dlp racing the orchestrator prefetch.
+  coalescedDownload: (videoId: string, opts?: DownloadOptions) => Promise<DownloadResult>;
   lyrics?: RestDeps["lyrics"];
   radio: RestDeps["radio"];
   searchLimit: number;
@@ -108,6 +112,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   registerAudioRoute(app, {
     cache: deps.cache,
     youtube: deps.youtube,
+    download: deps.coalescedDownload,
     cacheDir: deps.cacheDir,
     downloads: deps.downloads,
   });

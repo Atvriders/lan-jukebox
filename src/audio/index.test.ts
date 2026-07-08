@@ -25,7 +25,8 @@ vi.mock("./format.js", async (importOriginal) => {
   };
 });
 
-import { registerAudioRoute, parseRange } from "./index.js";
+import { registerAudioRoute, parseRange, type AudioRouteDeps } from "./index.js";
+import { createCoalescedDownload } from "../util/coalesce-download.js";
 
 describe("parseRange", () => {
   it("returns null when there is no Range header", () => {
@@ -112,7 +113,13 @@ describe("GET /audio/:trackId", () => {
   // cookie by default — the sid cookie is same-origin, exactly as the Player's <audio> element
   // sends it. `rawInject` (the un-patched original) is kept for the unauthenticated 401 test.
   let rawInject!: FastifyInstance["inject"];
-  async function build(youtube: { download: ReturnType<typeof vi.fn> }) {
+  // The route now takes the coalesced downloader as a SEPARATE `download` dep (the shared
+  // src/index.ts downloader), and only `resolve` off `youtube`. Tests pass `download` (a mock or
+  // a real createCoalescedDownload) and optionally a `resolve` mock for the duration-hint path.
+  async function build(deps: {
+    download: AudioRouteDeps["download"];
+    resolve?: AudioRouteDeps["youtube"]["resolve"];
+  }) {
     app = Fastify();
     await app.register(cookie);
     await app.register(session, {
@@ -126,7 +133,8 @@ describe("GET /audio/:trackId", () => {
     registerAuthRoutes(app, TEST_CFG);
     registerAudioRoute(app, {
       cache,
-      youtube: youtube as never,
+      youtube: { resolve: deps.resolve } as never,
+      download: deps.download,
       cacheDir: dir,
       downloads: new Semaphore(2),
     });
@@ -256,8 +264,8 @@ describe("GET /audio/:trackId", () => {
   it("downloads, registers + pins, then serves when the track is not cached", async () => {
     const body = Buffer.from("transcode-me-not-opus"); // arbitrary bytes
     // download() writes the file into cacheDir and returns its real path + AudioInfo
-    const download = vi.fn(async (videoId: string, outDir: string) => {
-      const p = join(outDir, `${videoId}.webm`);
+    const download = vi.fn(async (videoId: string) => {
+      const p = join(dir, `${videoId}.webm`);
       await writeFile(p, body);
       return { path: p, audio: { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 } };
     });
@@ -269,10 +277,10 @@ describe("GET /audio/:trackId", () => {
     expect(res.headers["content-type"]).toBe("audio/webm");
     expect(res.rawPayload.equals(body)).toBe(true);
     expect(download).toHaveBeenCalledTimes(1);
-    // resolveFile threads the resolved durationSec into download() as a third options arg.
-    // This bare youtube stub has no resolve(), so that lookup is caught and durationSec is
-    // undefined — download is still invoked with (id, dir, { durationSec: undefined }).
-    expect(download).toHaveBeenCalledWith(ID, dir, { durationSec: undefined });
+    // resolveFile threads the resolved durationSec into the coalesced download() as its opts arg.
+    // No resolve() is wired here, so that lookup is caught and durationSec is undefined —
+    // download is still invoked with (id, { durationSec: undefined }).
+    expect(download).toHaveBeenCalledWith(ID, { durationSec: undefined });
     // registered + pinned: a second request must NOT re-download.
     expect(cache.has(ID)).toBe(true);
     const res2 = await app.inject({ method: "GET", url: `/audio/${ID}` });
@@ -285,8 +293,8 @@ describe("GET /audio/:trackId", () => {
     // scaleDownloadTimeout could never scale and a long track was SIGKILLed at the short
     // default. The route now resolves the track first and forwards its durationSec.
     const body = Buffer.from("long-mix-bytes");
-    const download = vi.fn(async (videoId: string, outDir: string) => {
-      const p = join(outDir, `${videoId}.webm`);
+    const download = vi.fn(async (videoId: string) => {
+      const p = join(dir, `${videoId}.webm`);
       await writeFile(p, body);
       return { path: p, audio: { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 } };
     });
@@ -298,29 +306,28 @@ describe("GET /audio/:trackId", () => {
       isLive: false,
       thumbnailUrl: null,
     }));
-    // build()'s param is typed { download }, but the route uses resolve too — pass both.
-    await build({ download, resolve } as never);
+    await build({ download, resolve });
 
     const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
     expect(res.statusCode).toBe(200);
     expect(resolve).toHaveBeenCalledWith(ID);
-    expect(download).toHaveBeenCalledWith(ID, dir, { durationSec: 5400 });
+    expect(download).toHaveBeenCalledWith(ID, { durationSec: 5400 });
   });
 
   it("falls back to an unscaled download (durationSec undefined) when resolve() fails", async () => {
     // A resolve failure must NOT 404 the request — the route downloads unscaled instead.
     const body = Buffer.from("bytes");
-    const download = vi.fn(async (videoId: string, outDir: string) => {
-      const p = join(outDir, `${videoId}.webm`);
+    const download = vi.fn(async (videoId: string) => {
+      const p = join(dir, `${videoId}.webm`);
       await writeFile(p, body);
       return { path: p, audio: { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 } };
     });
     const resolve = vi.fn().mockRejectedValue(new Error("unavailable"));
-    await build({ download, resolve } as never);
+    await build({ download, resolve });
 
     const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
     expect(res.statusCode).toBe(200);
-    expect(download).toHaveBeenCalledWith(ID, dir, { durationSec: undefined });
+    expect(download).toHaveBeenCalledWith(ID, { durationSec: undefined });
   });
 
   it("transcodes a non-playable source and serves it as audio/mp4", async () => {
@@ -413,18 +420,27 @@ describe("GET /audio/:trackId", () => {
     const gate = new Promise<void>((r) => {
       release = r;
     });
-    // download() blocks on the gate so both requests are in-flight simultaneously.
-    const download = vi.fn(async (videoId: string, outDir: string) => {
+    // The underlying yt-dlp fetch blocks on the gate so both requests are in-flight simultaneously.
+    const rawDownload = vi.fn(async (videoId: string) => {
       await gate;
-      const p = join(outDir, `${videoId}.webm`);
+      const p = join(dir, `${videoId}.webm`);
       await writeFile(p, body);
       return { path: p, audio: { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 } };
+    });
+    // The route no longer owns a source single-flight; coalescing now lives in the shared
+    // downloader (createCoalescedDownload) that src/index.ts injects as `download`. Wire the mock
+    // through it here so the test still verifies concurrent /audio requests collapse to ONE yt-dlp.
+    const download = createCoalescedDownload({
+      download: rawDownload,
+      cacheGet: (id) => cache.get(id),
+      cacheGetAudio: (id) => cache.getAudio(id),
+      semaphore: new Semaphore(2),
     });
     await build({ download });
 
     const r1 = app.inject({ method: "GET", url: `/audio/${ID}` });
     const r2 = app.inject({ method: "GET", url: `/audio/${ID}` });
-    // Let both handlers reach the cache miss + single-flight gate before releasing.
+    // Let both handlers reach the cache miss + coalesce gate before releasing.
     await new Promise((r) => setImmediate(r));
     release();
     const [res1, res2] = await Promise.all([r1, r2]);
@@ -433,8 +449,8 @@ describe("GET /audio/:trackId", () => {
     expect(res2.statusCode).toBe(200);
     expect(res1.rawPayload.equals(body)).toBe(true);
     expect(res2.rawPayload.equals(body)).toBe(true);
-    // The single-flight guard collapsed the duplicate download.
-    expect(download).toHaveBeenCalledTimes(1);
+    // The shared coalesced downloader collapsed the duplicate yt-dlp fetch.
+    expect(rawDownload).toHaveBeenCalledTimes(1);
   });
 
   // Regression: the /audio route must be gated on the shared-password session exactly like the

@@ -315,7 +315,13 @@ export function App() {
             item={snap?.current ?? null}
             paused={effectivePaused}
             receivedAt={receivedAt}
-            canSeek={wantsSpeaker}
+            // Seeking is a station control like skip/pause/shuffle — every one of those works
+            // from any authenticated remote (control() → REST, which only requires a session),
+            // and station.seek() routes the seek to the active Player's <audio> regardless of who
+            // issued it. Gating the bar on wantsSpeaker made seek the lone speaker-only control,
+            // so a remote could skip but not scrub. The bar still self-gates on durationMs > 0
+            // (a live feed is not seekable).
+            canSeek={true}
             onSeek={(positionMs) => void control("seek", positionMs)}
           />
           {/* Live download/processing progress for the track being fetched. Returns null

@@ -28,31 +28,33 @@ yt-dlp (YouTube rotates its nsig solver, so a stale yt-dlp breaks extraction).
 `src/config.ts` is the only env reader. All variables are set inline in
 `docker-compose.yml`. Defaults below are the values `src/config.ts` falls back to.
 
-| Variable                 | Required | Default                      | Notes                                                                                                                              |
-| ------------------------ | -------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `PORT`                   | no       | `3018`                       | Internal container listen port.                                                                                                    |
-| `HOST_PORT`              | no       | `3018`                       | Host port your own ingress connects to (published on `127.0.0.1`, in `docker-compose.yml`).                                        |
-| `HOST`                   | no       | `0.0.0.0`                    | Bind address inside the container.                                                                                                 |
-| `PUBLIC_BASE_URL`        | yes      | —                            | The public `https://` subdomain (e.g. `https://jukebox.example.com`). Trailing slash is stripped.                                  |
-| `ALLOWED_WS_ORIGINS`     | no\*     | = `PUBLIC_BASE_URL`          | **MUST equal `PUBLIC_BASE_URL` exactly** (see WebSocket gotcha). Defaults to `PUBLIC_BASE_URL`; only override for extra origins.   |
-| `VIEWER_PASSWORD`        | yes\*\*  | —                            | Single shared password; anyone authenticated controls everything. There is no separate admin/second password.                      |
-| `ALLOW_NO_PASSWORD`      | no       | `false`                      | Set `true` to run with no viewer password (LAN-only escape hatch). Server refuses to start with no password unless this is `true`. |
-| `SESSION_SECRET`         | yes      | —                            | Cookie-signing secret, **>= 32 chars** (server refuses to start otherwise).                                                        |
-| `CACHE_DIR`              | no       | `/data/cache`                | Holds the audio LRU **and** the station snapshot + device registry JSON. Mount a volume here.                                      |
-| `CACHE_MAX_MB`           | no       | `2048`                       | LRU audio cache size cap (MiB).                                                                                                    |
-| `HISTORY_MAX_ITEMS`      | no       | `100`                        | Recently-played history length.                                                                                                    |
-| `SEARCH_RESULT_COUNT`    | no       | `5`                          | Search-candidate count.                                                                                                            |
-| `PREFETCH_DEPTH`         | no       | `1`                          | Radio queue-ahead depth.                                                                                                           |
-| `MAX_TRANSCODE_JOBS`     | no       | `2`                          | Parallel yt-dlp download/transcode cap (>= 1).                                                                                     |
-| `MAX_TRACK_DURATION_SEC` | no       | — (`0`/empty = no cap)       | Reject tracks longer than this many seconds; `0`, empty, or unset means no ceiling.                                                |
-| `YTDLP_TIMEOUT_MS`       | no       | `60000`                      | Per-invocation yt-dlp timeout (ms).                                                                                                |
-| `YT_PROXY`               | no       | —                            | Optional residential/SOCKS proxy for yt-dlp.                                                                                       |
-| `YT_COOKIES`             | no       | —                            | Optional mounted `cookies.txt` path for flagged IPs (takes precedence over `YT_COOKIES_TEXT`).                                     |
-| `YT_COOKIES_TEXT`        | no       | —                            | Paste cookies inline (a browser `Cookie:` header or a full `cookies.txt`); written to `<cache>/yt-cookies.txt` at startup.         |
-| `YT_PLAYER_CLIENTS`      | no       | `android_vr,web_embedded,tv` | Zero-PO-token client ladder. **Never** use `web,mweb` unless you run the bgutil PO-token sidecar.                                  |
-| `PO_TOKEN_PROVIDER_URL`  | no       | —                            | Only set (e.g. `http://bgutil-pot:4416`) when you run the optional bgutil PO-token provider (`--profile pot`).                     |
-| `LOG_LEVEL`              | no       | `info`                       | pino level (`trace`..`fatal`).                                                                                                     |
-| `NODE_ENV`               | no       | `development`                | Set `production` in deploy — enables `Secure` session cookies.                                                                     |
+| Variable                 | Required | Default                      | Notes                                                                                                                                                     |
+| ------------------------ | -------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                   | no       | `3018`                       | Internal container listen port.                                                                                                                           |
+| `HOST_PORT`              | no       | `3018`                       | Host port your own ingress connects to (published on `127.0.0.1`, in `docker-compose.yml`).                                                               |
+| `HOST`                   | no       | `0.0.0.0`                    | Bind address inside the container.                                                                                                                        |
+| `PUBLIC_BASE_URL`        | yes      | —                            | The public `https://` subdomain (e.g. `https://jukebox.example.com`). Trailing slash is stripped.                                                         |
+| `ALLOWED_WS_ORIGINS`     | no\*     | = `PUBLIC_BASE_URL`          | **MUST equal `PUBLIC_BASE_URL` exactly** (see WebSocket gotcha). Defaults to `PUBLIC_BASE_URL`; only override for extra origins.                          |
+| `VIEWER_PASSWORD`        | yes\*\*  | —                            | Single shared password; anyone authenticated controls everything. There is no separate admin/second password.                                             |
+| `ALLOW_NO_PASSWORD`      | no       | `false`                      | Set `true` to run with no viewer password (LAN-only escape hatch). Server refuses to start with no password unless this is `true`.                        |
+| `SESSION_SECRET`         | yes      | —                            | Cookie-signing secret, **>= 32 chars** (server refuses to start otherwise).                                                                               |
+| `CACHE_DIR`              | no       | `/data/cache`                | Holds the audio LRU **and** the station snapshot + device registry JSON. Mount a volume here.                                                             |
+| `CACHE_MAX_MB`           | no       | `2048`                       | LRU audio cache size cap (MiB).                                                                                                                           |
+| `HISTORY_MAX_ITEMS`      | no       | `100`                        | Recently-played history length.                                                                                                                           |
+| `SEARCH_RESULT_COUNT`    | no       | `5`                          | Search-candidate count.                                                                                                                                   |
+| `PREFETCH_DEPTH`         | no       | `1`                          | Radio queue-ahead depth.                                                                                                                                  |
+| `MAX_TRANSCODE_JOBS`     | no       | `2`                          | Parallel yt-dlp download/transcode cap (>= 1).                                                                                                            |
+| `MAX_TRACK_DURATION_SEC` | no       | — (`0`/empty = no cap)       | Reject tracks longer than this many seconds; `0`, empty, or unset means no ceiling.                                                                       |
+| `RADIO_MAX_AUTOPLAY_SEC` | no       | `900` (15 min); `0` = no cap | Radio **auto-discovery** skips candidates longer than this many seconds; `0` = no cap. **User-requested tracks are never capped.**                        |
+| `YTDLP_TIMEOUT_MS`       | no       | `60000`                      | Per-invocation yt-dlp timeout (ms).                                                                                                                       |
+| `YT_PROXY`               | no       | —                            | Optional residential/SOCKS proxy for yt-dlp.                                                                                                              |
+| `YT_COOKIES`             | no       | —                            | Optional mounted `cookies.txt` path for flagged IPs (takes precedence over `YT_COOKIES_TEXT`).                                                            |
+| `YT_COOKIES_TEXT`        | no       | —                            | Paste cookies inline (a browser `Cookie:` header or a full `cookies.txt`); written to `<cache>/yt-cookies.txt` at startup.                                |
+| `YT_SPONSORBLOCK`        | no       | music-focused CSV            | SponsorBlock categories yt-dlp removes from downloaded audio. Unset = `music_offtopic,intro,outro,sponsor,selfpromo,preview,interaction`; `off` disables. |
+| `YT_PLAYER_CLIENTS`      | no       | `android_vr,web_embedded,tv` | Zero-PO-token client ladder. **Never** use `web,mweb` unless you run the bgutil PO-token sidecar.                                                         |
+| `PO_TOKEN_PROVIDER_URL`  | no       | —                            | Only set (e.g. `http://bgutil-pot:4416`) when you run the optional bgutil PO-token provider (`--profile pot`).                                            |
+| `LOG_LEVEL`              | no       | `info`                       | pino level (`trace`..`fatal`).                                                                                                                            |
+| `NODE_ENV`               | no       | `development`                | Set `production` in deploy — enables `Secure` session cookies.                                                                                            |
 
 > \* `ALLOWED_WS_ORIGINS` is optional only because it **defaults to
 > `PUBLIC_BASE_URL`**. If you set it, it must still equal `PUBLIC_BASE_URL`.

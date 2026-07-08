@@ -130,6 +130,37 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
     });
   };
 
+  // WS heartbeat: ping/pong keepalive to reap ghost listeners + a stuck dead speaker.
+  // A client that dies uncleanly (laptop lid, Wi-Fi drop, NAT timeout) never fires 'close',
+  // so without this it lingers forever in the live listeners roster — and if it was the
+  // speaker, the station stays attached to a dead sink. Each sweep terminates any socket
+  // that missed the previous ping; terminate() fires 'close', which runs the existing
+  // trackDisconnect/onDisconnect cleanup (so both ghosts AND dead speakers are reaped).
+  type HeartbeatSocket = WsWebSocket & { _isAlive?: boolean };
+  const openSockets = new Set<HeartbeatSocket>();
+  const heartbeat = setInterval(() => {
+    for (const socket of openSockets) {
+      // Crash-safe per socket: a throw from one dead socket's ping/terminate must not
+      // abort the sweep for the rest.
+      try {
+        if (socket._isAlive === false) {
+          socket.terminate(); // missed the last ping -> 'close' fires -> normal cleanup reaps it
+        } else {
+          socket._isAlive = false;
+          socket.ping();
+        }
+      } catch {
+        // ignore this socket; keep sweeping the others
+      }
+    }
+  }, 30000);
+  // Stop the sweep when Fastify closes so tests/shutdown don't leak a timer. Callback form (no
+  // await needed) rather than an async handler with no await expression.
+  app.addHook("onClose", (_instance, done) => {
+    clearInterval(heartbeat);
+    done();
+  });
+
   app.get("/ws", { websocket: true }, (socket: WsWebSocket, req: FastifyRequest) => {
     const session = (
       req as FastifyRequest & {
@@ -147,7 +178,17 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
 
     deps.broadcaster.subscribe(send);
 
+    // Heartbeat liveness for this socket (see the sweep above): alive on open, on every
+    // pong, and on every inbound message (activity implies alive).
+    const hbSocket = socket as HeartbeatSocket;
+    hbSocket._isAlive = true;
+    openSockets.add(hbSocket);
+    socket.on("pong", () => {
+      hbSocket._isAlive = true;
+    });
+
     socket.on("message", (raw: Buffer) => {
+      hbSocket._isAlive = true;
       let parsed: unknown;
       try {
         parsed = JSON.parse(raw.toString());
@@ -177,7 +218,9 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
           deps.registry.release(deviceId);
           break;
         case "position":
-          deps.station.reportPosition(msg.ms);
+          // Player-scoped: only the ACTIVE speaker's clock drives the station.
+          // A non-speaker's position must NOT move the shared timeline.
+          if (deps.registry.isSpeaker(deviceId)) deps.station.reportPosition(msg.ms);
           break;
         case "trackEnded":
           // Route through the sink's guarded API (destroyed short-circuit) rather than a raw
@@ -188,7 +231,9 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
           // The Player already started the next track (crossfading in); advance the queue
           // WITHOUT re-loading it. For a given track the Player sends EITHER crossfadeAdvance
           // OR trackEnded, never both, so this never double-advances vs onSinkTrackEnd.
-          deps.station.crossfadeAdvance();
+          // Player-scoped: a non-speaker sending this would desync the station (advance the
+          // queue while the real Player keeps playing), so ignore it unless we're the speaker.
+          if (deps.registry.isSpeaker(deviceId)) deps.station.crossfadeAdvance();
           break;
         case "playbackError":
           // MUST go through onPlaybackError (not a raw emit("error")): a listener-less
@@ -208,6 +253,8 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
       // Drop this socket from the live listeners roster (deviceId-scoped: one decrement per
       // socket, so multi-tab / reload overlap nets out — the device stays until its last socket).
       deps.registry.trackDisconnect(deviceId);
+      // Stop heartbeating a closed socket.
+      openSockets.delete(hbSocket);
       deps.broadcaster.unsubscribe(send);
       // The roster shrank — tell everyone still connected. Unsubscribe FIRST so this dead
       // socket is not in the fan-out.

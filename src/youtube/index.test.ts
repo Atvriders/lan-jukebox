@@ -486,7 +486,35 @@ describe("YouTubeService.download", () => {
     expect(args[printIdx + 1]).toContain("after_move:");
     expect(args[printIdx + 1]).toContain("%(acodec)s");
     expect(args[args.length - 1]).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    // SponsorBlock is ON by default (unset YT_SPONSORBLOCK → music-focused CSV): yt-dlp is told
+    // to strip those segment categories from the downloaded audio.
+    expect(args).toContain("--sponsorblock-remove");
+    const sbIdx = args.indexOf("--sponsorblock-remove");
+    expect(args[sbIdx + 1]).toBe(
+      "music_offtopic,intro,outro,sponsor,selfpromo,preview,interaction",
+    );
+  });
+
+  it("omits --sponsorblock-remove when YT_SPONSORBLOCK is 'off'", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yt-"));
+    await writeFile(join(dir, "dQw4w9WgXcQ.webm"), "fakeaudio");
+    runMock.mockResolvedValue(ok("AUDIOFMT::opus|160|165|48000\n"));
+    const offCfg = loadMediaConfig({ YT_SPONSORBLOCK: "off" });
+    await new YouTubeService(offCfg).download("dQw4w9WgXcQ", dir);
+    const args = runMock.mock.calls[0]![0] as string[];
     expect(args).not.toContain("--sponsorblock-remove");
+  });
+
+  it("passes a custom YT_SPONSORBLOCK CSV straight through to yt-dlp", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yt-"));
+    await writeFile(join(dir, "dQw4w9WgXcQ.webm"), "fakeaudio");
+    runMock.mockResolvedValue(ok("AUDIOFMT::opus|160|165|48000\n"));
+    const customCfg = loadMediaConfig({ YT_SPONSORBLOCK: "sponsor,selfpromo" });
+    await new YouTubeService(customCfg).download("dQw4w9WgXcQ", dir);
+    const args = runMock.mock.calls[0]![0] as string[];
+    const sbIdx = args.indexOf("--sponsorblock-remove");
+    expect(sbIdx).toBeGreaterThan(-1);
+    expect(args[sbIdx + 1]).toBe("sponsor,selfpromo");
   });
 
   it("returns null audio when yt-dlp prints no usable format", async () => {

@@ -321,6 +321,8 @@ export interface MediaConfig {
   ytCookiesFile: string | null;
   /** Inline Netscape cookies.txt CONTENT (pasted into compose); materialized to a file at startup. */
   ytCookiesText: string | null;
+  /** SponsorBlock category CSV passed to yt-dlp to strip segments from downloaded audio; null = disabled. */
+  sponsorblockCategories: string | null;
   poTokenProviderUrl: string | null;
   playerClients: string; // default "android_vr,web_embedded,tv"
   ytdlpTimeoutMs: number;
@@ -329,6 +331,8 @@ export interface MediaConfig {
 export interface StationConfig {
   prefetchDepth: number;
   maxConcurrentDownloads: number;
+  /** Radio autoplay skips candidates longer than this many seconds; 0 = no cap. User-requested tracks are NOT capped. */
+  maxAutoplayDurationSec: number;
   logLevel: string;
 }
 

@@ -3,33 +3,32 @@ import { rm, stat } from "node:fs/promises";
 import { extname, join } from "node:path";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import type { AudioCache } from "../cache/index.js";
-import type { YouTubeService } from "../youtube/index.js";
+import type { YouTubeService, DownloadOptions, DownloadResult } from "../youtube/index.js";
 import type { Semaphore } from "../util/semaphore.js";
 import { chooseDelivery, transcodeToM4a } from "./format.js";
 import { requireSession } from "../auth/password.js";
 
 export interface AudioRouteDeps {
   cache: AudioCache;
-  youtube: Pick<YouTubeService, "download" | "resolve">;
+  // Only `resolve` is needed now (for the duration hint threaded into the download); the actual
+  // fetch goes through the shared coalesced `download` below, not youtube.download directly.
+  youtube: Pick<YouTubeService, "resolve">;
+  // Shared coalesced downloader injected from src/index.ts: consults the cache first and de-dupes
+  // concurrent fetches of the same videoId with the orchestrator's prefetch/load path (through the
+  // download semaphore). Using it here — instead of a raw youtube.download guarded by a route-local
+  // single-flight — means a track promoted to upcoming[0] is fetched by exactly ONE yt-dlp even if
+  // the orchestrator prefetch and a browser preload race, so they can't both write (and corrupt)
+  // the same `--no-part` file.
+  download: (videoId: string, opts?: DownloadOptions) => Promise<DownloadResult>;
   cacheDir: string;
-  downloads: Semaphore;
+  downloads: Semaphore; // still gates the transcode (ffmpeg) leg
 }
 
 /**
- * Per-videoId single-flight guard. The Semaphore bounds concurrency but is NOT key-aware,
- * so two concurrent GET /audio/:id for the same uncached id would both pass the cache miss,
- * both call youtube.download(), and both register() the same key — duplicate yt-dlp work plus
- * a destructive register() race (the second register rm's the first download's file out from
- * under an in-flight stream). Coalescing on videoId so the second caller awaits the first's
- * Promise eliminates both. Cleared in a finally so a failed resolve doesn't poison the key.
- */
-const inFlight = new Map<string, Promise<{ path: string; contentType: string } | null>>();
-
-/**
- * Per-videoId single-flight guard for the TRANSCODE leg specifically. The download inFlight
- * map only guards the uncached path — but the fast path in ensureFile returns before taking
- * that lock whenever the ORIGINAL source is already cached. For a cached-but-needs-transcode
- * id, two concurrent requests would both reach the transcode block, both see cache.get(m4aKey)
+ * Per-videoId single-flight guard for the TRANSCODE leg specifically. The coalesced downloader
+ * de-dupes the SOURCE fetch across callers, but it hands every joiner the same already-cached
+ * path and returns immediately for a cached source — it does nothing for the transcode. For a
+ * cached-but-needs-transcode id, two concurrent requests would both reach the transcode block, both see cache.get(m4aKey)
  * null, and both spawn ffmpeg writing the SAME `${videoId}.transcoded.m4a` (ffmpeg runs with
  * `-y` + `-movflags +faststart`), interleaving their writes into a corrupt file that then gets
  * register()+pin()'d and served. Coalescing on the m4a key so the second caller awaits the
@@ -79,43 +78,24 @@ export function parseRange(
 }
 
 /**
- * Resolve a videoId to a ready-to-serve file path + Content-Type.
- * Downloads if missing (through the semaphore), registers+pins in the cache,
- * and transcodes once to a clean .m4a when the source isn't browser-playable.
+ * Resolve a videoId to a ready-to-serve file path + Content-Type. Fetches the source through the
+ * SHARED coalesced downloader (deps.download) when it isn't cached — that consults the cache first
+ * and de-dupes concurrent downloads of the same id with the orchestrator's prefetch/load path, so
+ * the route no longer needs its own source single-flight map (concurrent joiners get the SAME path,
+ * making the register()+pin() below idempotent). Registers+pins the source, then transcodes once
+ * (coalesced on the m4a key) to a clean .m4a when the source isn't browser-playable.
  * Returns null when the track can't be produced (caller -> 404).
  */
-async function ensureFile(
-  deps: AudioRouteDeps,
-  videoId: string,
-): Promise<{ path: string; contentType: string } | null> {
-  // Fast path: already cached. Resolve directly (no need to take the single-flight lock).
-  if (deps.cache.get(videoId)) {
-    return resolveFile(deps, videoId);
-  }
-  // Single-flight: if a resolve for this id is already running, await it instead of starting
-  // a second download. The first caller owns the entry and removes it on settle.
-  const existing = inFlight.get(videoId);
-  if (existing) return existing;
-
-  const work = resolveFile(deps, videoId).finally(() => {
-    inFlight.delete(videoId);
-  });
-  inFlight.set(videoId, work);
-  return work;
-}
-
 async function resolveFile(
   deps: AudioRouteDeps,
   videoId: string,
 ): Promise<{ path: string; contentType: string } | null> {
-  // Re-check the cache: a coalesced caller may have raced in, and the fast path above
-  // already populated the cache for an already-cached id.
   let path = deps.cache.get(videoId);
   let audio = deps.cache.getAudio(videoId);
 
   if (!path) {
     try {
-      // Resolve the track first so we can thread its duration into download(): that scales the
+      // Resolve the track first so we can thread its duration into the download: that scales the
       // yt-dlp timeout for long mixes/concerts instead of killing them at the short default.
       // Best-effort — a resolve failure falls back to an unscaled download rather than 404ing.
       let durationSec: number | null | undefined;
@@ -124,9 +104,14 @@ async function resolveFile(
       } catch {
         durationSec = undefined;
       }
-      const result = await deps.downloads.run(() =>
-        deps.youtube.download(videoId, deps.cacheDir, { durationSec }),
-      );
+      // Fetch through the SHARED coalesced downloader rather than a raw youtube.download: it
+      // consults the cache first and guarantees exactly ONE yt-dlp per videoId across BOTH this
+      // route and the orchestrator's prefetch/load path. Without it, a track promoted to
+      // upcoming[0] could be fetched by the orchestrator prefetch AND a browser preload at once —
+      // two processes writing the same `--no-part` file, corrupting it into a playbackError/skip.
+      // The coalesced fn already runs the real download under the download semaphore, so there is
+      // no deps.downloads.run wrapper here (that would double-acquire the same gate).
+      const result = await deps.download(videoId, { durationSec });
       deps.cache.register(videoId, result.path, result.audio);
       deps.cache.pin(videoId);
       path = result.path;
@@ -238,13 +223,13 @@ export function registerAudioRoute(app: FastifyInstance, deps: AudioRouteDeps): 
     // invariant), exhausting download slots, CPU, disk, and the host's YouTube egress. The
     // Player's same-origin <audio src="/audio/<id>"> sends the sid cookie automatically, so
     // legitimate playback still passes. Check BEFORE the id-format check so unauthenticated
-    // callers get 401 and never reach ensureFile()/youtube.download().
+    // callers get 401 and never reach resolveFile()/the downloader.
     if (!(await requireSession(req, reply))) return;
     const { trackId } = req.params;
     if (!VIDEO_ID_RE.test(trackId)) {
       return reply.code(404).send({ error: "not_found" });
     }
-    const file = await ensureFile(deps, trackId);
+    const file = await resolveFile(deps, trackId);
     if (!file) {
       return reply.code(404).send({ error: "not_found" });
     }

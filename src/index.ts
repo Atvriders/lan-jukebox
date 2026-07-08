@@ -109,6 +109,9 @@ async function main(): Promise<void> {
       cache.unpin(videoId);
       cache.unpin(`${videoId}.m4a`);
     },
+    // Lets crossfadeAdvance read an already-cached track's real audio format (the crossfade path
+    // has no download to source it from) so the NowPlaying format badge renders for crossfaded tracks.
+    getAudio: (videoId) => cache.getAudio(videoId),
     // Prefetch the upcoming head. Register the resulting file in the LRU cache (NOT pinned)
     // so its bytes are tracked + evictable and loadCurrentLocked can hit it instead of
     // re-downloading. Without register() the file was an untracked on-disk orphan the
@@ -136,6 +139,9 @@ async function main(): Promise<void> {
   const radio = new RadioEngine({
     youtube,
     station,
+    // Cap on how long an AUTOPLAY (radio-continuation) track may run — a 10-hour "lofi" mix
+    // enqueued by the radio would otherwise hold the station on one track for hours. 0 = no cap.
+    maxAutoplayDurationSec: stationCfg.maxAutoplayDurationSec,
     settings: () => ({
       autoplay: station.settings.autoplay,
       autoplaySource: station.settings.autoplaySource,
@@ -162,6 +168,10 @@ async function main(): Promise<void> {
     cache,
     cacheDir: media.cacheDir,
     downloads,
+    // Hand the audio route the SAME coalesced downloader the orchestrator uses so a browser
+    // preload of upcoming[0] joins the in-flight prefetch instead of spawning a second yt-dlp
+    // that races it on the same `--no-part` file (corruption -> playbackError -> skip).
+    coalescedDownload,
     radio,
     searchLimit: media.searchResultCount,
   });

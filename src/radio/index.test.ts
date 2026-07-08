@@ -49,6 +49,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
     expect(await r.nextCandidate()).toBeNull();
@@ -65,6 +66,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
     const c = await r.nextCandidate();
@@ -82,6 +84,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related: vi.fn(), artistTracks },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: () => ({ autoplay: true, autoplaySource: "artist" }),
     });
     expect((await r.nextCandidate())?.videoId).toBe("zzzzzzzzzzz");
@@ -102,9 +105,43 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
     expect((await r.nextCandidate())?.videoId).toBe("nnnnnnnnnnn"); // aaa=current, lll=live → skipped
+  });
+
+  it("skips autoplay candidates longer than maxAutoplayDurationSec (cap>0); null duration passes", async () => {
+    const longMix: TrackMeta = {
+      videoId: "longlonglon",
+      title: "10h mix",
+      channel: "c",
+      durationSec: 36000, // way over the cap
+      isLive: false,
+      thumbnailUrl: null,
+    };
+    const unknownDur: TrackMeta = {
+      videoId: "unknownnnnn",
+      title: "?",
+      channel: "c",
+      durationSec: null, // unknown → cap can't reject it
+      isLive: false,
+      thumbnailUrl: null,
+    };
+    const related = vi.fn(async () => [longMix, unknownDur]);
+    const { station } = fakeStation(meta("aaaaaaaaaaa"), {
+      current: null,
+      upcoming: [],
+      history: [],
+    });
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 900,
+      settings: radioSettings,
+    });
+    // longMix (36000s > 900) is skipped by the cap; unknownDur (durationSec null) is NOT rejected.
+    expect((await r.nextCandidate())?.videoId).toBe("unknownnnnn");
   });
 
   it("does not re-pick the same id across consecutive calls (bounded recent window)", async () => {
@@ -117,6 +154,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
     expect((await r.nextCandidate())?.videoId).toBe("sssssssssss");
@@ -133,6 +171,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
     expect((await r.nextCandidate())?.videoId).toBe("sssssssssss");
@@ -153,6 +192,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
     await expect(r.nextCandidate()).resolves.toBeNull();
@@ -171,6 +211,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
     await expect(r.nextCandidate()).resolves.toBeNull();
@@ -186,6 +227,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: () => ({ autoplay: false, autoplaySource: "radio" }),
     });
     expect(await r.nextCandidate()).toBeNull();
@@ -217,6 +259,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
     await r.ensureAhead(2);
@@ -239,6 +282,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
     await expect(r.ensureAhead(2)).resolves.toBeUndefined();
@@ -268,6 +312,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
     await r.ensureAhead(2);
@@ -292,6 +337,7 @@ describe("RadioEngine", () => {
     const r = new RadioEngine({
       youtube: { related, artistTracks: vi.fn() },
       station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
     await r.ensureAhead(1);

@@ -12,9 +12,10 @@ export class Queue extends EventEmitter {
   private _current: QueueItem | null = null;
   private _upcoming: QueueItem[] = [];
   private _history: QueueItem[] = [];
-  // UNCAPPED record of every track that has cleanly advanced this cycle, kept separately
-  // from the bounded `_history` ring so repeat="all" can re-cycle the FULL set even when it
-  // exceeds historyMax. Reset on requeueHistory() / clear().
+  // Record of tracks that have cleanly advanced this cycle, kept separately from the display
+  // `_history` ring so repeat="all" can re-cycle them. Bounded to historyMax (see advance):
+  // this station runs for days, so an unbounded array would slowly OOM and permanently stop
+  // playback — the invariant we exist to protect. Reset on requeueHistory() / clear().
   private _played: QueueItem[] = [];
   private readonly mutex = new Mutex();
   private readonly historyMax: number;
@@ -83,6 +84,12 @@ export class Queue extends EventEmitter {
     return this.mutex.runExclusive(() => {
       if (this._current) {
         this._played.push(this._current);
+        // Bound `_played` to historyMax so it can't grow forever on the always-on station
+        // (unbounded here == slow OOM == a permanent stop). requeueHistory then recycles the
+        // most recent <=historyMax played tracks, the correct set for repeat="all".
+        if (this._played.length > this.historyMax) {
+          this._played.splice(0, this._played.length - this.historyMax);
+        }
         this._history.push(this._current);
         if (this._history.length > this.historyMax) {
           this._history.splice(0, this._history.length - this.historyMax);

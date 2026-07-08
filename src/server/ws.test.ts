@@ -355,12 +355,24 @@ describe("registerWebsocket integration", () => {
     ws.close();
   });
 
-  it("position telemetry reaches station.reportPosition", async () => {
+  it("position telemetry from the active speaker reaches station.reportPosition", async () => {
     h = await boot({ authed: true });
     const ws = await openHello(h.url);
+    // Position is now speaker-scoped: only the ACTIVE speaker's clock drives the station.
+    ws.send(JSON.stringify({ type: "becomePlayer" }));
+    await new Promise((r) => setTimeout(r, 30));
     ws.send(JSON.stringify({ type: "position", ms: 4242 }));
     await new Promise((r) => setTimeout(r, 50));
     expect(h.station.reportPosition).toHaveBeenCalledWith(4242);
+    ws.close();
+  });
+
+  it("position telemetry from a NON-speaker is ignored", async () => {
+    h = await boot({ authed: true });
+    const ws = await openHello(h.url); // never becomes the player → not the speaker
+    ws.send(JSON.stringify({ type: "position", ms: 4242 }));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(h.station.reportPosition).not.toHaveBeenCalled();
     ws.close();
   });
 
@@ -392,12 +404,24 @@ describe("registerWebsocket integration", () => {
     ws.close();
   });
 
-  it("crossfadeAdvance routes to station.crossfadeAdvance()", async () => {
+  it("crossfadeAdvance from the active speaker routes to station.crossfadeAdvance()", async () => {
     h = await boot({ authed: true });
     const ws = await openHello(h.url);
+    // crossfadeAdvance is now speaker-scoped: a non-speaker sending it would desync the station.
+    ws.send(JSON.stringify({ type: "becomePlayer" }));
+    await new Promise((r) => setTimeout(r, 30));
     ws.send(JSON.stringify({ type: "crossfadeAdvance" }));
     await new Promise((r) => setTimeout(r, 50));
     expect(h.station.crossfadeAdvance).toHaveBeenCalledTimes(1);
+    ws.close();
+  });
+
+  it("crossfadeAdvance from a NON-speaker is ignored", async () => {
+    h = await boot({ authed: true });
+    const ws = await openHello(h.url); // never becomes the player → not the speaker
+    ws.send(JSON.stringify({ type: "crossfadeAdvance" }));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(h.station.crossfadeAdvance).not.toHaveBeenCalled();
     ws.close();
   });
 
@@ -436,16 +460,25 @@ describe("registerWebsocket integration", () => {
     ws1.close();
   });
 
-  it("registers no recurring interval (no 30s revalidation)", async () => {
-    const spy = vi.spyOn(global, "setInterval");
+  it("registers a single 30s heartbeat sweep and clears it on close", async () => {
+    const setSpy = vi.spyOn(global, "setInterval");
+    const clearSpy = vi.spyOn(global, "clearInterval");
     h = await boot({ authed: true });
     const ws = await openHello(h.url);
     await new Promise((r) => setTimeout(r, 30));
-    // Only Fastify/ws internals may set intervals; our handler must add none keyed to /ws auth.
-    const ourIntervals = spy.mock.calls.filter(([, ms]) => ms === 30000 || ms === 30_000);
-    expect(ourIntervals).toHaveLength(0);
+    // The batch replaced "no recurring interval" with a 30s ping/pong keepalive that reaps ghost
+    // sockets + a stuck dead speaker. Exactly ONE such timer must be registered.
+    const timers = setSpy.mock.calls
+      .map((call, i) => ({ ms: call[1], handle: setSpy.mock.results[i]?.value }))
+      .filter((t) => t.ms === 30000 || t.ms === 30_000);
+    expect(timers).toHaveLength(1);
     ws.close();
-    spy.mockRestore();
+    // The onClose hook must clear the heartbeat so shutdown doesn't leak the timer.
+    await h.app.close();
+    h = null;
+    expect(clearSpy).toHaveBeenCalledWith(timers[0]!.handle);
+    setSpy.mockRestore();
+    clearSpy.mockRestore();
   });
 });
 

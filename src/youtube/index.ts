@@ -467,6 +467,14 @@ export class YouTubeService {
         }
       : undefined;
     const maxMb = Math.floor(this.cfg.cacheMaxBytes / (1024 * 1024));
+    // SponsorBlock: when configured (non-null, non-empty CSV), have yt-dlp strip the selected
+    // segment categories during download. This runs an ffmpeg cut post-processor (ffmpeg is in
+    // the image), so removed segments shorten the on-disk file — the queue item's resolve-time
+    // meta.durationSec is slightly larger than the played audio, an accepted minor cosmetic gap
+    // for v1. Built once here; null/disabled => empty, so behavior is unchanged.
+    const sponsorblockArgs = this.cfg.sponsorblockCategories
+      ? ["--sponsorblock-remove", this.cfg.sponsorblockCategories]
+      : [];
     const stdout = await this.withClientFallback(async (client) => {
       const args = [
         "-f",
@@ -478,6 +486,7 @@ export class YouTubeService {
         "--no-part",
         "--max-filesize",
         `${Math.max(1, Math.min(maxMb, 500))}M`,
+        ...sponsorblockArgs,
         "--socket-timeout",
         "30",
         "--retries",
@@ -516,6 +525,15 @@ export class YouTubeService {
         !f.endsWith(".part") &&
         !f.endsWith(".ytdl") &&
         !f.endsWith(".temp") &&
+        // Exclude the SponsorBlock/ffmpeg post-processor intermediates. yt-dlp's prepend_extension
+        // inserts the marker BEFORE the real extension (`<id>.temp.opus`, `<id>.uncut.opus`,
+        // `<id>.keyframes.opus`), so these END in a real audio ext (.opus/.m4a/…) and slip past the
+        // suffix checks above. A SponsorBlock cut SIGKILLed on timeout (retryable → the ladder/next
+        // call still produces the final `<id>.opus`) leaves such a partial/uncut intermediate; since
+        // it is created first, readdir returns it before the finalized file and the bare
+        // `startsWith(videoId + ".")` would return the truncated/uncut audio. Reject them explicitly.
+        // (`orig` covers FFmpegExtractAudioPP's `<id>.orig.<ext>` should `-x` ever be added.)
+        !/\.(temp|uncut|keyframes|orig)\.[^.]+$/.test(f) &&
         // Exclude the transcode artifact the audio route writes into this same cacheDir
         // (`${videoId}.transcoded.m4a`). It also matches `${videoId}.` and persists across
         // an evict-then-redownload of the source, so without this the find could return the

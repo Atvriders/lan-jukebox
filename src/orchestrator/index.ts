@@ -26,6 +26,10 @@ export interface StationControllerDeps {
   pin?: (videoId: string, path: string, audio: AudioInfo | null) => void;
   unpin?: (videoId: string) => void;
   prefetch?: (videoId: string, durationSec?: number | null) => Promise<void>;
+  // Read the real audio format of an already-cached track (prefetch/audio-route registered it).
+  // Used by crossfadeAdvance to populate the crossfaded-in track's `.audio` (there is no download
+  // in the crossfade path to source it from), so its NowPlaying format badge still renders.
+  getAudio?: (videoId: string) => AudioInfo | null;
   now?: () => number;
   onSettingsChanged?: (s: StationSettings) => void;
   // Injectable timer for the dry-hold radio self-retry (defaults to global setTimeout/clearTimeout).
@@ -240,6 +244,11 @@ export class StationController extends EventEmitter {
    * track / radio / dry-hold. The single advance path for trackEnd/error/skip/jump.
    */
   private async advanceAndPlayLocked(disposition: "archive" | "discard"): Promise<void> {
+    // Capture the advance generation up front. radioContinuation() below is an awaited network call
+    // (seconds); a clear()/detachSink() during it bumps the generation OUTSIDE this.lock, and this
+    // whole chain would otherwise keep going and restart playback (radio) after the user cleared.
+    // Re-checked after that await. (loadCurrentLocked, reached below, self-guards its own download.)
+    const advGen = this.playGeneration;
     // repeat="one": a CLEAN end replays the SAME current from 0 (an error still advances, so a
     // broken track can never wedge the station on itself forever).
     if (disposition === "archive" && this._settings.repeat === "one" && this.queue.current) {
@@ -251,6 +260,9 @@ export class StationController extends EventEmitter {
     const hasUpcoming = this.queue.snapshot().upcoming.length > 0;
     if (!hasUpcoming) {
       const radioMeta = this.radioContinuation ? await this.radioContinuation() : null;
+      // A clear() ran during radioContinuation() → the station is idle; abandon this advance BEFORE
+      // adding a radio track / arming a dry-hold retry / playing (all of which would un-idle it).
+      if (advGen !== this.playGeneration) return;
       if (radioMeta) {
         await this.queue.add(radioMeta, AUTOPLAY_REQUESTER, true);
       } else if (this._settings.repeat === "all" && (await this.queue.requeueHistory()) > 0) {
@@ -356,6 +368,9 @@ export class StationController extends EventEmitter {
 
   // Core never-stopping advance: promote head → if none, ask radio → if none, hold paused.
   private async playNextLocked(): Promise<void> {
+    // Advance generation for the radioContinuation() await below (see advanceAndPlayLocked): a
+    // clear() during that network call must abandon this advance rather than restart radio.
+    const pnGen = this.playGeneration;
     // Spurious auto-start guard (enqueue-race): if `current` is already the live, actively-playing
     // track (not paused, not dry-held), a second scheduled startNextLocked would re-load+restart it
     // from 0. Two near-simultaneous cold-start enqueues both observe current===null and both
@@ -372,6 +387,9 @@ export class StationController extends EventEmitter {
       const item = await this.queue.advance();
       if (!item) {
         const radioMeta = this.radioContinuation ? await this.radioContinuation() : null;
+        // A clear() ran during radioContinuation() → abandon before adding radio / arming a
+        // dry-hold retry, so the station stays idle instead of restarting.
+        if (pnGen !== this.playGeneration) return;
         if (radioMeta) {
           await this.queue.add(radioMeta, AUTOPLAY_REQUESTER, true);
           await this.queue.advance();
@@ -391,6 +409,14 @@ export class StationController extends EventEmitter {
       this.emit("changed");
       return;
     }
+    // Capture the advance generation for the WHOLE load. The download below is awaited (and can
+    // take minutes for a long mix), during which clear() or detachSink() — the only two paths that
+    // bump the generation OUTSIDE this.lock — may run. If either did, this load is superseded and
+    // its post-download play step must NOT run (it would resurrect a track after clear() idled the
+    // station, or call this.sink.play() on a sink detachSink() just nulled). Re-checked after the
+    // await (skip/pause/crossfade all bump INSIDE the lock, serialized behind us, so they can't
+    // false-trigger this).
+    const loadGen = this.playGeneration;
     // A new load supersedes any seek that targeted the previous load window.
     this.pendingSeekMs = null;
     this.setPreparing({
@@ -425,6 +451,14 @@ export class StationController extends EventEmitter {
       audio = res.audio;
     } catch (err) {
       this._loading = false;
+      // Supersede check (same loadGen as the success path): a clear() or detachSink() ran during
+      // the (failed) download. Bail WITHOUT surfacing a "Skipped" banner, discarding, or walking to
+      // the next candidate — any of which would resurrect playback (radio) after the user cleared,
+      // which is exactly the stuck-download-then-Clear escape hatch clear() exists for.
+      if (loadGen !== this.playGeneration) {
+        this.setPreparing(null);
+        return;
+      }
       // download failed → discard + try the next (radio/next track). Best-effort.
       this.setPreparing(null);
       // Surface the failure to the UI (banner) BEFORE discarding, while `item` is still known.
@@ -446,10 +480,19 @@ export class StationController extends EventEmitter {
               StationController.DOWNLOAD_FAIL_BACKOFF_BASE_MS * 2 ** (this.downloadFailStreak - 2),
             );
       await this.delay(backoff);
+      // A clear() during the backoff wait supersedes this advance too — don't walk to the next.
+      if (loadGen !== this.playGeneration) return;
       await this.playNextLocked();
       return;
     }
     this._loading = false;
+    // Supersede check (see loadGen capture above): a clear() or detachSink() ran during the
+    // download. Do NOT pin/adopt/play — bailing here leaves the station in the idle/detached state
+    // that clear()/detachSink() established rather than restarting a track behind the user's back.
+    if (loadGen !== this.playGeneration) {
+      this.setPreparing(null);
+      return;
+    }
     // Forward the real audio format so /audio/:id can serve playable opus/webm/m4a as-is (not
     // transcode) and the NowPlaying format badge can render. Pin under the same audio so the
     // cache carries it too.
@@ -562,7 +605,14 @@ export class StationController extends EventEmitter {
    * event (the same wiring loadCurrentLocked relies on).
    */
   crossfadeAdvance(): void {
+    // Capture the advance generation at signal time (mirrors onSinkTrackEnd). playGeneration only
+    // ever increments, so if a Skip/jump/load raced this in-flight crossfade — bumping the
+    // generation before our lock task runs — the captured value no longer matches and this fade
+    // targeted an already-retired track: no-op so we don't double-advance (server on T3 while the
+    // speaker plays T2).
+    const gen = this.playGeneration;
     void this.lock.runExclusive(async () => {
+      if (gen !== this.playGeneration) return; // a skip/jump/load already advanced — stale crossfade
       if (!this.sink || this._dryHeld) return;
       // No next track → let the Player's trackEnded path (radio/dry-hold) handle the end instead.
       if (this.queue.snapshot().upcoming.length === 0) return;
@@ -579,6 +629,26 @@ export class StationController extends EventEmitter {
       this.liveItem = item;
       this._paused = false;
       this.markTrackStarted(0); // fresh track → position clock restarts at 0
+      // Populate the crossfaded-in track's `.audio` from the cache (loadCurrentLocked normally does
+      // this via setCurrentAudio off the download result, which the crossfade path skips). Without
+      // it the NowPlaying format badge would blank out for the whole duration of every crossfaded
+      // track. Mutates the item in place (the same object the queue holds while current).
+      const xfAudio = item.audio ?? this.deps.getAudio?.(item.meta.videoId) ?? null;
+      this.queue.setCurrentAudio(item.meta.videoId, xfAudio);
+      // Mirror loadCurrentLocked's pin bookkeeping (its unpin/pin/pinnedVideoId sequence) so a
+      // pure-crossfade run neither leaks pins nor leaves the new current LRU-evictable mid-song:
+      // release the PREVIOUS track's pin — deps.unpin also drops its derived `${videoId}.m4a`
+      // transcode key, which loadCurrentLocked's unpin never reaches on a crossfade-only advance —
+      // then pin the new current and re-point pinnedVideoId at it. There is no fresh download path
+      // here (the next audio is already playing; calling deps.download would re-fetch and break
+      // both the "next is already audible" contract and the crossfade tests), but prefetch / the
+      // audio route already cache-registered the file, so deps.pin's register() no-ops on the
+      // absent path and simply (re-)pins that existing entry.
+      if (this.pinnedVideoId && this.pinnedVideoId !== item.meta.videoId) {
+        this.deps.unpin?.(this.pinnedVideoId);
+      }
+      this.deps.pin?.(item.meta.videoId, "", item.audio);
+      this.pinnedVideoId = item.meta.videoId;
       this.emit("changed");
     });
   }
@@ -639,8 +709,34 @@ export class StationController extends EventEmitter {
   shuffle(rng?: () => number): Promise<void> {
     return this.queue.shuffle(rng);
   }
-  clear(): Promise<void> {
-    return this.queue.clear();
+  async clear(): Promise<void> {
+    // Intentionally NOT taking this.lock: a loadCurrentLocked may be holding it across a slow
+    // (up to 30-min) download, and Clear is the control the user reaches for to escape exactly
+    // that — it must stay responsive. Instead we bump the generation so any in-flight load aborts
+    // its post-download play step (see the guard in loadCurrentLocked) rather than resurrecting a
+    // track after the queue was cleared, and we tear down every path that could restart playback.
+    this.playGeneration += 1; // an in-flight load / a late trackEnd|error for the old track is now stale
+    // Kill any armed dry-hold radio retry and drop the dry-hold flag so a queued (or about-to-fire)
+    // retry can't call startNextLocked and spontaneously restart radio seconds after the clear.
+    this.cancelRadioRetry();
+    this.radioRetryAttempt = 0;
+    this._dryHeld = false;
+    await this.queue.clear();
+    // queue.clear() empties the queue (current→null) but the browser <audio> keeps playing the old
+    // track and liveItem/liveItemId stay stale, so the snapshot still reports it as now-playing and
+    // audio keeps sounding until the next enqueue cuts it off. Stop the sink and drop the
+    // now-playing anchor so the station truly goes idle. Release the pin too so the just-cleared
+    // track becomes LRU-evictable (nothing is holding it now).
+    this.sink?.stop();
+    if (this.pinnedVideoId) {
+      this.deps.unpin?.(this.pinnedVideoId);
+      this.pinnedVideoId = null;
+    }
+    this.liveItem = null;
+    this.liveItemId = null;
+    // queue.clear() already emitted 'changed' while liveItem was still stale, so re-emit AFTER
+    // resetting so subscribers see the idle state.
+    this.emit("changed");
   }
 
   updateSettings(patch: Partial<Record<keyof StationSettings, unknown>>): StationSettings {

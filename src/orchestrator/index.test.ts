@@ -927,3 +927,71 @@ describe("StationController crossfadeAdvance", () => {
     expect(c.snapshot().history).toHaveLength(0);
   });
 });
+
+// Regression: clear() must truly idle the station and must NOT be un-idled by an advance chain
+// that was already in flight when Clear was pressed (audit finding — the "never stops" invariant
+// inverted: playback resurrecting AFTER a clear). clear() runs outside the lock and bumps the
+// advance generation; the in-flight chain re-checks that generation after every real await.
+describe("StationController clear() supersedes an in-flight advance (no resurrect)", () => {
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+
+  it("clear() during an in-flight load abandons it — no play, station idle", async () => {
+    const { download, resolve } = deferredDownload();
+    const c = new StationController({ download, now: () => 1_000 });
+    const { sink, sent } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    c.attachSink(sink); // begins loading A; download is pending (not resolved)
+    await vi.waitFor(() => expect(download).toHaveBeenCalledWith("aaaaaaaaaaa", expect.anything()));
+    await c.clear(); // Clear WHILE A's download is in flight
+    resolve(); // A's download completes AFTER the clear
+    await tick(); // let loadCurrentLocked resume and hit the supersede guard
+    expect(sent.some((m) => m.type === "load")).toBe(false); // A was never loaded
+    expect(sent.some((m) => m.type === "play")).toBe(false); // …and never played
+    expect(c.snapshot().current).toBeNull(); // station is idle
+  });
+
+  it("clear() while a load is FAILING does not restart radio (the stuck-download escape hatch)", async () => {
+    let rejectFn: (() => void) | null = null;
+    const download = vi.fn(
+      () =>
+        new Promise<{ path: string; audio: null }>((_res, rej) => {
+          rejectFn = () => rej(new Error("timeout"));
+        }),
+    );
+    const c = new StationController({ download, now: () => 1_000, radioRetryBaseMs: 0 });
+    c.setRadioContinuation(async () => meta("ccccccccccc")); // radio WOULD resume if not guarded
+    const { sink, sent } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(download).toHaveBeenCalledTimes(1));
+    await c.clear(); // Clear WHILE A's (stuck) download is in flight
+    rejectFn?.(); // the stuck download finally fails, AFTER the clear
+    await tick();
+    expect(c.snapshot().current).toBeNull(); // stayed idle; radio did NOT resume
+    expect(sent.some((m) => m.type === "play")).toBe(false);
+    expect(download).toHaveBeenCalledTimes(1); // never walked on to a radio track
+  });
+
+  it("clear() during the radio lookup does not add or play a radio track", async () => {
+    const { download } = controller(); // instant download
+    let resolveRadio: (() => void) | null = null;
+    const c = new StationController({ download, now: () => 1_000 });
+    c.setRadioContinuation(
+      () =>
+        new Promise<TrackMeta | null>((res) => {
+          resolveRadio = () => res(meta("ccccccccccc"));
+        }),
+    );
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    sink.onTrackEnded(); // A ends, queue dry → awaits radioContinuation (pending)
+    await tick();
+    await c.clear(); // Clear WHILE the radio lookup is pending
+    resolveRadio?.(); // radio returns a track AFTER the clear
+    await tick();
+    expect(c.snapshot().current).toBeNull(); // radio track was neither added nor played
+    expect(c.snapshot().upcoming).toEqual([]); // and left no stray radio item in the queue
+  });
+});
