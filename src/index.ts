@@ -10,6 +10,7 @@ import { PlayerRegistry } from "./players/registry.js";
 import { buildApp } from "./server/app.js";
 import { StationBroadcaster } from "./server/ws.js";
 import { createLogger, setRootLogger } from "./util/logger.js";
+import { createCoalescedDownload } from "./util/coalesce-download.js";
 import { installCrashHandlers, installSignalHandlers } from "./lifecycle.js";
 import { startupCanary } from "./canary.js";
 import {
@@ -67,6 +68,19 @@ async function main(): Promise<void> {
   // Inject the Queue built with the configured history ring size so HISTORY_MAX_ITEMS is
   // actually honored (StationController would otherwise default to new Queue() = 100).
   const queue = new Queue({ historyMax: media.historyMaxItems });
+  // Single download function shared by BOTH the load path (deps.download) and the prefetch path
+  // (deps.prefetch). It coalesces concurrent downloads of the same videoId and consults the cache
+  // first, so a track enqueued into an idle queue (prefetch fires, then it is promoted to current
+  // and loaded) is fetched by exactly ONE yt-dlp — not two racing processes writing the same
+  // `--no-part` file, which corrupted the audio and made the browser skip the user's song into a
+  // radio track. Every download runs through the `downloads` semaphore so the cap actually bounds
+  // concurrency (deps.download previously bypassed it).
+  const coalescedDownload = createCoalescedDownload({
+    download: (videoId, opts) => youtube.download(videoId, media.cacheDir, opts),
+    cacheGet: (videoId) => cache.get(videoId),
+    cacheGetAudio: (videoId) => cache.getAudio(videoId),
+    semaphore: downloads,
+  });
   const station = new StationController({
     queue,
     // The controller's download dep reports progress as a plain percent number, while
@@ -74,7 +88,7 @@ async function main(): Promise<void> {
     // durationSec is forwarded so YouTubeService.download can auto-scale the yt-dlp
     // timeout for long mixes/concerts instead of killing them at the short default.
     download: (videoId, opts) =>
-      youtube.download(videoId, media.cacheDir, {
+      coalescedDownload(videoId, {
         durationSec: opts?.durationSec,
         onProgress: opts?.onProgress ? (p) => opts.onProgress!(p.percent) : undefined,
       }),
@@ -100,8 +114,7 @@ async function main(): Promise<void> {
     // re-downloading. Without register() the file was an untracked on-disk orphan the
     // CACHE_MAX_MB cap could never reclaim. durationSec scales the timeout for long tracks.
     prefetch: (videoId, durationSec) =>
-      downloads
-        .run(() => youtube.download(videoId, media.cacheDir, { durationSec }))
+      coalescedDownload(videoId, { durationSec })
         .then((r) => {
           cache.register(videoId, r.path, r.audio);
         })

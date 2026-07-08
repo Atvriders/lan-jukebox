@@ -182,6 +182,52 @@ describe("usePlayerRole", () => {
     expect(lastPositionMs(ws)).toBe(1500);
   });
 
+  it("swallows a benign AbortError from play() (no playbackError, no error banner)", async () => {
+    // Regression (bug: "plays one song then stops" / a radio track preempts the user's song):
+    // a play() rejected because a newer load()/pause() superseded it throws a DOMException
+    // named "AbortError". Reporting it as a playbackError makes the server DISCARD the track
+    // (error-skip cascade) so radio takes over. It must be swallowed silently.
+    const abort = Object.assign(new Error("interrupted by a new load request"), {
+      name: "AbortError",
+    });
+    vi.spyOn(window.HTMLMediaElement.prototype, "play").mockRejectedValue(abort);
+    const ws = makeWs();
+    const { result } = renderHook(() => usePlayerRole(ws as unknown as WebSocket, true));
+    const el = document.createElement("audio");
+    act(() => {
+      (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current = el;
+    });
+    await act(async () => {
+      ws.fireMessage(JSON.stringify({ type: "play" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(ws.sent.map((m) => JSON.parse(m).type)).not.toContain("playbackError");
+    expect(result.current.error).toBeNull();
+  });
+
+  it("surfaces a NON-AbortError play() rejection as a playbackError", async () => {
+    // The autoplay-block (NotAllowedError) / decode / network failures are genuine and MUST
+    // still reach the "Skipped …" banner — only AbortError is swallowed.
+    const blocked = Object.assign(new Error("autoplay blocked"), { name: "NotAllowedError" });
+    vi.spyOn(window.HTMLMediaElement.prototype, "play").mockRejectedValue(blocked);
+    const ws = makeWs();
+    const { result } = renderHook(() => usePlayerRole(ws as unknown as WebSocket, true));
+    const el = document.createElement("audio");
+    act(() => {
+      (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current = el;
+    });
+    await act(async () => {
+      ws.fireMessage(JSON.stringify({ type: "play" }));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const sent = ws.sent.map((m) => JSON.parse(m));
+    const pe = sent.find((m) => m.type === "playbackError");
+    expect(pe?.message).toBe("autoplay blocked");
+    expect(result.current.error).toBe("autoplay blocked");
+  });
+
   it("flushes the exact pause position on a 'pause' command (not the stale throttled value)", () => {
     const ws = makeWs();
     const { result } = renderHook(() => usePlayerRole(ws as unknown as WebSocket, true));

@@ -58,6 +58,15 @@ export class StationController extends EventEmitter {
   // enqueue-race double-schedule of startNextLocked short-circuit instead of restarting the
   // just-started head from 0 (redundant reload/pin + a visible restart).
   private liveItemId: string | null = null;
+  // The actual QueueItem the sink was last told to load/play (same object the queue holds while
+  // it is current, so setCurrentAudio keeps its `.audio` fresh). snapshot() pins now-playing to
+  // THIS item, not the raw queue head: queue.advance() moves the head to the next track and
+  // broadcasts it the instant a promotion happens, but the sink isn't told to load that next
+  // track until its (slow, real yt-dlp) download completes. Reporting the raw head during that
+  // window made NowPlaying show/count a track that wasn't playing yet (and, for skip/jump, while
+  // the PREVIOUS track was still audible). Retaining liveItem keeps the card on the truly-live
+  // track across the next track's download; the separate `preparing` field signals "loading next".
+  private liveItem: QueueItem | null = null;
   // The videoId whose cache entry (source + derived `${videoId}.m4a` transcode) is currently
   // pinned. Unpinned when a different track becomes current so pins don't grow without bound
   // and the LRU can honor CACHE_MAX_MB (spec: cache is bounded; the station plays forever).
@@ -94,7 +103,6 @@ export class StationController extends EventEmitter {
   private readonly clearTimeoutFn: (h: ReturnType<typeof setTimeout>) => void;
   private readonly radioRetryBaseMs: number;
   private static readonly RADIO_RETRY_CAP_MS = 60_000;
-  private static readonly RADIO_RETRY_MAX_ATTEMPTS = 10;
 
   constructor(private readonly deps: StationControllerDeps) {
     super();
@@ -288,15 +296,21 @@ export class StationController extends EventEmitter {
     }
   }
 
-  /** Arm the next backing-off dry-hold radio retry (idempotent — replaces any pending timer). */
+  /**
+   * Arm the next backing-off dry-hold radio retry (idempotent — replaces any pending timer).
+   * The always-on station must NEVER permanently give up: there is no attempt cap. The exponential
+   * delay is clamped at RADIO_RETRY_CAP_MS, so a persistently-failing upstream degrades into a
+   * steady ~60s poll that self-heals the instant related() recovers (loadCurrentLocked resets the
+   * backoff on the next successful load). The exponent stops growing once the delay is already at
+   * the cap, so `2 ** attempt` can never overflow to Infinity on an indefinitely-failing feed.
+   */
   private scheduleRadioRetryLocked(): void {
     this.cancelRadioRetry();
-    if (this.radioRetryAttempt >= StationController.RADIO_RETRY_MAX_ATTEMPTS) return;
     const delay = Math.min(
       StationController.RADIO_RETRY_CAP_MS,
       this.radioRetryBaseMs * 2 ** this.radioRetryAttempt,
     );
-    this.radioRetryAttempt += 1;
+    if (delay < StationController.RADIO_RETRY_CAP_MS) this.radioRetryAttempt += 1;
     this.radioRetryHandle = this.setTimeoutFn(() => {
       this.radioRetryHandle = null;
       const gen = this.playGeneration;
@@ -453,6 +467,10 @@ export class StationController extends EventEmitter {
     this.setPreparing(null);
     this.playGeneration += 1; // fresh live track → re-arm the advance guard
     this.liveItemId = item.id;
+    // Retain the exact item the sink was told to load so snapshot()/now-playing tracks the
+    // actually-playing track (not the raw queue head that may have already advanced). `item` is
+    // the same object the queue holds while current, so setCurrentAudio mutates it in place.
+    this.liveItem = item;
     this._dryHeld = false;
     // A track is live again: cancel any pending dry-hold radio retry and reset its backoff so a
     // future drain starts fresh from the base delay. Also reset the download-failure streak.
@@ -597,14 +615,21 @@ export class StationController extends EventEmitter {
 
   snapshot(): StationSnapshot {
     const snap = this.queue.snapshot();
-    const current: CurrentItem | null = snap.current
+    // Report the track the sink was actually last told to play (liveItem), NOT the raw queue head.
+    // When the head already IS the live track use the fresh clone (it carries the up-to-date
+    // `.audio` from setCurrentAudio); while the next track is still downloading, keep showing the
+    // retained liveItem so now-playing doesn't jump to a track that isn't audible yet. Before any
+    // track has ever loaded (cold start / restore, liveItemId===null) fall back to the head so the
+    // persisted/promoted track still shows. positionMs and durationMs are BOTH taken from this base
+    // so the progress bar can't overlay one track's elapsed time on another track's duration.
+    const liveMatchesHead = this.liveItemId !== null && snap.current?.id === this.liveItemId;
+    const base = liveMatchesHead ? snap.current : (this.liveItem ?? snap.current);
+    const current: CurrentItem | null = base
       ? {
-          ...snap.current,
+          ...base,
           positionMs: this.positionMs(),
           durationMs:
-            snap.current.meta.durationSec && snap.current.meta.durationSec > 0
-              ? snap.current.meta.durationSec * 1000
-              : 0,
+            base.meta.durationSec && base.meta.durationSec > 0 ? base.meta.durationSec * 1000 : 0,
         }
       : null;
     return {

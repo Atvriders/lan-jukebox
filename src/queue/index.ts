@@ -63,7 +63,17 @@ export class Queue extends EventEmitter {
         audio: null,
         fromRadio,
       };
-      this._upcoming.push(item);
+      // A USER pick jumps AHEAD of trailing radio filler (fromRadio items) so it plays
+      // soon rather than behind an endless radio buffer (the radio is filler; the user's
+      // request is the intent). Radio adds always append. User adds keep their relative
+      // order — inserted before the FIRST radio item, i.e. after any earlier user picks.
+      if (fromRadio) {
+        this._upcoming.push(item);
+      } else {
+        const firstRadio = this._upcoming.findIndex((i) => i.fromRadio);
+        if (firstRadio === -1) this._upcoming.push(item);
+        else this._upcoming.splice(firstRadio, 0, item);
+      }
       this.emitChange();
       return item;
     });

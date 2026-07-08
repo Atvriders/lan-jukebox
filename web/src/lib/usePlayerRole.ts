@@ -203,6 +203,18 @@ export function usePlayerRole(
         case "play":
           setError(null);
           el.play().catch((err: unknown) => {
+            // A play() rejected because a newer load()/pause() superseded it is BENIGN: the
+            // browser throws a DOMException named "AbortError" ("interrupted by a new load
+            // request" / "by a call to pause()"). Reporting it as a playbackError makes the
+            // server treat it as a real failure and DISCARD/skip the track — an error-skip
+            // cascade that preempts the user's just-queued song with a radio track. Swallow
+            // AbortError; still surface everything else (NotAllowedError autoplay-block,
+            // decode/network errors) so genuine failures reach the "Skipped …" banner.
+            const name =
+              typeof err === "object" && err !== null && "name" in err
+                ? String((err as { name: unknown }).name)
+                : "";
+            if (name === "AbortError") return;
             const message = err instanceof Error ? err.message : "play blocked";
             setError(message);
             send({ type: "playbackError", message });

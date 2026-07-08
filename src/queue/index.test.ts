@@ -42,6 +42,39 @@ describe("Queue", () => {
     expect(item.fromRadio).toBe(true);
   });
 
+  it("a user pick jumps AHEAD of trailing radio filler; radio picks always append", async () => {
+    // Regression (bug: "a radio track plays instead of my queued song"): a USER add must
+    // insert before the FIRST fromRadio item so it plays soon, not behind an endless radio
+    // buffer — while keeping its order relative to earlier user picks; radio adds append.
+    const q = newQueue();
+    const radioReq: Requester = { deviceId: "autoplay", displayName: "radio", source: "autoplay" };
+    await q.add(meta("useraaaaaa1"), requester); // user
+    await q.add(meta("radiobbbbb1"), radioReq, true); // radio → append
+    await q.add(meta("radiobbbbb2"), radioReq, true); // radio → append
+    expect(q.snapshot().upcoming.map((i) => i.meta.videoId)).toEqual([
+      "useraaaaaa1",
+      "radiobbbbb1",
+      "radiobbbbb2",
+    ]);
+    // New user pick lands AFTER the earlier user pick but BEFORE any radio filler.
+    await q.add(meta("useraaaaaa2"), requester);
+    expect(q.snapshot().upcoming.map((i) => i.meta.videoId)).toEqual([
+      "useraaaaaa1",
+      "useraaaaaa2",
+      "radiobbbbb1",
+      "radiobbbbb2",
+    ]);
+    // A radio pick still appends to the very end.
+    await q.add(meta("radiobbbbb3"), radioReq, true);
+    expect(q.snapshot().upcoming.map((i) => i.meta.videoId)).toEqual([
+      "useraaaaaa1",
+      "useraaaaaa2",
+      "radiobbbbb1",
+      "radiobbbbb2",
+      "radiobbbbb3",
+    ]);
+  });
+
   it("advance() promotes the head and archives the old current to history", async () => {
     const q = newQueue();
     await q.add(meta("aaaaaaaaaaa"), requester);

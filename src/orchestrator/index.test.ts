@@ -513,6 +513,42 @@ describe("StationController dry-hold radio self-retry (transient outage must sel
     expect(c.isPaused).toBe(false);
   });
 
+  it("never permanently gives up: keeps re-arming the radio retry far past any fixed cap", async () => {
+    // Regression: the retry was hard-capped at 10 attempts and the counter only reset on a
+    // successful load. With a PERSISTENTLY-unavailable upstream no load ever happens, so after 10
+    // backoffs the station parked in dry-hold forever ("plays one song then stops for good"). The
+    // always-on station must re-arm indefinitely (delay clamped to a steady poll) so it self-heals.
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    let fire: (() => void) | null = null;
+    const setTimeoutFn = vi.fn((fn: () => void) => {
+      fire = fn;
+      return 1 as unknown as ReturnType<typeof setTimeout>;
+    });
+    const c = new StationController({
+      download,
+      now: () => 1_000,
+      setTimeout: setTimeoutFn,
+      clearTimeout: vi.fn(),
+      radioRetryBaseMs: 5_000,
+    });
+    c.setRadioContinuation(async () => null); // radio NEVER recovers
+    const sink = new BrowserPlayerSink();
+    sink.setSend(() => {});
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    sink.onTrackEnded(); // drain → dry-hold → retry #1 armed
+    await vi.waitFor(() => expect(fire).not.toBeNull());
+    // Fire the retry timer far more than the old 10-attempt cap; each null result must re-arm.
+    for (let i = 0; i < 15; i++) {
+      const f = fire!;
+      fire = null;
+      f();
+      await vi.waitFor(() => expect(fire).not.toBeNull()); // a fresh retry keeps being scheduled
+    }
+    expect(setTimeoutFn.mock.calls.length).toBeGreaterThan(12); // old code stopped at 10
+  });
+
   it("does NOT schedule a radio retry on a genuine cold start (no seed)", async () => {
     const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
     const setTimeoutFn = vi.fn((fn: () => void) => {
@@ -727,8 +763,66 @@ describe("StationController mid-load user controls (concurrency findings)", () =
     c.attachSink(sink);
     await vi.waitFor(() => expect(download).toHaveBeenCalledWith("aaaaaaaaaaa", expect.anything()));
     c.skip(); // pressed WHILE A is still downloading — must not be a silent no-op
-    resolve(); // A's download completes; skip's queued advance then runs
+    resolve(); // A's download completes; skip's queued advance then runs, downloading B
+    // now-playing pins to the actually-loaded track: until B's download completes the card must
+    // NOT jump to B (that was the "now-playing shows a not-yet-playing track" bug). Wait for B's
+    // download to be requested, then complete it so B genuinely becomes live.
+    await vi.waitFor(() => expect(download).toHaveBeenCalledWith("bbbbbbbbbbb", expect.anything()));
+    resolve(); // B's download completes → B is what the sink actually loaded
     await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+  });
+});
+
+describe("StationController now-playing derivation (finding: snapshot showed the raw queue head)", () => {
+  // Regression: snapshot().current was derived from the raw queue head, which advances the instant
+  // a promotion happens — but the sink isn't told to load the next track until its (slow) download
+  // completes. During that window now-playing rendered the not-yet-playing track (and overlaid the
+  // old track's elapsed time onto the new track's duration). It must instead pin to the track the
+  // sink was actually last told to play until the next one genuinely loads.
+  it("keeps now-playing on the live track (and its duration) while the NEXT track downloads", async () => {
+    const { download, resolve } = deferredDownload();
+    const c = new StationController({ download, now: () => 1_000 });
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa", 100), user); // A: 100s
+    await c.enqueue(meta("bbbbbbbbbbb", 200), user); // B: 200s
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(download).toHaveBeenCalledWith("aaaaaaaaaaa", expect.anything()));
+    resolve(); // A finishes downloading → A is the live track
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    sink.onTrackEnded(); // advance to B; B begins downloading (deferred, not resolved yet)
+    await vi.waitFor(() => expect(download).toHaveBeenCalledWith("bbbbbbbbbbb", expect.anything()));
+    // B is NOT live yet — now-playing must still be A, with A's duration (not B's 200s).
+    expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa");
+    expect(c.snapshot().current?.durationMs).toBe(100_000);
+    resolve(); // B finishes → now B is what the sink actually loaded
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    expect(c.snapshot().current?.durationMs).toBe(200_000);
+  });
+
+  it("still reports the promoted head before anything has ever loaded (cold restore)", async () => {
+    // liveItemId===null (no sink has ever loaded a track): fall back to the queue head so a
+    // restored/promoted track still shows in now-playing.
+    const { c } = controller();
+    await c.restore({
+      version: 1,
+      savedAt: 0,
+      seed: meta("aaaaaaaaaaa"),
+      current: {
+        id: "c-1",
+        meta: meta("aaaaaaaaaaa"),
+        requester: user,
+        addedAt: 0,
+        audio: null,
+        fromRadio: false,
+      },
+      positionMs: 0,
+      queue: [],
+      upcomingRadio: [],
+      history: [],
+      settings: c.settings,
+      activePlayerDeviceId: null,
+    });
+    expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa");
   });
 });
 
