@@ -951,7 +951,7 @@ describe("StationController clear() supersedes an in-flight advance (no resurrec
   });
 
   it("clear() while a load is FAILING does not restart radio (the stuck-download escape hatch)", async () => {
-    let rejectFn: (() => void) | null = null;
+    let rejectFn: () => void = () => {};
     const download = vi.fn(
       () =>
         new Promise<{ path: string; audio: null }>((_res, rej) => {
@@ -965,7 +965,7 @@ describe("StationController clear() supersedes an in-flight advance (no resurrec
     c.attachSink(sink);
     await vi.waitFor(() => expect(download).toHaveBeenCalledTimes(1));
     await c.clear(); // Clear WHILE A's (stuck) download is in flight
-    rejectFn?.(); // the stuck download finally fails, AFTER the clear
+    rejectFn(); // the stuck download finally fails, AFTER the clear
     await tick();
     expect(c.snapshot().current).toBeNull(); // stayed idle; radio did NOT resume
     expect(sent.some((m) => m.type === "play")).toBe(false);
@@ -974,7 +974,7 @@ describe("StationController clear() supersedes an in-flight advance (no resurrec
 
   it("clear() during the radio lookup does not add or play a radio track", async () => {
     const { download } = controller(); // instant download
-    let resolveRadio: (() => void) | null = null;
+    let resolveRadio: () => void = () => {};
     const c = new StationController({ download, now: () => 1_000 });
     c.setRadioContinuation(
       () =>
@@ -989,7 +989,7 @@ describe("StationController clear() supersedes an in-flight advance (no resurrec
     sink.onTrackEnded(); // A ends, queue dry → awaits radioContinuation (pending)
     await tick();
     await c.clear(); // Clear WHILE the radio lookup is pending
-    resolveRadio?.(); // radio returns a track AFTER the clear
+    resolveRadio(); // radio returns a track AFTER the clear
     await tick();
     expect(c.snapshot().current).toBeNull(); // radio track was neither added nor played
     expect(c.snapshot().upcoming).toEqual([]); // and left no stray radio item in the queue
