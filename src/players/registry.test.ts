@@ -295,6 +295,90 @@ describe("PlayerRegistry.init tolerant per-record restore", () => {
 });
 
 // --------------------------------------------------------------------------
+// Live listeners presence: connected-device roster (in-memory, deduped per
+// device by a connection count). onConnect increments, trackDisconnect
+// decrements + drops at 0, listConnected reports the roster with isSpeaker.
+// --------------------------------------------------------------------------
+describe("PlayerRegistry live presence (listeners roster)", () => {
+  it("onConnect adds a listener; listConnected reports displayName from the label", async () => {
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => 1 });
+    await reg.init();
+    reg.touch("d1", "Living Room PC"); // label = displayName
+    reg.onConnect("d1", makeSink());
+    expect(reg.listConnected()).toEqual([
+      { deviceId: "d1", displayName: "Living Room PC", isSpeaker: false },
+    ]);
+  });
+
+  it("falls back to the deviceId as displayName when the device was never labelled", async () => {
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => 1 });
+    await reg.init();
+    reg.onConnect("d-unlabelled", makeSink());
+    expect(reg.listConnected()).toEqual([
+      { deviceId: "d-unlabelled", displayName: "d-unlabelled", isSpeaker: false },
+    ]);
+  });
+
+  it("marks the active player as isSpeaker in the roster", async () => {
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => 1 });
+    await reg.init();
+    reg.touch("spk", "Speaker PC");
+    reg.touch("lis", "Phone");
+    reg.onConnect("spk", makeSink());
+    reg.onConnect("lis", makeSink());
+    reg.claim("spk", makeSink());
+    const roster = reg.listConnected();
+    expect(roster.find((u) => u.deviceId === "spk")?.isSpeaker).toBe(true);
+    expect(roster.find((u) => u.deviceId === "lis")?.isSpeaker).toBe(false);
+  });
+
+  it("dedupes per device: two sockets = one roster entry; drops only after the LAST closes", async () => {
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => 1 });
+    await reg.init();
+    reg.touch("d1", "PC");
+    reg.onConnect("d1", makeSink()); // tab 1
+    reg.onConnect("d1", makeSink()); // tab 2 (same device)
+    expect(reg.listConnected()).toHaveLength(1);
+    reg.trackDisconnect("d1"); // tab 1 closes
+    expect(reg.listConnected()).toHaveLength(1); // still connected via tab 2
+    reg.trackDisconnect("d1"); // tab 2 closes
+    expect(reg.listConnected()).toEqual([]); // gone at 0
+  });
+
+  it("trackDisconnect of an unknown / already-gone device is a harmless no-op", async () => {
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => 1 });
+    await reg.init();
+    expect(() => reg.trackDisconnect("never-connected")).not.toThrow();
+    reg.onConnect("d1", makeSink());
+    reg.trackDisconnect("d1");
+    reg.trackDisconnect("d1"); // extra close must not drive the count negative
+    expect(reg.listConnected()).toEqual([]);
+  });
+
+  it("tracks a plain (non-preferred) listener without designating it as speaker", async () => {
+    const station = makeStation();
+    const reg = new PlayerRegistry({ dir, station, now: () => 1 });
+    await reg.init();
+    reg.touch("d1", "Phone");
+    reg.onConnect("d1", makeSink()); // not remembered -> no claim
+    expect(reg.activePlayerDeviceId).toBeNull();
+    expect(station.attachSink).not.toHaveBeenCalled();
+    expect(reg.listConnected()).toEqual([
+      { deviceId: "d1", displayName: "Phone", isSpeaker: false },
+    ]);
+  });
+
+  it("a mid-session rename via touch updates the connected roster displayName", async () => {
+    const reg = new PlayerRegistry({ dir, station: makeStation(), now: () => 1 });
+    await reg.init();
+    reg.touch("d1", "Old Name");
+    reg.onConnect("d1", makeSink());
+    reg.touch("d1", "New Name"); // rename while connected
+    expect(reg.listConnected()[0]?.displayName).toBe("New Name");
+  });
+});
+
+// --------------------------------------------------------------------------
 // Regression: the device map / file must not grow without bound, and an
 // unchanged reconnect must not rewrite the whole file on the hot path.
 // --------------------------------------------------------------------------

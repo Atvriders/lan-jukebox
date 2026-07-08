@@ -54,6 +54,7 @@ function fakeStation(snap: Partial<StationSnapshot>): {
     preparing: null,
     activePlayerPresent: false,
     activePlayerLabel: null,
+    listeners: [],
     ...snap,
   };
   return { snapshot: () => full, settings: { ...DEFAULT_SETTINGS }, seed: full.seed };

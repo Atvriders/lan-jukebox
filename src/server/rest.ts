@@ -10,6 +10,7 @@ import type { PlayerRegistry } from "../players/registry.js";
 import type { WebConfig } from "../config.js";
 import {
   VOLUME_MAX,
+  CROSSFADE_MAX,
   type Requester,
   type TrackMeta,
   type RepeatMode,
@@ -178,7 +179,18 @@ export function registerRest(app: FastifyInstance, deps: RestDeps): void {
           return reply.send({ ok });
         }
         case "settings": {
-          const patch = (value ?? {}) as Partial<StationSettings>;
+          // Copy so we never mutate the request body; only crossfadeSec is validated here
+          // (mirroring the volume/repeat pattern) — the other fields pass through unchanged.
+          const patch = { ...((value ?? {}) as Partial<StationSettings>) };
+          if (patch.crossfadeSec !== undefined) {
+            const sec = Number(patch.crossfadeSec);
+            if (!Number.isFinite(sec)) {
+              return reply.code(400).send({ error: `crossfadeSec must be 0..${CROSSFADE_MAX}` });
+            }
+            // Contract: crossfadeSec is "Clamped to [0, CROSSFADE_MAX]" and stored as an integer,
+            // so a finite out-of-range value is bounded (not rejected) and rounded to a whole second.
+            patch.crossfadeSec = Math.max(0, Math.min(CROSSFADE_MAX, Math.round(sec)));
+          }
           station.updateSettings(patch as Record<string, unknown>);
           return reply.send({ ok: true });
         }

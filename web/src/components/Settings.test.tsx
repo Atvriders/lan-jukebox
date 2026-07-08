@@ -9,6 +9,7 @@ const base = {
   repeat: "off" as const,
   volume: 100,
   maxTrackDurationSec: 0,
+  crossfadeSec: 10,
 };
 
 describe("Settings (pruned)", () => {
@@ -19,7 +20,6 @@ describe("Settings (pruned)", () => {
     expect(screen.getByLabelText(/max track length/i)).toBeTruthy();
     // Removed for the jukebox:
     expect(screen.queryByLabelText(/leave channel/i)).toBeNull();
-    expect(screen.queryByLabelText(/crossfade/i)).toBeNull();
     expect(screen.queryByLabelText(/normalize/i)).toBeNull();
     expect(screen.queryByLabelText(/fx preset/i)).toBeNull();
     expect(screen.queryByLabelText(/command channel/i)).toBeNull();
@@ -42,5 +42,29 @@ describe("Settings (pruned)", () => {
     render(<Settings {...base} onChange={onChange} />);
     fireEvent.change(screen.getByLabelText(/^volume$/i), { target: { value: "150" } });
     expect(onChange).toHaveBeenCalledWith({ volume: 150 });
+  });
+  it("renders a Crossfade select with Off/5/10/15/20 options bound to crossfadeSec", () => {
+    render(<Settings {...base} onChange={() => {}} />);
+    const select = screen.getByLabelText(/^crossfade$/i) as HTMLSelectElement;
+    expect(select).toBeTruthy();
+    expect(select.value).toBe("10"); // bound to base.crossfadeSec
+    const labels = Array.from(select.options).map((o) => o.textContent);
+    expect(labels).toEqual(["Off", "5s", "10s", "15s", "20s"]);
+    const values = Array.from(select.options).map((o) => o.value);
+    expect(values).toEqual(["0", "5", "10", "15", "20"]);
+  });
+  it("emits a crossfadeSec patch as a number when changed", () => {
+    const onChange = vi.fn();
+    render(<Settings {...base} onChange={onChange} />);
+    fireEvent.change(screen.getByLabelText(/^crossfade$/i), { target: { value: "0" } });
+    expect(onChange).toHaveBeenCalledWith({ crossfadeSec: 0 });
+    fireEvent.change(screen.getByLabelText(/^crossfade$/i), { target: { value: "20" } });
+    expect(onChange).toHaveBeenCalledWith({ crossfadeSec: 20 });
+  });
+  it("shows a '(current)' fallback option when crossfadeSec is not a preset", () => {
+    render(<Settings {...base} crossfadeSec={7} onChange={() => {}} />);
+    const select = screen.getByLabelText(/^crossfade$/i) as HTMLSelectElement;
+    expect(select.value).toBe("7");
+    expect(Array.from(select.options).map((o) => o.textContent)).toContain("7s (current)");
   });
 });

@@ -104,10 +104,11 @@ describe("usePlayerRole", () => {
       expect(source.connect).toHaveBeenCalledWith(gain);
       expect(gain.connect).toHaveBeenCalledWith(ctx.destination);
       expect(result.current.volume).toBe(200);
-      // Dropping back to <=100% must relax the gain to unity so it stops amplifying.
+      // Once the graph exists volume rides the master GainNode (which the shared mock aliases
+      // to `gain`); the element stays at unity and the gain carries the exact factor.
       act(() => ws.fireMessage(JSON.stringify({ type: "setVolume", pct: 40 })));
-      expect(el.volume).toBeCloseTo(0.4);
-      expect(gain.gain.value).toBe(1);
+      expect(el.volume).toBe(1);
+      expect(gain.gain.value).toBeCloseTo(0.4);
     } finally {
       vi.unstubAllGlobals();
     }
@@ -245,5 +246,234 @@ describe("usePlayerRole", () => {
     expect(lastPositionMs(ws)).toBe(900);
     act(() => ws.fireMessage(JSON.stringify({ type: "pause" })));
     expect(lastPositionMs(ws)).toBe(1200);
+  });
+
+  // --- Crossfade engine ------------------------------------------------------------------
+
+  type GainMock = {
+    gain: {
+      value: number;
+      setValueCurveAtTime: ReturnType<typeof vi.fn>;
+      setValueAtTime: ReturnType<typeof vi.fn>;
+      linearRampToValueAtTime: ReturnType<typeof vi.fn>;
+      cancelScheduledValues: ReturnType<typeof vi.fn>;
+    };
+    connect: ReturnType<typeof vi.fn>;
+  };
+  const makeGain = (): GainMock => ({
+    gain: {
+      value: 1,
+      setValueCurveAtTime: vi.fn(),
+      setValueAtTime: vi.fn(),
+      linearRampToValueAtTime: vi.fn(),
+      cancelScheduledValues: vi.fn(),
+    },
+    connect: vi.fn(),
+  });
+  // Install a Web Audio stub whose createGain hands back distinct, ramp-recording nodes.
+  const installAudioContext = () => {
+    const gains: GainMock[] = [];
+    class AudioCtx {
+      currentTime = 0;
+      destination = {};
+      resume = vi.fn();
+      close = vi.fn();
+      createGain() {
+        const g = makeGain();
+        gains.push(g);
+        return g;
+      }
+      createMediaElementSource() {
+        return { connect: vi.fn() };
+      }
+    }
+    vi.stubGlobal("AudioContext", AudioCtx);
+    return { gains };
+  };
+  // Capture the hook's lazily-created second (idle) <audio> element.
+  const captureCreatedAudio = () => {
+    const created: HTMLAudioElement[] = [];
+    const real = document.createElement.bind(document);
+    vi.spyOn(document, "createElement").mockImplementation(((tag: string, opts?: unknown) => {
+      const el = real(tag as "audio", opts as ElementCreationOptions);
+      if (tag === "audio") created.push(el as HTMLAudioElement);
+      return el;
+    }) as typeof document.createElement);
+    return created;
+  };
+  const defineTime = (el: HTMLAudioElement, duration: number) => {
+    let t = 0;
+    Object.defineProperty(el, "duration", { get: () => duration, configurable: true });
+    Object.defineProperty(el, "currentTime", {
+      get: () => t,
+      set: (v: number) => {
+        t = v;
+      },
+      configurable: true,
+    });
+    return {
+      set(v: number) {
+        t = v;
+      },
+    };
+  };
+
+  it("preloads nextAudioUrl into the idle element", () => {
+    const created = captureCreatedAudio();
+    try {
+      const ws = makeWs();
+      renderHook(() => usePlayerRole(ws as unknown as WebSocket, true, "/audio/next", 10));
+      // The idle element (created internally) should have the next track preloaded.
+      expect(created.length).toBeGreaterThan(0);
+      expect(created[0]!.getAttribute("src")).toBe("/audio/next");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("starts the equal-power crossfade at duration - crossfadeSec and sends crossfadeAdvance", () => {
+    const audio = installAudioContext();
+    const active = document.createElement("audio"); // created before the capture spy
+    const created = captureCreatedAudio();
+    try {
+      const ws = makeWs();
+      const { result } = renderHook(() =>
+        usePlayerRole(ws as unknown as WebSocket, true, "/audio/next", 10),
+      );
+      act(() => {
+        (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current =
+          active;
+      });
+      const clock = defineTime(active, 100);
+      act(() =>
+        ws.fireMessage(JSON.stringify({ type: "load", audioUrl: "/audio/cur", startMs: 0 })),
+      );
+      act(() => ws.fireMessage(JSON.stringify({ type: "play" })));
+      // Before the fade point: no crossfadeAdvance.
+      clock.set(89);
+      act(() => active.dispatchEvent(new Event("timeupdate")));
+      expect(ws.sent.map((m) => JSON.parse(m).type)).not.toContain("crossfadeAdvance");
+      // At duration - crossfadeSec (90s): the fade begins.
+      clock.set(90);
+      act(() => active.dispatchEvent(new Event("timeupdate")));
+      const types = ws.sent.map((m) => JSON.parse(m).type);
+      expect(types.filter((t: string) => t === "crossfadeAdvance").length).toBe(1);
+      // Two per-element fade gains were ramped with an equal-power value curve (out + in).
+      const ramped = audio.gains.filter((g) => g.gain.setValueCurveAtTime.mock.calls.length > 0);
+      expect(ramped.length).toBe(2);
+      // The idle element carries the incoming track.
+      expect(created[0]!.getAttribute("src")).toBe("/audio/next");
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("does not double-signal: after crossfade the faded-out element's 'ended' is ignored", () => {
+    installAudioContext();
+    const active = document.createElement("audio");
+    const created = captureCreatedAudio();
+    try {
+      const ws = makeWs();
+      const { result } = renderHook(() =>
+        usePlayerRole(ws as unknown as WebSocket, true, "/audio/next", 10),
+      );
+      act(() => {
+        (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current =
+          active;
+      });
+      const clock = defineTime(active, 100);
+      act(() =>
+        ws.fireMessage(JSON.stringify({ type: "load", audioUrl: "/audio/cur", startMs: 0 })),
+      );
+      act(() => ws.fireMessage(JSON.stringify({ type: "play" })));
+      clock.set(90);
+      act(() => active.dispatchEvent(new Event("timeupdate")));
+      // The now-idle (faded-out) old active element must NOT emit trackEnded.
+      act(() => active.dispatchEvent(new Event("ended")));
+      const sent = ws.sent.map((m) => JSON.parse(m).type);
+      expect(sent).not.toContain("trackEnded");
+      expect(sent.filter((t: string) => t === "crossfadeAdvance").length).toBe(1);
+      // The NEW active element (the incoming one) is the sole trackEnded source.
+      act(() => created[0]!.dispatchEvent(new Event("ended")));
+      expect(ws.sent.map((m) => JSON.parse(m).type)).toContain("trackEnded");
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("hard-cuts on a server 'load' mid-fade: cancels the fade and resets gains", () => {
+    const audio = installAudioContext();
+    const active = document.createElement("audio");
+    const created = captureCreatedAudio();
+    try {
+      const ws = makeWs();
+      const { result } = renderHook(() =>
+        usePlayerRole(ws as unknown as WebSocket, true, "/audio/next", 10),
+      );
+      act(() => {
+        (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current =
+          active;
+      });
+      const clock = defineTime(active, 100);
+      act(() =>
+        ws.fireMessage(JSON.stringify({ type: "load", audioUrl: "/audio/cur", startMs: 0 })),
+      );
+      act(() => ws.fireMessage(JSON.stringify({ type: "play" })));
+      clock.set(90);
+      act(() => active.dispatchEvent(new Event("timeupdate")));
+      expect(
+        ws.sent.map((m) => JSON.parse(m).type).filter((t: string) => t === "crossfadeAdvance")
+          .length,
+      ).toBe(1);
+      // gains: [0]=outgoing(old active) fade, [1]=master, [2]=incoming(new active) fade.
+      const outgoingFade = audio.gains[0]!;
+      const incomingFade = audio.gains[2]!;
+      // Hard-cut: a server load abandons the fade and reloads the (now) active element.
+      act(() =>
+        ws.fireMessage(JSON.stringify({ type: "load", audioUrl: "/audio/skip", startMs: 0 })),
+      );
+      // No second crossfadeAdvance — the fade was cancelled, not restarted.
+      expect(
+        ws.sent.map((m) => JSON.parse(m).type).filter((t: string) => t === "crossfadeAdvance")
+          .length,
+      ).toBe(1);
+      // Gains reset: abandoned element silenced (0), the surviving active element full (1).
+      expect(outgoingFade.gain.value).toBe(0);
+      expect(incomingFade.gain.value).toBe(1);
+      // The new track was loaded into the surviving active element (the incoming one).
+      expect(created[0]!.getAttribute("src")).toBe("/audio/skip");
+    } finally {
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("does not crossfade when crossfadeSec is 0 (off): a normal 'ended' still reports trackEnded", () => {
+    const active = document.createElement("audio");
+    captureCreatedAudio();
+    try {
+      const ws = makeWs();
+      const { result } = renderHook(() =>
+        usePlayerRole(ws as unknown as WebSocket, true, "/audio/next", 0),
+      );
+      act(() => {
+        (result.current.audioRef as React.MutableRefObject<HTMLAudioElement | null>).current =
+          active;
+      });
+      const clock = defineTime(active, 100);
+      act(() =>
+        ws.fireMessage(JSON.stringify({ type: "load", audioUrl: "/audio/cur", startMs: 0 })),
+      );
+      act(() => ws.fireMessage(JSON.stringify({ type: "play" })));
+      clock.set(99.9);
+      act(() => active.dispatchEvent(new Event("timeupdate")));
+      expect(ws.sent.map((m) => JSON.parse(m).type)).not.toContain("crossfadeAdvance");
+      act(() => active.dispatchEvent(new Event("ended")));
+      expect(ws.sent.map((m) => JSON.parse(m).type)).toContain("trackEnded");
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 });

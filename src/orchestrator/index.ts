@@ -542,6 +542,47 @@ export class StationController extends EventEmitter {
     this.emit("changed");
   }
 
+  /**
+   * The Player has begun an equal-power crossfade into the queued next track and already started
+   * that track's <audio> element — advance current→next WITHOUT loading/playing the sink (the
+   * Player is already playing it). Runs under the playback lock so it serializes against the normal
+   * trackEnd/error advance and skip/jump.
+   *
+   * No-op unless a sink is attached, we are genuinely playing (not dry-held), and there is a next
+   * track (upcoming[0]); when the queue has no next the Player instead sends `trackEnded` (no
+   * crossfade with nothing to fade into) and the normal trackEnded→advance / radio / dry-hold path
+   * handles the end.
+   *
+   * Advance-exactly-once: bumping playGeneration re-arms the guard so a stale/late `trackEnded` or
+   * `error` for the just-faded-out (old) track — whose handler captured the pre-bump generation —
+   * cannot also advance. The contract guarantees the Player sends EITHER `crossfadeAdvance` OR
+   * `trackEnded` for a given track (never both), so this is defense against a race, not a duplicate.
+   * Deliberately does NOT call loadCurrentLocked/sink.load: the next audio is already audible. The
+   * prefetch of the NEW upcoming[0] and radioTopUp fire automatically via queue.advance()'s change
+   * event (the same wiring loadCurrentLocked relies on).
+   */
+  crossfadeAdvance(): void {
+    void this.lock.runExclusive(async () => {
+      if (!this.sink || this._dryHeld) return;
+      // No next track → let the Player's trackEnded path (radio/dry-hold) handle the end instead.
+      if (this.queue.snapshot().upcoming.length === 0) return;
+      // Re-arm BEFORE advancing so any end/error signal captured for the outgoing track is stale.
+      this.playGeneration += 1;
+      const item = await this.queue.advance();
+      // Race guard: nothing was actually promoted (e.g. the queue drained between the check and the
+      // advance) — leave the end handling to the normal trackEnded path.
+      if (!item) return;
+      // Adopt the already-playing next track as live WITHOUT a load/play. advance() archived the
+      // finished (faded-out) track to history and fired prefetch(newHead) + radioTopUp via its
+      // 'changed'/'prefetch' events, so the head is warming and radio tops up on its own.
+      this.liveItemId = item.id;
+      this.liveItem = item;
+      this._paused = false;
+      this.markTrackStarted(0); // fresh track → position clock restarts at 0
+      this.emit("changed");
+    });
+  }
+
   // eslint-disable-next-line @typescript-eslint/require-await -- async keeps the rejected-promise contract (callers await; RangeError surfaces via .rejects, not a sync throw)
   async seek(positionMs: number): Promise<boolean> {
     const item = this.queue.current;
@@ -641,9 +682,10 @@ export class StationController extends EventEmitter {
       seed: this._seed,
       paused: this._paused,
       preparing: this.preparing ? { ...this.preparing } : null,
-      // server fills the player-presence fields; orchestrator reports defaults.
+      // server fills the player-presence + live-listeners fields; orchestrator reports defaults.
       activePlayerPresent: false,
       activePlayerLabel: null,
+      listeners: [],
     };
   }
 

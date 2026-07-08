@@ -841,3 +841,89 @@ describe("StationController enqueue-race auto-start (finding: redundant reload r
     expect(download.mock.calls.filter((call) => call[0] === "aaaaaaaaaaa")).toHaveLength(1);
   });
 });
+
+describe("StationController crossfadeAdvance", () => {
+  it("advances current→next WITHOUT loading the sink (Player already crossfaded in)", async () => {
+    const { c, download } = controller();
+    const { sink, sent } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    const loadsBefore = sent.filter((m) => m.type === "load" || m.type === "play").length;
+    c.crossfadeAdvance();
+    // Live track becomes b; the finished a is archived to history.
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    expect(c.snapshot().upcoming).toHaveLength(0);
+    expect(c.snapshot().history.some((h) => h.meta.videoId === "aaaaaaaaaaa")).toBe(true);
+    // Position reset to ~0 for the new track.
+    expect(c.snapshot().current?.positionMs).toBe(0);
+    // NO new load/play was sent for b (the Player already has it playing) and b was never downloaded.
+    expect(sent.filter((m) => m.type === "load" || m.type === "play").length).toBe(loadsBefore);
+    expect(sent.some((m) => m.type === "load" && m.audioUrl === "/audio/bbbbbbbbbbb")).toBe(false);
+    expect(download.mock.calls.some((call) => call[0] === "bbbbbbbbbbb")).toBe(false);
+  });
+
+  it("fires prefetch of the NEW upcoming head + radioTopUp on crossfade advance", async () => {
+    const prefetch = vi.fn(async () => {});
+    const radioTopUp = vi.fn();
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    const c = new StationController({ download, prefetch, now: () => 1_000 });
+    c.setRadioTopUp(radioTopUp);
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    await c.enqueue(meta("ccccccccccc"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    prefetch.mockClear();
+    radioTopUp.mockClear();
+    c.crossfadeAdvance();
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    // New upcoming head is c → it gets prefetched, and radio tops up.
+    expect(prefetch).toHaveBeenCalledWith("ccccccccccc", expect.anything());
+    expect(radioTopUp).toHaveBeenCalled();
+  });
+
+  it("no-op when there is no next track (Player sends trackEnded, not crossfadeAdvance)", async () => {
+    const { c } = controller();
+    const { sink, sent } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    const before = sent.length;
+    c.crossfadeAdvance();
+    await new Promise((r) => setTimeout(r, 20));
+    // Still on a, nothing archived, no sink traffic — the normal end path owns this case.
+    expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa");
+    expect(c.snapshot().history).toHaveLength(0);
+    expect(sent.length).toBe(before);
+  });
+
+  it("does NOT double-advance when a stale trackEnded races the crossfadeAdvance", async () => {
+    const { c } = controller();
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    await c.enqueue(meta("ccccccccccc"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    // Both fire for the SAME (outgoing) track a: crossfadeAdvance re-arms the generation first, so
+    // the trackEnded captured at the pre-bump generation is ignored — we land on b, not c.
+    c.crossfadeAdvance();
+    sink.onTrackEnded();
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"); // NOT advanced past to c
+    expect(c.snapshot().upcoming.map((i) => i.meta.videoId)).toEqual(["ccccccccccc"]);
+  });
+
+  it("no-op with no sink attached", async () => {
+    const { c } = controller();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.crossfadeAdvance();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(c.snapshot().history).toHaveLength(0);
+  });
+});

@@ -23,6 +23,7 @@ const SNAP: StationSnapshot = {
   autoplaySource: "radio",
   volume: 100,
   maxTrackDurationSec: 0,
+  crossfadeSec: 10,
   current: null,
   upcoming: [],
   upcomingRadio: [],
@@ -32,6 +33,7 @@ const SNAP: StationSnapshot = {
   preparing: null,
   activePlayerPresent: false,
   activePlayerLabel: null,
+  listeners: [],
 };
 
 describe("isAllowedOrigin", () => {
@@ -112,22 +114,45 @@ describe("StationBroadcaster.attach", () => {
       get activePlayerLabel() {
         return "Kitchen";
       },
+      listConnected: () => [{ deviceId: "d1", displayName: "Kitchen", isSpeaker: true }],
     });
     station.emit("changed");
     const state = (sub.mock.calls[0]![0] as { state: StationSnapshot }).state;
     expect(state.activePlayerPresent).toBe(true);
     expect(state.activePlayerLabel).toBe("Kitchen");
+    expect(state.listeners).toEqual([{ deviceId: "d1", displayName: "Kitchen", isSpeaker: true }]);
   });
 });
 
 describe("withPresence", () => {
   it("fills present/label from the registry values (null deviceId => absent)", () => {
     expect(
-      withPresence(SNAP, { activePlayerDeviceId: "d1", activePlayerLabel: "Den" }),
+      withPresence(SNAP, {
+        activePlayerDeviceId: "d1",
+        activePlayerLabel: "Den",
+        listConnected: () => [],
+      }),
     ).toMatchObject({ activePlayerPresent: true, activePlayerLabel: "Den" });
     expect(
-      withPresence(SNAP, { activePlayerDeviceId: null, activePlayerLabel: null }),
+      withPresence(SNAP, {
+        activePlayerDeviceId: null,
+        activePlayerLabel: null,
+        listConnected: () => [],
+      }),
     ).toMatchObject({ activePlayerPresent: false, activePlayerLabel: null });
+  });
+
+  it("overlays the live listeners roster from presence.listConnected()", () => {
+    const roster = [
+      { deviceId: "d1", displayName: "PC", isSpeaker: true },
+      { deviceId: "d2", displayName: "Phone", isSpeaker: false },
+    ];
+    const out = withPresence(SNAP, {
+      activePlayerDeviceId: "d1",
+      activePlayerLabel: "PC",
+      listConnected: () => roster,
+    });
+    expect(out.listeners).toEqual(roster);
   });
 });
 
@@ -174,6 +199,7 @@ async function boot(opts: { authed: boolean }) {
     resume: vi.fn(),
     pause: vi.fn(),
     reportPosition: vi.fn(),
+    crossfadeAdvance: vi.fn(),
   });
   const b = new StationBroadcaster();
   const dir = mkdtempSync(join(tmpdir(), "lj-ws-"));
@@ -215,6 +241,7 @@ describe("origin guard exact-path matching", () => {
       resume: vi.fn(),
       pause: vi.fn(),
       reportPosition: vi.fn(),
+      crossfadeAdvance: vi.fn(),
     });
     const dir = mkdtempSync(join(tmpdir(), "lj-ws-origin-"));
     const registry = new PlayerRegistry({ dir, station: station as never, now: () => 1 });
@@ -365,6 +392,50 @@ describe("registerWebsocket integration", () => {
     ws.close();
   });
 
+  it("crossfadeAdvance routes to station.crossfadeAdvance()", async () => {
+    h = await boot({ authed: true });
+    const ws = await openHello(h.url);
+    ws.send(JSON.stringify({ type: "crossfadeAdvance" }));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(h.station.crossfadeAdvance).toHaveBeenCalledTimes(1);
+    ws.close();
+  });
+
+  it("broadcasts the live roster to existing clients when a new client connects", async () => {
+    h = await boot({ authed: true });
+    const ws1 = await openHello(h.url);
+    const seen1: unknown[] = [];
+    ws1.on("message", (d) => seen1.push(JSON.parse(d.toString())));
+    await new Promise((r) => setTimeout(r, 40));
+    seen1.length = 0; // drop frames from ws1's own hello
+    // A second client connects — a bare connect fires no station 'changed', so the roster
+    // update to ws1 can only come from the explicit connect-broadcast in the hello handler.
+    const ws2 = await openHello(h.url);
+    await new Promise((r) => setTimeout(r, 60));
+    const states = seen1.filter((m) => (m as { type?: string }).type === "state") as Array<{
+      state: StationSnapshot;
+    }>;
+    expect(states.length).toBeGreaterThan(0);
+    expect(states.at(-1)!.state.listeners.some((l) => l.deviceId === "d1")).toBe(true);
+    ws1.close();
+    ws2.close();
+  });
+
+  it("broadcasts the updated roster to remaining clients on disconnect", async () => {
+    h = await boot({ authed: true });
+    const ws1 = await openHello(h.url);
+    const seen1: unknown[] = [];
+    ws1.on("message", (d) => seen1.push(JSON.parse(d.toString())));
+    const ws2 = await openHello(h.url);
+    await new Promise((r) => setTimeout(r, 50));
+    seen1.length = 0; // drop earlier frames
+    ws2.close(); // its close handler must broadcast the shrunken roster to ws1
+    await new Promise((r) => setTimeout(r, 60));
+    const states = seen1.filter((m) => (m as { type?: string }).type === "state");
+    expect(states.length).toBeGreaterThan(0);
+    ws1.close();
+  });
+
   it("registers no recurring interval (no 30s revalidation)", async () => {
     const spy = vi.spyOn(global, "setInterval");
     h = await boot({ authed: true });
@@ -395,6 +466,7 @@ describe("playbackError from a non-Player socket must NOT crash the process", ()
       resume: vi.fn(),
       pause: vi.fn(),
       reportPosition: vi.fn(),
+      crossfadeAdvance: vi.fn(),
     });
     const dir = mkdtempSync(join(tmpdir(), "lj-ws-real-"));
     const registry = new PlayerRegistry({ dir, station: station as never, now: () => 1 });

@@ -20,6 +20,7 @@ import { Queue } from "./Queue.js";
 import { History } from "./History.js";
 import { Lyrics } from "./Lyrics.js";
 import { Settings } from "./Settings.js";
+import { Listeners } from "./Listeners.js";
 import { Grain } from "./Grain.js";
 
 type AuthState = "checking" | "anon" | "authed";
@@ -63,6 +64,9 @@ export function App() {
     at: number;
   } | null>(null);
 
+  // Live-listeners drawer visibility, toggled by the header "Listeners (N)" button.
+  const [listenersOpen, setListenersOpen] = useState(false);
+
   const ws = useStationState();
 
   // Bootstrap: ensure a deviceId exists, then probe the session.
@@ -86,9 +90,23 @@ export function App() {
     };
   }, []);
 
+  // The live snapshot (WS broadcast is truth, REST seed is the fallback) — needed here,
+  // ABOVE the auth early-returns, because usePlayerRole is a hook and must run every render.
+  // It feeds the crossfade engine the next queued track's audio URL + the crossfade length.
+  const playerSnap: StationSnapshot | null = ws.snapshot ?? restSnap;
+  const nextAudioUrl = playerSnap?.upcoming?.[0]
+    ? "/audio/" + playerSnap.upcoming[0].meta.videoId
+    : null;
+  const crossfadeSec = playerSnap?.crossfadeSec ?? 10;
+
   // Claiming the Player needs the per-socket audio sink, so it happens over the WS
   // (usePlayerRole sends becomePlayer/relinquishPlayer as `isSpeaker` flips), NOT REST.
-  const { audioRef, error: playerError } = usePlayerRole(ws.socket, wantsSpeaker);
+  const { audioRef, error: playerError } = usePlayerRole(
+    ws.socket,
+    wantsSpeaker,
+    nextAudioUrl,
+    crossfadeSec,
+  );
 
   // A transient error banner fed by wsState.lastError (trackError frames). Keyed on the
   // monotonic seq so a repeat of the same title still re-surfaces, and auto-dismisses.
@@ -168,8 +186,8 @@ export function App() {
   }
 
   // The WS broadcast is the live truth; fall back to the immediate REST snapshot
-  // (which is a superset) until the first WS frame lands.
-  const snap: StationSnapshot | null = ws.snapshot ?? restSnap;
+  // (which is a superset) until the first WS frame lands. Same source as playerSnap above.
+  const snap: StationSnapshot | null = playerSnap;
   const receivedAt = ws.snapshot ? ws.receivedAt : 0;
 
   // Cold-start: exactly seed === null && current === null (never while checking auth).
@@ -203,27 +221,39 @@ export function App() {
         <p className="eyebrow" style={{ color: "var(--color-ember-soft)" }}>
           LAN Jukebox
         </p>
-        {/* Live region so a screen reader is told when the station's speaker comes/goes — a
+        <div className="flex items-center gap-4">
+          <button
+            type="button"
+            className="pill pill-ghost"
+            style={{ padding: "0.35rem 0.8rem", fontSize: "0.75rem" }}
+            aria-haspopup="dialog"
+            aria-expanded={listenersOpen}
+            onClick={() => setListenersOpen((v) => !v)}
+          >
+            Listeners ({snap?.listeners?.length ?? 0})
+          </button>
+          {/* Live region so a screen reader is told when the station's speaker comes/goes — a
             critical state for an always-playing radio (no speaker = nothing produces audio). The
             text alone ("… live" / "No speaker") conveys the state; the ●/○ glyph is decorative. */}
-        <span
-          role="status"
-          aria-live="polite"
-          className="font-mono text-xs"
-          style={{ color: "var(--color-ink-faint)" }}
-        >
-          {snap?.activePlayerPresent ? (
-            <>
-              <span aria-hidden>● </span>
-              {`${snap.activePlayerLabel ?? "speaker"} live`}
-            </>
-          ) : (
-            <>
-              <span aria-hidden>○ </span>
-              No speaker
-            </>
-          )}
-        </span>
+          <span
+            role="status"
+            aria-live="polite"
+            className="font-mono text-xs"
+            style={{ color: "var(--color-ink-faint)" }}
+          >
+            {snap?.activePlayerPresent ? (
+              <>
+                <span aria-hidden>● </span>
+                {`${snap.activePlayerLabel ?? "speaker"} live`}
+              </>
+            ) : (
+              <>
+                <span aria-hidden>○ </span>
+                No speaker
+              </>
+            )}
+          </span>
+        </div>
       </header>
 
       {(ws.status === "connecting" || ws.status === "closed") && (
@@ -389,10 +419,18 @@ export function App() {
             repeat={snap?.repeat ?? "off"}
             volume={snap?.volume ?? 100}
             maxTrackDurationSec={snap?.maxTrackDurationSec ?? 0}
+            crossfadeSec={snap?.crossfadeSec ?? 10}
             onChange={(patch: Partial<StationSettings>) => void control("settings", patch)}
           />
         </div>
       </div>
+
+      <Listeners
+        listeners={snap?.listeners ?? []}
+        myDeviceId={getDeviceId()}
+        open={listenersOpen}
+        onClose={() => setListenersOpen(false)}
+      />
     </main>
   );
 }

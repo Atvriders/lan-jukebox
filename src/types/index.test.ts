@@ -4,6 +4,7 @@ import {
   DEFAULT_SETTINGS,
   VOLUME_MAX,
   MAX_TRACK_DURATION_CEILING_SEC,
+  CROSSFADE_MAX,
 } from "./index.js";
 import type {
   TrackMeta,
@@ -13,6 +14,8 @@ import type {
   DeviceRegistryFile,
   ControlRequest,
   ServerPlayerMessage,
+  ClientWsMessage,
+  PresenceUser,
   AppConfig,
 } from "./index.js";
 
@@ -25,19 +28,21 @@ describe("shared types backbone — runtime constants", () => {
     });
   });
 
-  it("DEFAULT_SETTINGS is the jukebox default (autoplay on, radio, vol 100, no dur cap)", () => {
+  it("DEFAULT_SETTINGS is the jukebox default (autoplay on, radio, vol 100, no dur cap, crossfade 10s)", () => {
     expect(DEFAULT_SETTINGS).toEqual({
       repeat: "off",
       autoplay: true,
       autoplaySource: "radio",
       volume: 100,
       maxTrackDurationSec: 0,
+      crossfadeSec: 10,
     });
   });
 
-  it("exposes the volume + duration ceilings", () => {
+  it("exposes the volume + duration + crossfade ceilings", () => {
     expect(VOLUME_MAX).toBe(200);
     expect(MAX_TRACK_DURATION_CEILING_SEC).toBe(21600);
+    expect(CROSSFADE_MAX).toBe(20);
   });
 });
 
@@ -96,5 +101,19 @@ describe("shared types backbone — structural type usage compiles", () => {
   it("AppConfig + StationSnapshot are referenceable as types", () => {
     const t = (_c: AppConfig, _s: StationSnapshot, _m: TrackMeta) => true;
     expect(typeof t).toBe("function");
+  });
+
+  it("PresenceUser + StationSnapshot.listeners model the live roster", () => {
+    const me: PresenceUser = { deviceId: "dev-1", displayName: "Me", isSpeaker: true };
+    const other: PresenceUser = { deviceId: "dev-2", displayName: "You", isSpeaker: false };
+    const listeners: StationSnapshot["listeners"] = [me, other];
+    expect(listeners).toHaveLength(2);
+    expect(me.isSpeaker).toBe(true);
+    expect(other.isSpeaker).toBe(false);
+  });
+
+  it("ClientWsMessage includes the crossfadeAdvance signal", () => {
+    const msg: ClientWsMessage = { type: "crossfadeAdvance" };
+    expect(msg.type).toBe("crossfadeAdvance");
   });
 });

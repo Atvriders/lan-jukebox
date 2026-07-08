@@ -371,6 +371,93 @@ describe("POST /api/control", () => {
     expect(res.statusCode).toBe(400);
     await app.close();
   });
+  it("settings clamps an over-max crossfadeSec down to CROSSFADE_MAX (integer)", async () => {
+    const { app, station } = await build();
+    const c = await login(app);
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/control",
+      headers: { cookie: c },
+      payload: { action: "settings", value: { crossfadeSec: 999 } },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().ok).toBe(true);
+    expect(station.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ crossfadeSec: 20 }),
+    );
+    await app.close();
+  });
+  it("settings clamps a negative crossfadeSec up to 0", async () => {
+    const { app, station } = await build();
+    const c = await login(app);
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/control",
+      headers: { cookie: c },
+      payload: { action: "settings", value: { crossfadeSec: -5 } },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(station.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ crossfadeSec: 0 }),
+    );
+    await app.close();
+  });
+  it("settings rounds a fractional crossfadeSec to a whole second", async () => {
+    const { app, station } = await build();
+    const c = await login(app);
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/control",
+      headers: { cookie: c },
+      payload: { action: "settings", value: { crossfadeSec: 12.7 } },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(station.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ crossfadeSec: 13 }),
+    );
+    await app.close();
+  });
+  it("settings accepts a valid in-range crossfadeSec (0 = off) unchanged", async () => {
+    const { app, station } = await build();
+    const c = await login(app);
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/control",
+      headers: { cookie: c },
+      payload: { action: "settings", value: { crossfadeSec: 0 } },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(station.updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ crossfadeSec: 0 }),
+    );
+    await app.close();
+  });
+  it("settings 400s a non-numeric crossfadeSec", async () => {
+    const { app, station } = await build();
+    const c = await login(app);
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/control",
+      headers: { cookie: c },
+      payload: { action: "settings", value: { crossfadeSec: "abc" } },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(station.updateSettings).not.toHaveBeenCalled();
+    await app.close();
+  });
+  it("settings passes through non-crossfade fields untouched (no crossfade key added)", async () => {
+    const { app, station } = await build();
+    const c = await login(app);
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/control",
+      headers: { cookie: c },
+      payload: { action: "settings", value: { repeat: "all" } },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(station.updateSettings).toHaveBeenCalledWith({ repeat: "all" });
+    await app.close();
+  });
   it("400s remove/jump with a missing itemId", async () => {
     const { app } = await build();
     const c = await login(app);

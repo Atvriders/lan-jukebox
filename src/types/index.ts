@@ -90,6 +90,8 @@ export interface StationSettings {
   volume: number;
   /** 0 = no limit. */
   maxTrackDurationSec: number;
+  /** Equal-power crossfade overlap in seconds; 0 = off. Clamped to [0, CROSSFADE_MAX]. */
+  crossfadeSec: number;
 }
 
 export const DEFAULT_SETTINGS: StationSettings = {
@@ -98,10 +100,12 @@ export const DEFAULT_SETTINGS: StationSettings = {
   autoplaySource: "radio",
   volume: 100,
   maxTrackDurationSec: 0,
+  crossfadeSec: 10,
 };
 
 export const VOLUME_MAX = 200;
 export const MAX_TRACK_DURATION_CEILING_SEC = 21600;
+export const CROSSFADE_MAX = 20;
 
 // ---------------------------------------------------------------------------
 // Preparing (live fetch status surfaced in /api/state)
@@ -136,6 +140,17 @@ export interface DeviceRegistryFile {
 }
 
 // ---------------------------------------------------------------------------
+// Live listeners (presence) — currently-connected clients, deduped per device
+// ---------------------------------------------------------------------------
+
+/** One currently-connected client in the live roster (deduped per deviceId). */
+export interface PresenceUser {
+  deviceId: string;
+  displayName: string;
+  isSpeaker: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Station snapshot (the broadcast shape AND the persisted state shape)
 // ---------------------------------------------------------------------------
 
@@ -161,6 +176,8 @@ export interface StationSnapshot extends StationSettings {
   activePlayerPresent: boolean;
   /** label of the active player device, for the UI. */
   activePlayerLabel: string | null;
+  /** Currently-connected clients (deduped per device) for the live listeners roster. */
+  listeners: PresenceUser[];
 }
 
 /** Per-viewer view of the snapshot returned by GET /api/state (adds request-scoped flags). */
@@ -271,6 +288,7 @@ export type ClientWsMessage =
   | { type: "relinquishPlayer" }
   | { type: "position"; ms: number }
   | { type: "trackEnded" }
+  | { type: "crossfadeAdvance" }
   | { type: "playbackError"; message: string };
 
 /** Server → all subscribers (broadcast). */

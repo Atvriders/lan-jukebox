@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { applySettingsPatch } from "./settings.js";
-import { DEFAULT_SETTINGS, VOLUME_MAX, MAX_TRACK_DURATION_CEILING_SEC } from "../types/index.js";
+import {
+  DEFAULT_SETTINGS,
+  VOLUME_MAX,
+  MAX_TRACK_DURATION_CEILING_SEC,
+  CROSSFADE_MAX,
+} from "../types/index.js";
 import type { StationSettings } from "../types/index.js";
 
 const base: StationSettings = { ...DEFAULT_SETTINGS };
@@ -42,10 +47,17 @@ describe("applySettingsPatch", () => {
     expect(applySettingsPatch(base, { autoplay: "yes" }).autoplay).toBe(base.autoplay);
   });
 
-  it("ignores removed fields (idle/crossfade/fx/commandChannel)", () => {
+  it("clamps + rounds crossfadeSec to 0..CROSSFADE_MAX and rejects booleans", () => {
+    expect(applySettingsPatch(base, { crossfadeSec: 5 }).crossfadeSec).toBe(5);
+    expect(applySettingsPatch(base, { crossfadeSec: 999 }).crossfadeSec).toBe(CROSSFADE_MAX);
+    expect(applySettingsPatch(base, { crossfadeSec: -5 }).crossfadeSec).toBe(0);
+    expect(applySettingsPatch(base, { crossfadeSec: 4.6 }).crossfadeSec).toBe(5);
+    expect(applySettingsPatch(base, { crossfadeSec: true }).crossfadeSec).toBe(base.crossfadeSec);
+  });
+
+  it("ignores removed fields (idle/fx/commandChannel)", () => {
     const out = applySettingsPatch(base, {
       idleTimeoutSec: 99,
-      crossfadeSec: 5,
       fx: "bassboost",
       commandChannelId: "c",
     } as Partial<Record<keyof StationSettings, unknown>>);
@@ -53,6 +65,7 @@ describe("applySettingsPatch", () => {
     expect(Object.keys(out).sort()).toEqual([
       "autoplay",
       "autoplaySource",
+      "crossfadeSec",
       "maxTrackDurationSec",
       "repeat",
       "volume",

@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { WebSocket as WsWebSocket } from "@fastify/websocket";
 import type {
   ClientWsMessage,
+  PresenceUser,
   ServerBroadcastMessage,
   ServerWsMessage,
   StationSnapshot,
@@ -29,9 +30,14 @@ export interface StationLike {
 export interface PlayerPresence {
   readonly activePlayerDeviceId: string | null;
   readonly activePlayerLabel: string | null;
+  /** Live roster of currently-connected clients (deduped per device). */
+  listConnected(): PresenceUser[];
 }
 
-/** Enrich a raw orchestrator snapshot with the registry's live player-presence fields. */
+/**
+ * Enrich a raw orchestrator snapshot with the registry's live player-presence fields:
+ * the speaker indicator (activePlayerPresent/Label) AND the live listeners roster.
+ */
 export function withPresence(
   state: StationSnapshot,
   presence: PlayerPresence | undefined,
@@ -41,6 +47,7 @@ export function withPresence(
     ...state,
     activePlayerPresent: presence.activePlayerDeviceId !== null,
     activePlayerLabel: presence.activePlayerLabel,
+    listeners: presence.listConnected(),
   };
 }
 
@@ -84,7 +91,7 @@ export interface WsDeps {
   registry: PlayerRegistry;
   allowedOrigins: readonly string[];
   makeSink: (send: Send) => BrowserPlayerSink; // factory injected from the composition root
-  station: StationLike & { reportPosition(ms: number): void };
+  station: StationLike & { reportPosition(ms: number): void; crossfadeAdvance(): void };
 }
 
 export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
@@ -100,15 +107,28 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
     }
   });
 
-  // Attach with a live presence view backed by the registry (getters read fresh each broadcast).
-  deps.broadcaster.attach(deps.station, {
+  // Live presence view backed by the registry (getters/listConnected read fresh each use).
+  // Shared by the broadcaster attach AND the per-socket connect/disconnect broadcasts below.
+  const presence: PlayerPresence = {
     get activePlayerDeviceId() {
       return deps.registry.activePlayerDeviceId;
     },
     get activePlayerLabel() {
       return deps.registry.activePlayerLabel;
     },
-  });
+    listConnected: () => deps.registry.listConnected(),
+  };
+  deps.broadcaster.attach(deps.station, presence);
+
+  // Broadcast the CURRENT enriched snapshot to every subscriber. Used on connect/disconnect
+  // so the live listeners roster updates for everyone — a bare remote connect/disconnect does
+  // NOT fire station 'changed' (the only other path that emits {type:'state'}).
+  const broadcastState = (): void => {
+    deps.broadcaster.broadcast({
+      type: "state",
+      state: withPresence(deps.station.snapshot(), presence),
+    });
+  };
 
   app.get("/ws", { websocket: true }, (socket: WsWebSocket, req: FastifyRequest) => {
     const session = (
@@ -140,15 +160,15 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
         case "hello":
           deps.registry.touch(deviceId, label);
           deps.registry.onConnect(deviceId, sink);
-          // Every subscriber gets an immediate {type:'state'} after a successful hello — enriched
-          // with the live player-presence fields (same overlay as the broadcast path).
+          // This socket gets an immediate {type:'state'} after a successful hello — enriched with
+          // the live player-presence fields (same overlay as the broadcast path).
           send({
             type: "state",
-            state: withPresence(deps.station.snapshot(), {
-              activePlayerDeviceId: deps.registry.activePlayerDeviceId,
-              activePlayerLabel: deps.registry.activePlayerLabel,
-            }),
+            state: withPresence(deps.station.snapshot(), presence),
           });
+          // …and every OTHER connected client's roster updates live: this new listener just
+          // joined, but a bare connect fires no station 'changed', so broadcast it explicitly.
+          broadcastState();
           break;
         case "becomePlayer":
           deps.registry.claim(deviceId, sink);
@@ -163,6 +183,12 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
           // Route through the sink's guarded API (destroyed short-circuit) rather than a raw
           // emit, keeping all sink-event policy in one place.
           sink.onTrackEnded();
+          break;
+        case "crossfadeAdvance":
+          // The Player already started the next track (crossfading in); advance the queue
+          // WITHOUT re-loading it. For a given track the Player sends EITHER crossfadeAdvance
+          // OR trackEnded, never both, so this never double-advances vs onSinkTrackEnd.
+          deps.station.crossfadeAdvance();
           break;
         case "playbackError":
           // MUST go through onPlaybackError (not a raw emit("error")): a listener-less
@@ -179,7 +205,13 @@ export function registerWebsocket(app: FastifyInstance, deps: WsDeps): void {
       // becomePlayer) does not let the OLD socket's stale close tear down the new,
       // legitimately-active session.
       deps.registry.onDisconnect(deviceId, sink);
+      // Drop this socket from the live listeners roster (deviceId-scoped: one decrement per
+      // socket, so multi-tab / reload overlap nets out — the device stays until its last socket).
+      deps.registry.trackDisconnect(deviceId);
       deps.broadcaster.unsubscribe(send);
+      // The roster shrank — tell everyone still connected. Unsubscribe FIRST so this dead
+      // socket is not in the fan-out.
+      broadcastState();
     });
   });
 }

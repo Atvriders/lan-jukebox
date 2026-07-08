@@ -1,5 +1,13 @@
 import type { RepeatMode, StationSettings } from "../types.js";
+import { CROSSFADE_MAX } from "../types.js";
 
+const CROSSFADE_PRESETS: { sec: number; label: string }[] = [
+  { sec: 0, label: "Off" },
+  { sec: 5, label: "5s" },
+  { sec: 10, label: "10s" },
+  { sec: 15, label: "15s" },
+  { sec: 20, label: "20s" },
+];
 const MAX_LEN_PRESETS: { sec: number; label: string }[] = [
   { sec: 3600, label: "1 hour" },
   { sec: 7200, label: "2 hours" },
@@ -24,12 +32,14 @@ export function Settings({
   repeat,
   volume,
   maxTrackDurationSec,
+  crossfadeSec,
   disabled,
   onChange,
 }: {
   repeat: RepeatMode;
   volume: number;
   maxTrackDurationSec: number;
+  crossfadeSec: number;
   disabled?: boolean;
   onChange: (patch: Partial<StationSettings>) => void;
 }) {
@@ -40,6 +50,7 @@ export function Settings({
   const selectClass = "bg-transparent px-3 py-2 text-sm font-mono tracking-tight";
   const optStyle = { background: "var(--color-raised)", color: "var(--color-fg)" } as const;
   const maxLenIsPreset = MAX_LEN_PRESETS.some((p) => p.sec === maxTrackDurationSec);
+  const crossfadeIsPreset = CROSSFADE_PRESETS.some((p) => p.sec === crossfadeSec);
 
   return (
     <div className="flex flex-wrap items-center gap-x-5 gap-y-3" aria-label="Playback settings">
@@ -100,6 +111,33 @@ export function Settings({
             </option>
           )}
           {MAX_LEN_PRESETS.map((p) => (
+            <option key={p.sec} value={String(p.sec)} style={optStyle}>
+              {p.label}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <label className="flex flex-col gap-1.5">
+        <span className="eyebrow">Crossfade</span>
+        <select
+          aria-label="Crossfade"
+          value={String(crossfadeSec)}
+          disabled={disabled}
+          onChange={(e) =>
+            onChange({
+              crossfadeSec: Math.max(0, Math.min(CROSSFADE_MAX, Number(e.target.value))),
+            })
+          }
+          className={selectClass}
+          style={inputStyle}
+        >
+          {!crossfadeIsPreset && (
+            <option key={crossfadeSec} value={String(crossfadeSec)} style={optStyle}>
+              {crossfadeSec}s (current)
+            </option>
+          )}
+          {CROSSFADE_PRESETS.map((p) => (
             <option key={p.sec} value={String(p.sec)} style={optStyle}>
               {p.label}
             </option>

@@ -43,6 +43,8 @@ function playingSnap(paused: boolean): StationSnapshot {
     autoplaySource: "radio",
     volume: 100,
     maxTrackDurationSec: 0,
+    crossfadeSec: 10,
+    listeners: [],
   } as unknown as StationSnapshot;
 }
 
@@ -50,6 +52,9 @@ function playingSnap(paused: boolean): StationSnapshot {
 // doesn't throw and the App renders its initial snapshot=null state.
 beforeEach(() => {
   localStorage.clear();
+  // App composes the Player (usePlayerRole); stub the media methods jsdom doesn't implement.
+  vi.spyOn(window.HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  vi.spyOn(window.HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
   class NoopWS {
     static OPEN = 1;
     static CONNECTING = 0;
@@ -284,5 +289,49 @@ describe("App", () => {
     const indicator = await screen.findByText(/no speaker/i);
     expect(indicator.getAttribute("role")).toBe("status");
     expect(indicator.getAttribute("aria-live")).toBe("polite");
+  });
+
+  it("shows the listener count in the header and toggles the drawer with the roster", async () => {
+    const snap = playingSnap(false);
+    (snap as unknown as { listeners: unknown[] }).listeners = [
+      { deviceId: "dA", displayName: "Alice", isSpeaker: true },
+      { deviceId: "dB", displayName: "Bob", isSpeaker: false },
+    ];
+    vi.spyOn(stationHook, "useStationState").mockReturnValue({
+      snapshot: snap,
+      status: "live",
+      receivedAt: 1000,
+      lastError: null,
+      socket: null,
+    });
+    vi.spyOn(api, "state").mockResolvedValue(snap as never);
+    render(<App />);
+    // Header button reflects the live count and no dialog is open yet.
+    const toggle = await screen.findByRole("button", { name: /listeners \(2\)/i });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // Opening the drawer shows an accessible dialog listing the connected roster.
+    fireEvent.click(toggle);
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByText("Alice")).toBeTruthy();
+    expect(screen.getByText("Bob")).toBeTruthy();
+    // Toggling again closes it.
+    fireEvent.click(toggle);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("changing the Crossfade select emits a settings patch with the new crossfadeSec", async () => {
+    vi.spyOn(stationHook, "useStationState").mockReturnValue({
+      snapshot: playingSnap(false),
+      status: "live",
+      receivedAt: 1000,
+      lastError: null,
+      socket: null,
+    });
+    vi.spyOn(api, "state").mockResolvedValue(playingSnap(false) as never);
+    const control = vi.spyOn(api, "control").mockResolvedValue(undefined as never);
+    render(<App />);
+    const select = await screen.findByLabelText(/crossfade/i);
+    fireEvent.change(select, { target: { value: "20" } });
+    expect(control).toHaveBeenCalledWith("settings", { crossfadeSec: 20 });
   });
 });

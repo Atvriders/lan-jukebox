@@ -1,7 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { DeviceRecord, DeviceRegistryFile, StationSnapshot } from "../types/index.js";
+import type {
+  DeviceRecord,
+  DeviceRegistryFile,
+  PresenceUser,
+  StationSnapshot,
+} from "../types/index.js";
 import { DEVICE_REGISTRY_FILE, readDeviceRegistry } from "./persist.js";
 import { getRootLogger } from "../util/logger.js";
 
@@ -53,6 +58,15 @@ export class PlayerRegistry {
   private devices = new Map<string, DeviceRecord>();
   private _activeDeviceId: string | null = null;
   private activeSink: RegistrySink | null = null;
+  /**
+   * Live connected-device presence (in-memory only, NOT persisted). Keyed by
+   * deviceId -> { displayName, connections }. `connections` counts how many
+   * open sockets a single device has (multi-tab / reload overlap), so the
+   * device stays in the roster until its LAST socket closes. This is distinct
+   * from `devices` (the persisted device-memory map): a device can be
+   * remembered without being connected, and connected without being remembered.
+   */
+  private connected = new Map<string, { displayName: string; connections: number }>();
 
   constructor(deps: PlayerRegistryDeps) {
     this.dir = deps.dir;
@@ -111,6 +125,11 @@ export class PlayerRegistry {
 
   touch(deviceId: string, label: string): void {
     const now = this.now();
+    // The label IS the presence displayName: if this device is currently
+    // connected, keep its live-roster name in sync with the freshest label
+    // (a rename mid-session should update the roster without a reconnect).
+    const pres = this.connected.get(deviceId);
+    if (pres) pres.displayName = label;
     const existing = this.devices.get(deviceId);
     if (existing) {
       // Skip the O(N) serialize + synchronous write when nothing meaningful
@@ -207,11 +226,45 @@ export class PlayerRegistry {
     return { activePlayerDeviceId: this._activeDeviceId };
   }
   onConnect(deviceId: string, sink: RegistrySink): void {
+    // Live presence FIRST: every connected client counts toward the listeners
+    // roster, independent of whether it is/auto-becomes the speaker below. Must
+    // run before the early-returns so non-speaker listeners are still tracked.
+    const displayName = this.devices.get(deviceId)?.label ?? deviceId;
+    const pres = this.connected.get(deviceId);
+    if (pres) {
+      pres.connections++;
+      pres.displayName = displayName; // refresh in case the label changed since
+    } else {
+      this.connected.set(deviceId, { displayName, connections: 1 });
+    }
+
     const rec = this.devices.get(deviceId);
     if (!rec || !rec.isPreferredSpeaker) return; // not a remembered speaker
     if (this._activeDeviceId !== null) return; // a player is already active
     // Auto-designate: same path as a manual claim.
     this.claim(deviceId, sink);
+  }
+
+  /**
+   * Decrement the live connection count for a device on socket close, dropping
+   * it from the roster when its last socket goes. deviceId-scoped (not
+   * sink-scoped): each socket contributes exactly one increment (onConnect) and
+   * one decrement (here), so multi-tab / reload overlap nets out correctly.
+   */
+  trackDisconnect(deviceId: string): void {
+    const pres = this.connected.get(deviceId);
+    if (!pres) return;
+    pres.connections--;
+    if (pres.connections <= 0) this.connected.delete(deviceId);
+  }
+
+  /** One entry per currently-connected device for the live listeners roster. */
+  listConnected(): PresenceUser[] {
+    return [...this.connected.entries()].map(([deviceId, p]) => ({
+      deviceId,
+      displayName: p.displayName,
+      isSpeaker: deviceId === this._activeDeviceId,
+    }));
   }
   onDisconnect(deviceId: string, sink?: RegistrySink): void {
     if (this._activeDeviceId !== deviceId) return;

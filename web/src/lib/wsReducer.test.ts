@@ -19,6 +19,8 @@ const snap: StationSnapshot = {
   autoplaySource: "radio",
   volume: 100,
   maxTrackDurationSec: 0,
+  crossfadeSec: 10,
+  listeners: [],
 };
 
 describe("applyWsMessage", () => {

@@ -1,5 +1,5 @@
 import type { AutoplaySource, RepeatMode, StationSettings } from "../types/index.js";
-import { VOLUME_MAX, MAX_TRACK_DURATION_CEILING_SEC } from "../types/index.js";
+import { VOLUME_MAX, MAX_TRACK_DURATION_CEILING_SEC, CROSSFADE_MAX } from "../types/index.js";
 
 const REPEAT_MODES: ReadonlySet<RepeatMode> = new Set<RepeatMode>(["off", "one", "all"]);
 const AUTOPLAY_SOURCES: ReadonlySet<AutoplaySource> = new Set<AutoplaySource>(["radio", "artist"]);
@@ -16,7 +16,7 @@ function clampInt(value: unknown, min: number, max: number, fallback: number): n
 /**
  * Merge an untrusted partial patch onto a base settings object, clamping/validating every
  * surviving field. Unknown or out-of-range values fall back to the current value. Removed
- * bot fields (idleTimeoutSec/crossfadeSec/normalizeLoudness/fx/commandChannelId) are ignored.
+ * bot fields (idleTimeoutSec/normalizeLoudness/fx/commandChannelId) are ignored.
  */
 export function applySettingsPatch(
   base: StationSettings,
@@ -45,5 +45,9 @@ export function applySettingsPatch(
             MAX_TRACK_DURATION_CEILING_SEC,
             base.maxTrackDurationSec,
           ),
+    crossfadeSec:
+      p.crossfadeSec == null
+        ? base.crossfadeSec
+        : clampInt(p.crossfadeSec, 0, CROSSFADE_MAX, base.crossfadeSec),
   };
 }
