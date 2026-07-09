@@ -321,6 +321,64 @@ describe("RadioEngine", () => {
     expect(preview.at(-1)?.map((i) => i.meta.videoId)).toEqual(["sssssssssss", "ttttttttttt"]);
   });
 
+  it("serializes CONCURRENT nextCandidate calls so they never pick the same id (dup-queue bug)", async () => {
+    // Real YouTube RD-Mix returns a STABLE set, so the first-eligible track is the same on every
+    // call. radioTopUp fires nextCandidate on every 'changed' (fire-and-forget) + radioContinuation
+    // adds a 2nd entry point, so calls overlap. Before serialization, both snapshot the de-dup set
+    // BEFORE their awaited fetch and BEFORE remember(), so both returned "sssssssssss" → duplicate
+    // queue entries (the reported Scientist ×4 / Yellow ×6). The mutex must hand out distinct ids.
+    const related = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 5)); // network delay → the two calls overlap
+      return [meta("sssssssssss"), meta("ttttttttttt"), meta("uuuuuuuuuuu")];
+    });
+    const { station } = fakeStation(meta("aaaaaaaaaaa"), {
+      current: null,
+      upcoming: [],
+      history: [],
+    });
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
+      settings: radioSettings,
+    });
+    const [a, b] = await Promise.all([r.nextCandidate(), r.nextCandidate()]);
+    expect(new Set([a?.videoId, b?.videoId]).size).toBe(2); // distinct — NOT both "sssssssssss"
+  });
+
+  it("overlapping ensureAhead runs never enqueue duplicate radio tracks", async () => {
+    const related = vi.fn(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      return [meta("sssssssssss"), meta("ttttttttttt"), meta("uuuuuuuuuuu")];
+    });
+    const snap = {
+      current: item("aaaaaaaaaaa"),
+      upcoming: [] as QueueItem[],
+      history: [] as QueueItem[],
+    };
+    const enqueued: TrackMeta[] = [];
+    const station = {
+      seed: meta("aaaaaaaaaaa"),
+      queue: { snapshot: () => snap },
+      enqueue: vi.fn(async (m: TrackMeta) => {
+        enqueued.push(m);
+        snap.upcoming.push({ ...item(m.videoId), fromRadio: true });
+        return item(m.videoId);
+      }),
+      setUpcomingRadio: vi.fn(),
+    };
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
+      settings: radioSettings,
+    });
+    // Fire two top-ups concurrently (as radioTopUp's fire-and-forget would on a burst of 'changed').
+    await Promise.all([r.ensureAhead(3), r.ensureAhead(3)]);
+    const ids = enqueued.map((m) => m.videoId);
+    expect(new Set(ids).size).toBe(ids.length); // zero duplicates enqueued
+  });
+
   it("does NOT publish the preview when nothing was enqueued (avoids infinite changed→topUp loop)", async () => {
     const related = vi.fn(async () => [] as TrackMeta[]);
     const snap = {

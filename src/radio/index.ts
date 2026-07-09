@@ -2,6 +2,7 @@ import type { AutoplaySource, QueueItem, TrackMeta } from "../types/index.js";
 import { AUTOPLAY_REQUESTER } from "../types/index.js";
 import type { YouTubeService } from "../youtube/index.js";
 import type { StationController } from "../orchestrator/index.js";
+import { Mutex } from "../util/mutex.js";
 
 export interface RadioDeps {
   youtube: Pick<YouTubeService, "related" | "artistTracks">;
@@ -24,6 +25,16 @@ export class RadioEngine {
   private readonly recent = new Set<string>();
   private readonly recentOrder: string[] = [];
   private readonly recentWindow: number;
+  // Serialize radio production. radioTopUp fires nextCandidate/ensureAhead on EVERY queue 'changed'
+  // (fire-and-forget), and radioContinuation adds a second concurrent entry point. Without this,
+  // overlapping runs each snapshot the SAME de-dup `seen` set BEFORE their awaited network fetch and
+  // BEFORE remember(), so they all pick the same first-eligible track and enqueue DUPLICATES (real
+  // YouTube RD-Mix returns a stable set, so the same few ids recur — hence Scientist ×4, Yellow ×6).
+  // Serializing means each pick observes the previous pick's remember(), so picks are distinct.
+  private readonly mutex = new Mutex();
+  // Re-entrancy guard for ensureAhead: our own enqueue fires 'changed' → radioTopUp → ensureAhead,
+  // so a burst of changes would otherwise pile up overlapping top-ups. One top-up at a time.
+  private topUpInFlight = false;
 
   constructor(private readonly deps: RadioDeps) {
     this.recentWindow = deps.recentWindow ?? 50;
@@ -90,7 +101,17 @@ export class RadioEngine {
     }
   }
 
-  async nextCandidate(): Promise<TrackMeta | null> {
+  /**
+   * Produce the next radio track. Serialized through `mutex` so concurrent callers (radioTopUp on
+   * every 'changed' AND radioContinuation on a drain) never both pick the same first-eligible track
+   * before either remember()s it — the duplicate-queue bug. Each serialized call sees the previous
+   * call's remember() in `seen`, so it moves on to the next distinct track in the Mix.
+   */
+  nextCandidate(): Promise<TrackMeta | null> {
+    return this.mutex.runExclusive(() => this.nextCandidateLocked());
+  }
+
+  private async nextCandidateLocked(): Promise<TrackMeta | null> {
     const { autoplay, autoplaySource } = this.deps.settings();
     if (!autoplay) return null;
     const seed = this.deps.station.seed;
@@ -126,24 +147,34 @@ export class RadioEngine {
   }
 
   async ensureAhead(lowWater = 1): Promise<void> {
-    // Append radio tracks until the explicit upcoming list reaches lowWater (or we run dry).
-    // Bounded by lowWater so a no-candidate result terminates the loop.
-    let enqueued = false;
-    for (let guard = 0; guard < lowWater + 1; guard++) {
-      const upcoming = this.deps.station.queue.snapshot().upcoming.length;
-      if (upcoming >= lowWater) break;
-      const next = await this.nextCandidate();
-      if (!next) break;
-      await this.deps.station.enqueue(next, AUTOPLAY_REQUESTER);
-      enqueued = true;
+    // Re-entrancy guard: radioTopUp fires this on every queue 'changed' — INCLUDING our own
+    // enqueue's change and publishPreview's change — so without it a burst of changes spawns many
+    // overlapping top-ups that pile up (behind the mutex) and overshoot lowWater / re-enter. One
+    // top-up at a time is sufficient; the next real drain fires 'changed' and tops up again.
+    if (this.topUpInFlight) return;
+    this.topUpInFlight = true;
+    try {
+      // Append radio tracks until the explicit upcoming list reaches lowWater (or we run dry).
+      // Bounded by lowWater so a no-candidate result terminates the loop.
+      let enqueued = false;
+      for (let guard = 0; guard < lowWater + 1; guard++) {
+        const upcoming = this.deps.station.queue.snapshot().upcoming.length;
+        if (upcoming >= lowWater) break;
+        const next = await this.nextCandidate();
+        if (!next) break;
+        await this.deps.station.enqueue(next, AUTOPLAY_REQUESTER);
+        enqueued = true;
+      }
+      // Publish the radio-tagged upcoming items as the UI "upcoming-radio preview" so the field
+      // reflects reality (radio picks are appended into the explicit `upcoming` queue tagged
+      // fromRadio, so the preview mirrors those rather than a separate pre-resolved buffer). Without
+      // this, setUpcomingRadio had zero runtime callers and the preview was permanently empty.
+      // ONLY when we actually enqueued: setUpcomingRadio emits "changed" → radioTopUp → ensureAhead,
+      // so publishing unconditionally (even when nothing was added) would recurse forever.
+      if (enqueued) this.publishPreview();
+    } finally {
+      this.topUpInFlight = false;
     }
-    // Publish the radio-tagged upcoming items as the UI "upcoming-radio preview" so the field
-    // reflects reality (radio picks are appended into the explicit `upcoming` queue tagged
-    // fromRadio, so the preview mirrors those rather than a separate pre-resolved buffer). Without
-    // this, setUpcomingRadio had zero runtime callers and the preview was permanently empty.
-    // ONLY when we actually enqueued: setUpcomingRadio emits "changed" → radioTopUp → ensureAhead,
-    // so publishing unconditionally (even when nothing was added) would recurse forever.
-    if (enqueued) this.publishPreview();
   }
 
   /** Mirror the current radio-tagged upcoming items into the station's upcoming-radio preview. */
