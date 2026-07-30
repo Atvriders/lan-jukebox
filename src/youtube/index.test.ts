@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, writeFile, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,8 +13,9 @@ import {
   parseDownloadProgress,
   scaleDownloadTimeout,
   DOWNLOAD_PROGRESS_TEMPLATE,
+  DOWNLOAD_LADDER_ATTEMPTS,
 } from "./index.js";
-import { YtErrorKind } from "./errors.js";
+import { YtError, YtErrorKind } from "./errors.js";
 import { loadMediaConfig } from "../config.js";
 
 const cfg = loadMediaConfig({ MAX_TRACK_DURATION_SEC: "3600" });
@@ -24,7 +25,13 @@ function ok(stdout: string) {
 }
 
 describe("YouTubeService.resolve", () => {
-  beforeEach(() => runMock.mockReset());
+  beforeEach(() => {
+    // Block body ON PURPOSE: a beforeEach's RETURN VALUE is treated by the runner as a teardown
+    // function, and mockReset() returns the (callable) mock — so `() => runMock.mockReset()` makes
+    // the runner INVOKE runMock() with no arguments after every test. With a throwing
+    // mockImplementation installed, that stray zero-arg call fails the test that just passed.
+    runMock.mockReset();
+  });
 
   it("maps yt-dlp -J output to TrackMeta", async () => {
     runMock.mockResolvedValue(
@@ -218,7 +225,9 @@ describe("YouTubeService.resolve", () => {
 });
 
 describe("YouTubeService.search", () => {
-  beforeEach(() => runMock.mockReset());
+  beforeEach(() => {
+    runMock.mockReset();
+  });
 
   it("maps flat entries, tolerating missing channel/duration", async () => {
     runMock.mockResolvedValue(
@@ -299,7 +308,9 @@ describe("YouTubeService.search", () => {
 });
 
 describe("YouTubeService.related", () => {
-  beforeEach(() => runMock.mockReset());
+  beforeEach(() => {
+    runMock.mockReset();
+  });
 
   it("fetches the RD<id> mix as a flat-playlist and maps entries, skipping the seed id", async () => {
     runMock.mockResolvedValue(
@@ -393,7 +404,9 @@ describe("YouTubeService.related", () => {
 });
 
 describe("YouTubeService.artistTracks", () => {
-  beforeEach(() => runMock.mockReset());
+  beforeEach(() => {
+    runMock.mockReset();
+  });
 
   const seed = {
     videoId: "seedaaaaaaa",
@@ -466,7 +479,9 @@ describe("YouTubeService.artistTracks", () => {
 });
 
 describe("YouTubeService.download", () => {
-  beforeEach(() => runMock.mockReset());
+  beforeEach(() => {
+    runMock.mockReset();
+  });
 
   it("returns the produced file path and parsed audio format", async () => {
     const dir = await mkdtemp(join(tmpdir(), "yt-"));
@@ -476,8 +491,14 @@ describe("YouTubeService.download", () => {
     expect(res.path).toBe(join(dir, "dQw4w9WgXcQ.webm"));
     expect(res.audio).toEqual({ codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 });
     const args = runMock.mock.calls[0]![0] as string[];
+    // Bitrate-first selection: `-f bestaudio/best` + `-S abr,acodec:opus` (the config defaults).
+    // The old hardcoded `bestaudio[acodec=opus]/bestaudio/best` chose opus BEFORE bitrate, so a
+    // higher-bitrate stream was thrown away in favour of a lower-bitrate opus one.
     expect(args).toContain("-f");
-    expect(args).toContain("bestaudio[acodec=opus]/bestaudio/best");
+    expect(args[args.indexOf("-f") + 1]).toBe("bestaudio/best");
+    expect(args).toContain("-S");
+    expect(args[args.indexOf("-S") + 1]).toBe("abr,acodec:opus");
+    expect(args).not.toContain("bestaudio[acodec=opus]/bestaudio/best");
     expect(args).toContain("--no-playlist");
     expect(args).toContain("--");
     // requests the real format via a post-download --print
@@ -565,14 +586,20 @@ describe("YouTubeService.download", () => {
 
   it("falls back to the next player client when the first download fails, then succeeds", async () => {
     const dir = await mkdtemp(join(tmpdir(), "yt-"));
-    await writeFile(join(dir, "dQw4w9WgXcQ.webm"), "fakeaudio");
     runMock
       .mockResolvedValueOnce({
         stdout: "",
         stderr: "ERROR: nsig extraction failed: Some formats may be missing",
         code: 1,
       })
-      .mockResolvedValueOnce(ok("AUDIOFMT::opus|160|165|48000\n"));
+      // The SUCCEEDING rung writes the file, exactly as the real yt-dlp does. It must not be
+      // seeded before the ladder starts: the failed rung above sweeps its own partial artifacts
+      // (see the purge regression below), so a pre-seeded file would be legitimately deleted and
+      // the fixture would no longer model production.
+      .mockImplementationOnce(async () => {
+        await writeFile(join(dir, "dQw4w9WgXcQ.webm"), "fakeaudio");
+        return ok("AUDIOFMT::opus|160|165|48000\n");
+      });
     const res = await new YouTubeService(cfg).download("dQw4w9WgXcQ", dir);
     expect(res.path).toBe(join(dir, "dQw4w9WgXcQ.webm"));
     expect(res.audio).toEqual({ codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 });
@@ -582,6 +609,177 @@ describe("YouTubeService.download", () => {
     const c2 = clientOf(runMock.mock.calls[1]![0] as string[]);
     expect(c1).toBe("youtube:player_client=android_vr");
     expect(c2).not.toBe(c1);
+  });
+
+  it("passes --force-overwrites so no attempt can adopt a killed attempt's TRUNCATED file", async () => {
+    // Regression. `--no-part` makes yt-dlp write straight to the FINAL `<id>.<ext>` name, so a
+    // SIGKILLed attempt leaves truncated bytes under a real audio extension — indistinguishable
+    // from a finished download to the produced-file scan below. yt-dlp does not overwrite by
+    // default, so the next attempt (the ladder's next rung, or any later re-download) printed
+    // "has already been downloaded", skipped the fetch, and handed back the truncated file: a
+    // corrupt track cached forever that plays broken or gets skipped every time.
+    const dir = await mkdtemp(join(tmpdir(), "yt-"));
+    await writeFile(join(dir, "dQw4w9WgXcQ.webm"), "fakeaudio");
+    runMock.mockResolvedValue(ok("AUDIOFMT::opus|160|165|48000\n"));
+    await new YouTubeService(cfg).download("dQw4w9WgXcQ", dir);
+    const args = runMock.mock.calls[0]![0] as string[];
+    expect(args).toContain("--force-overwrites");
+    // The pair is the point: --no-part is what creates the truncated final file in the first
+    // place, so the two flags must ship together.
+    expect(args).toContain("--no-part");
+  });
+
+  it("the ladder budget genuinely allows a full SECOND rung after the first burns its whole timeout", async () => {
+    // Regression. The download ladder is bounded in TOTAL time at DOWNLOAD_LADDER_ATTEMPTS (2) ×
+    // the per-attempt timeout. Charging each rung its RAW wall clock made that budget a lie: a rung
+    // that runs to its full timeout overshoots it by a few ms (SIGKILL + settle), so
+    // `elapsed + perAttemptMs > totalMs` was already true and the ladder stopped after ONE rung —
+    // the single client swap it exists to buy was unreachable in exactly the case it was for (a
+    // first client that hung). Each rung is charged at most one attempt, so the second rung runs.
+    const dir = await mkdtemp(join(tmpdir(), "yt-"));
+    let nowMs = 1_000_000; // injected clock, as this file's timeout tests do — no real waiting
+    runMock
+      .mockImplementationOnce(async (_args: string[], timeoutMs: number) => {
+        nowMs += timeoutMs + 37; // ran to the FULL per-attempt timeout, plus kill/settle overshoot
+        throw new YtError(YtErrorKind.Timeout, `yt-dlp timed out after ${timeoutMs}ms`);
+      })
+      // As above: the file appears when the SECOND rung succeeds, because the timed-out first
+      // rung purges every `<id>.*` partial it may have left behind.
+      .mockImplementationOnce(async () => {
+        await writeFile(join(dir, "dQw4w9WgXcQ.webm"), "fakeaudio");
+        return ok("AUDIOFMT::opus|160|165|48000\n");
+      });
+    const svc = new YouTubeService(cfg, undefined, () => nowMs);
+    const res = await svc.download("dQw4w9WgXcQ", dir, { durationSec: 10 });
+    expect(res.path).toBe(join(dir, "dQw4w9WgXcQ.webm"));
+    expect(runMock).toHaveBeenCalledTimes(2); // the second rung really ran
+    expect(runMock.mock.calls[0]![1] as number).toBe(cfg.ytdlpTimeoutMs);
+    const clientOf = (args: string[]) => args[args.indexOf("--extractor-args") + 1];
+    expect(clientOf(runMock.mock.calls[1]![0] as string[])).not.toBe(
+      clientOf(runMock.mock.calls[0]![0] as string[]),
+    );
+  });
+
+  it("…and stops at DOWNLOAD_LADDER_ATTEMPTS rungs, pinning the ladder's worst case at the budget", async () => {
+    // The other side of the same bound: the ladder must NOT walk all 5 clients at up to 30 min
+    // each (150 min), which would blow straight through the orchestrator's download watchdog and
+    // hand the abandoned call's stall to every track behind it. Two rungs, then the last error is
+    // rethrown down the same path as "every client failed", so the caller still gets a reason.
+    const dir = await mkdtemp(join(tmpdir(), "yt-"));
+    let nowMs = 0;
+    runMock.mockImplementation(async (_args: string[], timeoutMs: number) => {
+      nowMs += timeoutMs + 37;
+      throw new YtError(YtErrorKind.Timeout, `yt-dlp timed out after ${timeoutMs}ms`);
+    });
+    const svc = new YouTubeService(cfg, undefined, () => nowMs);
+    await expect(svc.download("dQw4w9WgXcQ", dir, { durationSec: 10 })).rejects.toMatchObject({
+      kind: YtErrorKind.Timeout,
+    });
+    expect(runMock).toHaveBeenCalledTimes(DOWNLOAD_LADDER_ATTEMPTS);
+    expect(buildClientLadder(cfg.playerClients).length).toBeGreaterThan(DOWNLOAD_LADDER_ATTEMPTS);
+    // Total attempt time stayed at the budget (plus the two rungs' kill overshoot), not 5 × it.
+    expect(nowMs).toBeLessThanOrEqual(DOWNLOAD_LADDER_ATTEMPTS * (cfg.ytdlpTimeoutMs + 1_000));
+  });
+
+  it("a FAILED rung deletes its partial artifacts, so a later rung on a DIFFERENT extension can't strand a truncated file", async () => {
+    // Regression — THE corrupt-cached-track bug. `--no-part` makes a killed attempt leave its
+    // TRUNCATED bytes at the FINAL `<id>.<ext>` name, and `--force-overwrites` only protects the
+    // SAME filename. A rung that dies on `<id>.webm` followed by a rung that succeeds on
+    // `<id>.m4a` therefore left the truncated `.webm` sitting in the cache dir, where
+    // AudioCache.reconcile() adopts it on the next start and serves it as a valid hit forever:
+    // a track that plays broken / gets skipped every single time. Each failed attempt must sweep
+    // its own `<id>.*` debris.
+    const dir = await mkdtemp(join(tmpdir(), "yt-"));
+    // A transcode from a previous play, owned by the audio route — it must NOT be collateral.
+    await writeFile(join(dir, "dQw4w9WgXcQ.transcoded.m4a"), "PRIOR-TRANSCODE");
+    runMock
+      .mockImplementationOnce(async () => {
+        // Rung 1 gets killed mid-download and leaves truncated bytes under a real audio extension.
+        await writeFile(join(dir, "dQw4w9WgXcQ.webm"), "TRUNCATED");
+        return {
+          stdout: "",
+          stderr: "ERROR: nsig extraction failed: Some formats may be missing",
+          code: 1,
+        };
+      })
+      .mockImplementationOnce(async () => {
+        // Rung 2 settles on a DIFFERENT container, so --force-overwrites cannot clean up after
+        // rung 1 and the produced-file scan below could pick either file.
+        await writeFile(join(dir, "dQw4w9WgXcQ.m4a"), "COMPLETE-AUDIO");
+        return ok("AUDIOFMT::aac|160|165|44100\n");
+      });
+
+    const res = await new YouTubeService(cfg).download("dQw4w9WgXcQ", dir);
+
+    expect(res.path).toBe(join(dir, "dQw4w9WgXcQ.m4a"));
+    const left = (await readdir(dir)).sort();
+    // The truncated leftover is GONE from disk — not merely un-selected this once (it would have
+    // been adopted by the cache on the next restart, which is how it became permanent).
+    expect(left).not.toContain("dQw4w9WgXcQ.webm");
+    // …and the sweep is surgical: the audio route's transcode sibling survives, bytes intact.
+    expect(left).toContain("dQw4w9WgXcQ.transcoded.m4a");
+    expect(await readFile(join(dir, "dQw4w9WgXcQ.transcoded.m4a"), "utf8")).toBe("PRIOR-TRANSCODE");
+    expect(left).toEqual(["dQw4w9WgXcQ.m4a", "dQw4w9WgXcQ.transcoded.m4a"]);
+  });
+
+  it("sweeps the partial when EVERY rung fails, so nothing is left for the next start to adopt", async () => {
+    // The other half of the same bug: when the whole ladder fails there is no successful rung to
+    // overwrite the debris, so a truncated `<id>.<ext>` would outlive the request entirely.
+    const dir = await mkdtemp(join(tmpdir(), "yt-"));
+    await writeFile(join(dir, "dQw4w9WgXcQ.transcoded.m4a"), "PRIOR-TRANSCODE");
+    runMock.mockImplementation(async () => {
+      await writeFile(join(dir, "dQw4w9WgXcQ.webm"), "TRUNCATED");
+      return { stdout: "", stderr: "ERROR: nsig extraction failed", code: 1 };
+    });
+    await expect(new YouTubeService(cfg).download("dQw4w9WgXcQ", dir)).rejects.toBeInstanceOf(
+      YtError,
+    );
+    expect(await readdir(dir)).toEqual(["dQw4w9WgXcQ.transcoded.m4a"]);
+  });
+
+  it("sweeps the partials when a rung 'succeeds' but produced no usable file", async () => {
+    // A zero-exit run that wrote only intermediates is a failed download too — the leftovers are
+    // exactly what reconcile() would adopt on the next start.
+    const dir = await mkdtemp(join(tmpdir(), "yt-"));
+    await writeFile(join(dir, "dQw4w9WgXcQ.transcoded.m4a"), "PRIOR-TRANSCODE");
+    runMock.mockImplementation(async () => {
+      await writeFile(join(dir, "dQw4w9WgXcQ.webm.part"), "PARTIAL");
+      return ok("");
+    });
+    await expect(new YouTubeService(cfg).download("dQw4w9WgXcQ", dir)).rejects.toMatchObject({
+      kind: YtErrorKind.Unknown,
+    });
+    expect(await readdir(dir)).toEqual(["dQw4w9WgXcQ.transcoded.m4a"]);
+  });
+
+  it("passes the configured YT_AUDIO_FORMAT / YT_AUDIO_SORT straight through as -f and -S", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "yt-"));
+    await writeFile(join(dir, "dQw4w9WgXcQ.webm"), "fakeaudio");
+    runMock.mockResolvedValue(ok("AUDIOFMT::opus|160|165|48000\n"));
+    const qualityCfg = loadMediaConfig({
+      YT_AUDIO_FORMAT: "bestaudio[abr>128]/bestaudio/best",
+      YT_AUDIO_SORT: "abr,asr,acodec:opus",
+    });
+    expect(qualityCfg.audioFormat).toBe("bestaudio[abr>128]/bestaudio/best");
+    expect(qualityCfg.audioSort).toBe("abr,asr,acodec:opus");
+    await new YouTubeService(qualityCfg).download("dQw4w9WgXcQ", dir);
+    const args = runMock.mock.calls[0]![0] as string[];
+    expect(args[args.indexOf("-f") + 1]).toBe("bestaudio[abr>128]/bestaudio/best");
+    expect(args[args.indexOf("-S") + 1]).toBe("abr,asr,acodec:opus");
+  });
+
+  it("omits -S entirely when YT_AUDIO_SORT is 'off' (yt-dlp's own ordering)", async () => {
+    // A dangling `-S` with no operand would make yt-dlp swallow the NEXT flag as its sort spec,
+    // so "no sort" has to mean the flag is absent, not empty.
+    const dir = await mkdtemp(join(tmpdir(), "yt-"));
+    await writeFile(join(dir, "dQw4w9WgXcQ.webm"), "fakeaudio");
+    runMock.mockResolvedValue(ok("AUDIOFMT::opus|160|165|48000\n"));
+    const noSortCfg = loadMediaConfig({ YT_AUDIO_SORT: "off" });
+    expect(noSortCfg.audioSort).toBeNull();
+    await new YouTubeService(noSortCfg).download("dQw4w9WgXcQ", dir);
+    const args = runMock.mock.calls[0]![0] as string[];
+    expect(args).not.toContain("-S");
+    expect(args[args.indexOf("-f") + 1]).toBe("bestaudio/best"); // -f is still passed
   });
 });
 
@@ -702,7 +900,9 @@ describe("scaleDownloadTimeout", () => {
 });
 
 describe("YouTubeService.download progress + timeout", () => {
-  beforeEach(() => runMock.mockReset());
+  beforeEach(() => {
+    runMock.mockReset();
+  });
 
   it("passes --newline + --progress-template and reports parsed percents via onProgress", async () => {
     const dir = await mkdtemp(join(tmpdir(), "yt-"));

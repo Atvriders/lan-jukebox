@@ -119,6 +119,7 @@ describe("GET /audio/:trackId", () => {
   async function build(deps: {
     download: AudioRouteDeps["download"];
     resolve?: AudioRouteDeps["youtube"]["resolve"];
+    transcodeBitrateKbps?: number;
   }) {
     app = Fastify();
     await app.register(cookie);
@@ -137,6 +138,7 @@ describe("GET /audio/:trackId", () => {
       download: deps.download,
       cacheDir: dir,
       downloads: new Semaphore(2),
+      transcodeBitrateKbps: deps.transcodeBitrateKbps,
     });
 
     rawInject = app.inject.bind(app);
@@ -354,6 +356,35 @@ describe("GET /audio/:trackId", () => {
     expect(res2.statusCode).toBe(206);
     expect(res2.headers["content-type"]).toBe("audio/mp4");
     expect((transcodeToM4a as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+  });
+
+  it("uses the configured TRANSCODE_BITRATE_KBPS for the re-encode and reports it as the format", async () => {
+    // The knob is only worth having if it reaches ffmpeg AND the reported AudioInfo: the format
+    // badge/telemetry would otherwise claim the old hardcoded rate for a differently-encoded file.
+    const { transcodeToM4a } = await import("./format.js");
+    (transcodeToM4a as ReturnType<typeof vi.fn>).mockClear();
+    await seedCached(ID, "mp3", Buffer.from("fake-mp3-bytes"), "mp3");
+    await build({ download: vi.fn(), transcodeBitrateKbps: 320 });
+
+    const res = await app.inject({ method: "GET", url: `/audio/${ID}` });
+    expect(res.statusCode).toBe(200);
+    const call = (transcodeToM4a as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(call[4]).toBe(320); // (src, dest, spawnFn, timeoutMs, bitrateKbps)
+    expect(cache.getAudio(`${ID}.m4a`)).toMatchObject({ codec: "aac", bitrateKbps: 320 });
+  });
+
+  it("falls back to the route's default bitrate when none is configured", async () => {
+    const { transcodeToM4a, DEFAULT_TRANSCODE_BITRATE_KBPS } = await import("./format.js");
+    (transcodeToM4a as ReturnType<typeof vi.fn>).mockClear();
+    await seedCached(ID, "mp3", Buffer.from("fake-mp3-bytes"), "mp3");
+    await build({ download: vi.fn() }); // no transcodeBitrateKbps
+
+    await app.inject({ method: "GET", url: `/audio/${ID}` });
+    const call = (transcodeToM4a as ReturnType<typeof vi.fn>).mock.calls[0]!;
+    expect(call[4]).toBe(DEFAULT_TRANSCODE_BITRATE_KBPS);
+    expect(cache.getAudio(`${ID}.m4a`)).toMatchObject({
+      bitrateKbps: DEFAULT_TRANSCODE_BITRATE_KBPS,
+    });
   });
 
   it("single-flights the transcode: concurrent requests for a cached-but-untranscoded id spawn ONE ffmpeg", async () => {

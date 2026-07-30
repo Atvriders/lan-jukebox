@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
 
@@ -12,7 +12,21 @@ type FakeProc = EventEmitter & {
   stdout: Readable;
   stderr: Readable;
   kill: ReturnType<typeof vi.fn>;
+  pid?: number;
 };
+
+/**
+ * A child that is alive with open pipes and will NEVER emit 'close' on its own — the shape of the
+ * 45h production freeze (an ffmpeg grandchild inherited yt-dlp's stdio and held the pipes open, so
+ * Node's 'close', which needs process-exit AND all pipes closed, never fired).
+ */
+function neverClosingProc(): FakeProc {
+  const proc = new EventEmitter() as FakeProc;
+  proc.stdout = new Readable({ read() {} }); // never ends
+  proc.stderr = new Readable({ read() {} });
+  proc.kill = vi.fn(); // deliberately silent: killing yt-dlp does NOT free the grandchild's pipes
+  return proc;
+}
 
 function fakeProc(stdout: string, stderr: string, code: number | null): FakeProc {
   const proc = new EventEmitter() as FakeProc;
@@ -24,7 +38,16 @@ function fakeProc(stdout: string, stderr: string, code: number | null): FakeProc
 }
 
 describe("runYtDlp", () => {
-  beforeEach(() => spawnMock.mockReset());
+  beforeEach(() => {
+    // Block body ON PURPOSE: the runner treats a beforeEach's returned function as a teardown, and
+    // mockReset() returns the callable mock — so the arrow-return form has the runner invoke
+    // spawnMock() with no arguments after every test.
+    spawnMock.mockReset();
+  });
+  // Restore real timers via a HOOK, not just a try/finally: if a fake-timer test ever hangs
+  // (exactly the failure mode these tests exist to catch) its finally never runs and every later
+  // test in the file would silently inherit the frozen clock and time out too.
+  afterEach(() => vi.useRealTimers());
 
   it("spawns yt-dlp with the args array and no shell", async () => {
     spawnMock.mockReturnValue(fakeProc('{"ok":true}', "", 0));
@@ -52,6 +75,104 @@ describe("runYtDlp", () => {
     // Pin the signal: SIGKILL is unignorable. A regression to SIGTERM (or no argument)
     // would be catchable by the child, defeating the timeout guard.
     expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("SETTLES on timeout even when 'close' NEVER fires (45h station-freeze regression)", async () => {
+    // THE incident. runYtDlp used to SIGKILL on timeout and then wait for 'close' to do the
+    // rejecting. yt-dlp's post-processing ffmpeg is a GRANDCHILD that inherits our stdout/stderr,
+    // so killing yt-dlp alone left those pipes open and 'close' never arrived: this promise never
+    // settled, its caller kept holding the station mutex, and the jukebox was frozen for 45 hours
+    // with no crash and no recovery. The timeout must now be authoritative and settle on its own,
+    // never depending on the child cooperating. This fake NEVER emits 'close' or 'exit'.
+    const proc = neverClosingProc();
+    spawnMock.mockReturnValue(proc);
+
+    const p = runYtDlp(["-J"], 10);
+    await expect(p).rejects.toMatchObject({ kind: YtErrorKind.Timeout });
+    expect(proc.kill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("kills the whole process GROUP on timeout, not just yt-dlp (the pipe-holding grandchild)", async () => {
+    // Killing only yt-dlp leaves the ffmpeg grandchild alive holding the inherited stdio pipes —
+    // both a leaked process and the reason 'close' never fired. The child is spawned detached (its
+    // own group leader) so the timeout can signal the ENTIRE group with process.kill(-pid).
+    const proc = neverClosingProc();
+    proc.pid = 4242;
+    spawnMock.mockReturnValue(proc);
+    const groupKill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    try {
+      await expect(runYtDlp(["-J"], 10)).rejects.toMatchObject({ kind: YtErrorKind.Timeout });
+      expect(groupKill).toHaveBeenCalledWith(-4242, "SIGKILL");
+      // Pin the spawn option that makes the group kill possible at all.
+      expect(spawnMock).toHaveBeenCalledWith(
+        "yt-dlp",
+        ["-J"],
+        expect.objectContaining({ detached: true, stdio: ["ignore", "pipe", "pipe"] }),
+      );
+    } finally {
+      groupKill.mockRestore();
+    }
+  });
+
+  it("settles from 'exit' when 'close' never arrives, keeping the output buffered so far", async () => {
+    // Second independent settlement path: 'exit' fires the moment the process terminates even
+    // while its pipes are still open. After a short grace period for a normal 'close' (which keeps
+    // full output), the run settles anyway rather than hanging until the timeout — so a clean but
+    // pipe-blocked run is not punished with a bogus Timeout minutes later.
+    vi.useFakeTimers(); // afterEach restores real timers even if this test hangs
+    const proc = neverClosingProc();
+    spawnMock.mockReturnValue(proc);
+    const p = runYtDlp(["-J"], 600_000); // timeout far away: only the exit path can settle this
+    proc.stdout.push("done\n");
+    proc.emit("exit", 0);
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(p).resolves.toEqual({ stdout: "done\n", stderr: "", code: 0 });
+  });
+
+  it("the exit-grace settlement kills the process GROUP first, then goes silent (no late onLine)", async () => {
+    // The exit-grace path only runs when 'close' never came after 'exit' — which means something we
+    // spawned is STILL alive holding the inherited stdio pipes. Settling and walking away would
+    // leak that orphan plus two fds on a station that never restarts, and its continuing output
+    // would keep growing our buffers and firing onLine long after the caller moved on (the UI would
+    // paint a phantom "downloading 99%" overlay over an already-playing track). So the group kill
+    // and the pipe detach must happen BEFORE the promise settles — asserted here by ordering, not
+    // just by "was kill called at some point".
+    vi.useFakeTimers(); // afterEach restores real timers even if this test hangs
+    const proc = neverClosingProc();
+    proc.pid = 4242;
+    spawnMock.mockReturnValue(proc);
+    const order: string[] = [];
+    const groupKill = vi.spyOn(process, "kill").mockImplementation(((pid: number, sig?: string) => {
+      order.push(`kill ${pid} ${String(sig)}`);
+      return true;
+    }) as typeof process.kill);
+    const lines: string[] = [];
+    try {
+      const p = runYtDlp(["-J"], 600_000, (l) => lines.push(l)).then((v) => {
+        order.push("settled");
+        return v;
+      });
+      proc.stdout.push("[download]  10.0%\n");
+      await vi.advanceTimersByTimeAsync(0); // let that chunk reach the reader, as a real pipe would
+      proc.emit("exit", 0); // process gone, pipes still held open by the grandchild
+      await vi.advanceTimersByTimeAsync(5_000); // the grace period lapses with no 'close'
+
+      await expect(p).resolves.toEqual({ stdout: "[download]  10.0%\n", stderr: "", code: 0 });
+      expect(order).toEqual(["kill -4242 SIGKILL", "settled"]); // group killed BEFORE settling
+      expect(lines).toEqual(["[download]  10.0%"]);
+      // Our end of both pipes is dropped, so the surviving orphan holds neither fd.
+      expect(proc.stdout.destroyed).toBe(true);
+      expect(proc.stderr.destroyed).toBe(true);
+      // …and anything the orphan still manages to emit is dropped: no onLine after settlement,
+      // and nothing appended to the already-returned buffers.
+      proc.stdout.emit("data", Buffer.from("[download]  99.9%\n"));
+      proc.stderr.emit("data", Buffer.from("late stderr\n"));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lines).toEqual(["[download]  10.0%"]);
+      await expect(p).resolves.toEqual({ stdout: "[download]  10.0%\n", stderr: "", code: 0 });
+    } finally {
+      groupKill.mockRestore();
+    }
   });
 
   it("propagates a spawn error (e.g. ENOENT)", async () => {

@@ -38,6 +38,7 @@ function deps(over: Partial<AppDeps> = {}): AppDeps {
         preparing: null,
         activePlayerPresent: false,
         activePlayerLabel: null,
+        listeners: [],
       })),
       reportPosition: vi.fn(),
     }),
@@ -45,6 +46,8 @@ function deps(over: Partial<AppDeps> = {}): AppDeps {
     registry: {
       isSpeaker: vi.fn(() => false),
       activePlayerDeviceId: null,
+      // /api/state reads the live roster off the registry (same source as the WS overlay).
+      listConnected: vi.fn(() => []),
       touch: vi.fn(),
       claim: vi.fn(),
       release: vi.fn(() => ({ activePlayerDeviceId: null })),

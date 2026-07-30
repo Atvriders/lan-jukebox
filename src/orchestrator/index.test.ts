@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { StationController } from "./index.js";
 import { Queue } from "../queue/index.js";
 import { BrowserPlayerSink } from "./browser-player-sink.js";
+import { DOWNLOAD_LADDER_ATTEMPTS, DOWNLOAD_TIMEOUT_CAP_MS } from "../youtube/index.js";
 import type { Requester, TrackMeta, ServerPlayerMessage } from "../types/index.js";
 
 const user: Requester = { deviceId: "d1", displayName: "u", source: "user" };
@@ -180,6 +181,29 @@ describe("StationController core", () => {
     await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("ddddddddddd"));
     expect(c.isPaused).toBe(false);
     expect(download).toHaveBeenCalledWith("ddddddddddd", expect.anything());
+  });
+
+  it("pause() during a dry-hold then resume() still restarts the station (no silent stop)", async () => {
+    // Regression: pause() cleared _dryHeld AND cancelled the radio retry, so resume() fell into the
+    // plain sink.resume() branch and sent `play` for a queue with nothing left to play — a single
+    // Pause press on a drained queue permanently stopped the station with no recovery path.
+    const { c } = controller();
+    const { sink } = fakeSink();
+    c.setRadioContinuation(async () => meta("rrrrrrrrrrr"));
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    // Drain into the dry-hold with radio temporarily unavailable, then PAUSE while dry-held.
+    c.setRadioContinuation(async () => null);
+    sink.onTrackEnded();
+    await vi.waitFor(() => expect(c.isPaused).toBe(true));
+    c.pause();
+    expect(c.isPaused).toBe(true);
+    // Radio recovers; Resume must restart the station rather than no-op.
+    c.setRadioContinuation(async () => meta("rrrrrrrrrrr"));
+    c.resume();
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("rrrrrrrrrrr"));
+    expect(c.isPaused).toBe(false);
   });
 
   it("resume() restarts a dry-held station by advancing into newly queued tracks", async () => {
@@ -371,6 +395,58 @@ describe("StationController core", () => {
     // The failed download is discarded and the station advances to the next track.
     await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
     expect(errors).toEqual([{ videoId: "aaaaaaaaaaa", title: "aaaaaaaaaaa", reason: "410 gone" }]);
+  });
+
+  it("evicts the failed track from the cache on a playback error (self-heal a corrupt file)", async () => {
+    // A track whose cached bytes are corrupt fails identically on EVERY retry — the browser can't
+    // decode it, the station skips it, and the same bad file is served again next time it comes
+    // round. Dropping the cache entry (+ file) is what makes the retry re-download.
+    const evict = vi.fn();
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    const c = new StationController({ download, evict, now: () => 1_000 });
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    sink.onPlaybackError("decode failed");
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    expect(evict).toHaveBeenCalledWith("aaaaaaaaaaa");
+    // Only the broken one — the track the station moved ON to must stay cached.
+    expect(evict).toHaveBeenCalledTimes(1);
+  });
+
+  it("evicts the failed track when the DOWNLOAD fails (a half-written file fails the same way forever)", async () => {
+    const evict = vi.fn();
+    const download = vi.fn(async (id: string) => {
+      if (id === "aaaaaaaaaaa") throw new Error("410 gone");
+      return { path: `/cache/${id}.m4a`, audio: null };
+    });
+    const c = new StationController({ download, evict, now: () => 1_000 });
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    expect(evict).toHaveBeenCalledWith("aaaaaaaaaaa");
+  });
+
+  it("a THROWING evict dep can never take the station down (best-effort by contract)", async () => {
+    // evictTrack runs inside a catch block / voided lock task, so an exception out of the dep
+    // would surface as an unhandled rejection and strand the station instead of skipping a track.
+    const evict = vi.fn(() => {
+      throw new Error("cache exploded");
+    });
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    const c = new StationController({ download, evict, now: () => 1_000 });
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    sink.onPlaybackError("decode failed");
+    // The station still advances despite the throw.
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
   });
 
   it("does not emit a duplicate 'trackError' for a stale error+trackEnd pair (advance-once guard)", async () => {
@@ -782,13 +858,20 @@ describe("StationController now-playing derivation (finding: snapshot showed the
   it("keeps now-playing on the live track (and its duration) while the NEXT track downloads", async () => {
     const { download, resolve } = deferredDownload();
     const c = new StationController({ download, now: () => 1_000 });
-    const { sink } = fakeSink();
+    const { sink, sent } = fakeSink();
     await c.enqueue(meta("aaaaaaaaaaa", 100), user); // A: 100s
     await c.enqueue(meta("bbbbbbbbbbb", 200), user); // B: 200s
     c.attachSink(sink);
     await vi.waitFor(() => expect(download).toHaveBeenCalledWith("aaaaaaaaaaa", expect.anything()));
     resolve(); // A finishes downloading → A is the live track
-    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    // Wait for the SINK to actually load A, not just for snapshot().current: before anything has
+    // loaded, current falls back to the queue head, so it already reads "aaaaaaaaaaa" while A's
+    // load is still in flight. Ending the track in that window is a stale signal the generation
+    // guard (correctly) drops, which would make this test race rather than test now-playing.
+    await vi.waitFor(() =>
+      expect(sent.some((m) => m.type === "load" && m.audioUrl === "/audio/aaaaaaaaaaa")).toBe(true),
+    );
+    expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa");
     sink.onTrackEnded(); // advance to B; B begins downloading (deferred, not resolved yet)
     await vi.waitFor(() => expect(download).toHaveBeenCalledWith("bbbbbbbbbbb", expect.anything()));
     // B is NOT live yet — now-playing must still be A, with A's duration (not B's 200s).
@@ -993,5 +1076,132 @@ describe("StationController clear() supersedes an in-flight advance (no resurrec
     await tick();
     expect(c.snapshot().current).toBeNull(); // radio track was neither added nor played
     expect(c.snapshot().upcoming).toEqual([]); // and left no stray radio item in the queue
+  });
+});
+
+describe("StationController never-hang watchdog (45h production freeze)", () => {
+  // THE incident, at the orchestrator layer. The station mutex serializes EVERY playback op, so a
+  // single dependency that never settles inside a lock task holds that lock forever: the station
+  // freezes mid-track with no crash, no restart and no recovery, and every later skip/resume/
+  // enqueue silently queues behind the dead lock. (In production it was a yt-dlp child whose
+  // 'close' never fired because an ffmpeg grandchild still held its stdio pipes — 45 hours of
+  // silence.) Every await reachable inside a lock task must be bounded by the injectable-timer
+  // watchdog, and a trip must degrade into an ordinary failure the station already knows how to
+  // recover from.
+
+  /** Timers that are ARMED but never fire on their own, so the test decides when a ceiling lapses. */
+  function heldTimers() {
+    let nextHandle = 1;
+    const armed = new Map<number, { fn: () => void; ms: number }>();
+    const setTimeoutFn = vi.fn((fn: () => void, ms: number) => {
+      const h = nextHandle++;
+      armed.set(h, { fn, ms });
+      return h as unknown as ReturnType<typeof setTimeout>;
+    });
+    const clearTimeoutFn = vi.fn((h: ReturnType<typeof setTimeout>) => {
+      armed.delete(h as unknown as number);
+    });
+    /** Fire (and disarm) every currently-armed timer, as if its full delay had elapsed. */
+    const elapse = (): number[] => {
+      const due = [...armed.values()];
+      armed.clear();
+      for (const t of due) t.fn();
+      return due.map((t) => t.ms);
+    };
+    return { setTimeoutFn, clearTimeoutFn, armed, elapse };
+  }
+
+  it("a download that NEVER settles trips the watchdog instead of wedging the station lock", async () => {
+    const timers = heldTimers();
+    const download = vi.fn((id: string) =>
+      id === "aaaaaaaaaaa"
+        ? new Promise<{ path: string; audio: null }>(() => {}) // never settles — the freeze
+        : Promise.resolve({ path: `/cache/${id}.m4a`, audio: null }),
+    );
+    const c = new StationController({
+      download,
+      now: () => 1_000,
+      setTimeout: timers.setTimeoutFn,
+      clearTimeout: timers.clearTimeoutFn,
+    });
+    const errors: { videoId: string }[] = [];
+    c.on("trackError", (e: { videoId: string }) => errors.push(e));
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    await c.enqueue(meta("bbbbbbbbbbb"), user);
+    await c.enqueue(meta("ccccccccccc"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(download).toHaveBeenCalledWith("aaaaaaaaaaa", expect.anything()));
+    // The station is now exactly as it was during the freeze: inside the lock, awaiting a download
+    // that will never settle. A watchdog ceiling must have been armed on the injected timer.
+    await vi.waitFor(() => expect(timers.armed.size).toBe(1));
+    const [downloadCeilingMs] = timers.elapse();
+    expect(downloadCeilingMs).toBe(120 * 60_000); // the download ceiling, not some policy timeout
+    // …and it is a BACKSTOP, i.e. strictly ABOVE what this await can legitimately take. That is
+    // QUEUEING + WORK, not work alone: `deps.download` is the coalesced downloader, which waits for
+    // a permit on the SHARED Semaphore(MAX_TRANSCODE_JOBS, default 2) before it does any work.
+    //   • work = the total-time-bounded client-fallback ladder, DOWNLOAD_LADDER_ATTEMPTS × the
+    //     auto-scaled per-rung cap = 60 min.
+    //   • queueing = whatever the other permit holders are still doing, each itself bounded (a
+    //     download by that same 60-min ladder, a transcode by TRANSCODE_TIMEOUT_MS = 10 min).
+    // So the ceiling must leave a whole extra ladder's worth of permit-queue headroom on top of the
+    // work — hence 2× the ladder, not merely "more than" it. A ceiling at or below the real worst
+    // case would false-trip on a legitimately slow long mix AND abandon a call still holding
+    // youtube's own ladder, so every following track would inherit the stall and hold the STATION
+    // lock for a full ceiling — the 45h freeze back on a fixed cycle.
+    const ladderWorstCaseMs = DOWNLOAD_LADDER_ATTEMPTS * DOWNLOAD_TIMEOUT_CAP_MS; // 60 min
+    expect(downloadCeilingMs).toBeGreaterThanOrEqual(2 * ladderWorstCaseMs);
+
+    // A trip is just "this track failed": banner, discard, walk on to the next candidate.
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("bbbbbbbbbbb"));
+    expect(errors.map((e) => e.videoId)).toEqual(["aaaaaaaaaaa"]);
+    // …and the lock is genuinely free: a LATER user action still takes effect. skip() only queues
+    // work on the lock and returns void, so on the wedged (pre-fix) station it was a silent no-op.
+    c.skip();
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("ccccccccccc"));
+  });
+
+  it("a radioContinuation that NEVER settles dry-holds instead of wedging the station lock", async () => {
+    const timers = heldTimers();
+    const download = vi.fn(async (id: string) => ({ path: `/cache/${id}.m4a`, audio: null }));
+    const c = new StationController({
+      download,
+      now: () => 1_000,
+      setTimeout: timers.setTimeoutFn,
+      clearTimeout: timers.clearTimeoutFn,
+    });
+    c.setRadioContinuation(() => new Promise<TrackMeta | null>(() => {})); // never settles
+    const { sink } = fakeSink();
+    await c.enqueue(meta("aaaaaaaaaaa"), user);
+    c.attachSink(sink);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa"));
+    sink.onTrackEnded(); // queue dry → awaits the hung radio lookup while holding the lock
+    await vi.waitFor(() => expect(timers.armed.size).toBe(1));
+    const [radioCeilingMs] = timers.elapse(); // the radio ceiling lapses
+    expect(radioCeilingMs).toBe(20 * 60_000);
+    // Same backstop rule as the download ceiling: it must sit ABOVE what this await can
+    // legitimately take, which is QUEUEING + WORK — nextCandidate() now queues on RadioEngine's
+    // production mutex, so the station's call can wait behind at most ONE other in-flight
+    // production before its own runs.
+    //   • one production = RadioEngine's internal between-fetch budget plus the one fetch that may
+    //     already be running, itself the 5-rung metadata ladder at the 60s yt-dlp metadata timeout.
+    //   • queueing = at most one such production ahead of us on that mutex.
+    // So the ceiling must clear 2 × the per-production worst case, not 1 ×. Trip below that and the
+    // watchdog abandons a healthy lookup that still owns the radio production slot — which makes
+    // the NEXT caller queue behind the abandoned one, i.e. a "safety" timer turning back into the
+    // freeze it guards against.
+    const radioBudgetMs = 120_000; // RadioEngine RADIO_BUDGET_MS
+    const metadataLadderMs = 5 * 60_000; // 5 client rungs × YTDLP_TIMEOUT_MS (60s)
+    expect(radioCeilingMs).toBeGreaterThan(2 * (radioBudgetMs + metadataLadderMs));
+
+    // A trip is treated exactly like "radio had nothing this round": hold paused (current/seed
+    // preserved, no teardown) and arm the backing-off self-retry — never a throw out of the lock.
+    await vi.waitFor(() => expect(c.isPaused).toBe(true));
+    expect(c.snapshot().current?.meta.videoId).toBe("aaaaaaaaaaa");
+    expect(timers.armed.size).toBe(1); // the dry-hold radio retry, armed for later
+    // The station is alive: a user add still starts playing (it would have hung behind the lock).
+    await c.enqueue(meta("ddddddddddd"), user);
+    await vi.waitFor(() => expect(c.snapshot().current?.meta.videoId).toBe("ddddddddddd"));
+    expect(c.isPaused).toBe(false);
   });
 });

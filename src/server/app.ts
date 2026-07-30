@@ -32,6 +32,10 @@ export interface AppDeps {
   cache: AudioCache;
   cacheDir: string; // = media.cacheDir; the audio route downloads/transcodes into it
   downloads: Semaphore;
+  // = media.transcodeBitrateKbps (TRANSCODE_BITRATE_KBPS). Optional: omitting it leaves the audio
+  // route on its own DEFAULT_TRANSCODE_BITRATE_KBPS, which is what the tests that build a bare app
+  // rely on.
+  transcodeBitrateKbps?: number;
   // Shared coalesced downloader (src/index.ts): consults the cache first + de-dupes concurrent
   // fetches of the same videoId with the orchestrator's prefetch/load path. Threaded into the
   // audio route so a browser preload can't spawn a second yt-dlp racing the orchestrator prefetch.
@@ -115,6 +119,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     download: deps.coalescedDownload,
     cacheDir: deps.cacheDir,
     downloads: deps.downloads,
+    transcodeBitrateKbps: deps.transcodeBitrateKbps,
   });
   registerWebsocket(app, {
     broadcaster: deps.broadcaster ?? new StationBroadcaster(),

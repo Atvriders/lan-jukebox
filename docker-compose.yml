@@ -55,6 +55,11 @@ services:
       # Cache + persistence (all three persisted files live under CACHE_DIR)
       CACHE_DIR: "/data/cache"
       CACHE_MAX_MB: "5000"
+      # Free-space floor (MiB) on the CACHE_DIR filesystem: downloads are refused before they
+      # can fill the host disk. A full disk breaks EVERY write (snapshot, cookies, logs), not
+      # just the cache, so keep this comfortably above your largest expected track.
+      # "0" disables the guard. Unset defaults to 1024 (1 GiB).
+      # MIN_FREE_DISK_MB: "1024"
 
       # History / search limits
       HISTORY_MAX_ITEMS: "100"
@@ -63,6 +68,10 @@ services:
       # Download / radio tuning
       PREFETCH_DEPTH: "3"
       MAX_TRANSCODE_JOBS: "4"
+      # Target bitrate (kbps) of the FALLBACK re-encode ONLY, so it does not apply to most
+      # tracks: browser-playable opus/webm and aac/m4a are served untouched. Only a format the
+      # browser can't play directly is re-encoded. Unset defaults to 256 (min 32, max 512).
+      # TRANSCODE_BITRATE_KBPS: "256"
       # 0 / "" = no cap; long content (concerts) plays out of the box.
       MAX_TRACK_DURATION_SEC: "0"
       # Caps ONLY radio auto-discovery: the engine skips autoplay candidates longer than
@@ -91,6 +100,14 @@ services:
       # SponsorBlock segments yt-dlp strips from downloaded audio (CSV of categories).
       # Unset uses the music-focused default shown below; set "off" to disable entirely.
       # YT_SPONSORBLOCK: "music_offtopic,intro,outro,sponsor,selfpromo,preview,interaction"
+      # Audio quality: the yt-dlp format selector (-f) and format sort (-S). The defaults below
+      # ask for the highest-bitrate opus YouTube will hand out. The ceiling is YouTube's, not
+      # this app's: a free/anonymous account tops out at roughly 160 kbps opus. The
+      # higher-bitrate opus formats are only offered to a YouTube PREMIUM account, so you must
+      # supply that account's cookies (YT_COOKIES_TEXT above, or YT_COOKIES) to get them.
+      # Set YT_AUDIO_SORT to "off" to drop the -S sort and take yt-dlp's own ordering.
+      # YT_AUDIO_FORMAT: "bestaudio/best"
+      # YT_AUDIO_SORT: "abr,acodec:opus"
     # Published on ALL host interfaces so the LAN (http://<host-ip>:3018) AND your OWN
     # external ingress (a separate tunnel / nginx / Caddy) can reach it. Override the
     # host port with HOST_PORT. To keep it OFF the LAN (only a same-host tunnel reaches

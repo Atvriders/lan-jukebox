@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { MediaConfig, StationConfig, WebConfig, AppConfig } from "./types/index.js";
-import { LEVELS, isValidLevel } from "./util/logger.js";
+import { LEVELS, isValidLevel, getRootLogger } from "./util/logger.js";
 
 export type { MediaConfig, StationConfig, WebConfig, AppConfig } from "./types/index.js";
 
@@ -57,6 +57,9 @@ export function loadMediaConfig(env: Env = process.env): MediaConfig {
   // SponsorBlock: unset/empty → music-focused default; a literal "off" → disabled (null);
   // any other value → that raw CSV, passed straight through to yt-dlp.
   const sponsorblockRaw = strEnv(env, "YT_SPONSORBLOCK");
+  // Audio quality: unset/empty → the opus-first default sort; a literal "off" → no -S sort at all
+  // (yt-dlp's own ordering); any other value → that raw sort spec, passed straight to yt-dlp.
+  const audioSortRaw = strEnv(env, "YT_AUDIO_SORT");
   return {
     cacheDir: strEnv(env, "CACHE_DIR") ?? "/data/cache",
     cacheMaxBytes: intEnv(env, "CACHE_MAX_MB", 2048, { min: 1 }) * 1024 * 1024,
@@ -81,6 +84,21 @@ export function loadMediaConfig(env: Env = process.env): MediaConfig {
     poTokenProviderUrl: strEnv(env, "PO_TOKEN_PROVIDER_URL"),
     playerClients: strEnv(env, "YT_PLAYER_CLIENTS") ?? "android_vr,web_embedded,tv",
     ytdlpTimeoutMs: intEnv(env, "YTDLP_TIMEOUT_MS", 60_000, { min: 1 }),
+    audioFormat: strEnv(env, "YT_AUDIO_FORMAT") ?? "bestaudio/best",
+    audioSort:
+      audioSortRaw === null
+        ? "abr,acodec:opus"
+        : audioSortRaw.toLowerCase() === "off"
+          ? null
+          : audioSortRaw,
+    // Only the fallback re-encode uses this (opus/webm + aac/m4a are served as-is), so it is
+    // bounded rather than free-form: below 32 the re-encode is unlistenable, above 512 it is
+    // pure waste for an audio-only stream.
+    transcodeBitrateKbps: intEnv(env, "TRANSCODE_BITRATE_KBPS", 256, { min: 32, max: 512 }),
+    // Free-space floor (MiB) the cache filesystem must keep before a download may start.
+    // 0 disables the guard entirely — the live station once filled its disk and crash-looped,
+    // so the default is a real, non-zero reserve.
+    minFreeDiskMb: intEnv(env, "MIN_FREE_DISK_MB", 1024, { min: 0 }),
   };
 }
 
@@ -125,14 +143,28 @@ export function toNetscapeCookies(text: string): string {
  * `<cacheDir>/yt-cookies.txt` (0600, since these are auth cookies) and return that path — yt-dlp's
  * --cookies only accepts a path, not the cookie text. Returns null when neither is configured.
  * Called once at startup before the YouTubeService is used.
+ *
+ * NEVER throws: a write failure degrades to null (no cookies) instead of aborting startup.
  */
 export async function materializeCookies(media: MediaConfig): Promise<string | null> {
   if (media.ytCookiesFile) return media.ytCookiesFile;
   const text = media.ytCookiesText?.trim();
   if (!text) return null;
-  await mkdir(media.cacheDir, { recursive: true });
   const path = join(media.cacheDir, "yt-cookies.txt");
-  await writeFile(path, toNetscapeCookies(text), { mode: 0o600 });
+  try {
+    await mkdir(media.cacheDir, { recursive: true });
+    await writeFile(path, toNetscapeCookies(text), { mode: 0o600 });
+  } catch (err) {
+    // A FULL DISK (ENOSPC) or an unwritable CACHE_DIR must NOT take the station down: this
+    // throwing out of main() is exactly what crash-looped the live host. Degrade instead —
+    // yt-dlp runs WITHOUT cookies, which is fine on an unflagged IP and only costs the
+    // "Sign in to confirm you're not a bot" bypass (and any Premium formats) until fixed.
+    getRootLogger().error(
+      { err, path },
+      "could not write the cookies file (disk full or CACHE_DIR unwritable?) — yt-dlp will run WITHOUT cookies",
+    );
+    return null;
+  }
   return path;
 }
 

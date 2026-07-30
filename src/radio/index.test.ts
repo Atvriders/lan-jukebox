@@ -321,14 +321,18 @@ describe("RadioEngine", () => {
     expect(preview.at(-1)?.map((i) => i.meta.videoId)).toEqual(["sssssssssss", "ttttttttttt"]);
   });
 
-  it("serializes CONCURRENT nextCandidate calls so they never pick the same id (dup-queue bug)", async () => {
+  it("SEQUENTIAL nextCandidate calls return DISTINCT ids (dup-queue bug stays fixed)", async () => {
     // Real YouTube RD-Mix returns a STABLE set, so the first-eligible track is the same on every
     // call. radioTopUp fires nextCandidate on every 'changed' (fire-and-forget) + radioContinuation
-    // adds a 2nd entry point, so calls overlap. Before serialization, both snapshot the de-dup set
-    // BEFORE their awaited fetch and BEFORE remember(), so both returned "sssssssssss" → duplicate
-    // queue entries (the reported Scientist ×4 / Yellow ×6). The mutex must hand out distinct ids.
+    // adds a 2nd entry point. Before the pick was serialized, two overlapping calls both snapshotted
+    // the de-dup set BEFORE their awaited fetch and BEFORE remember(), so both returned
+    // "sssssssssss" → duplicate queue entries (the reported Scientist ×4 / Yellow ×6). Only ONE
+    // production may run at a time, so each pick observes the previous pick's remember() and moves
+    // on to the next distinct track. Overlapping callers are turned into sequential ones by the
+    // queueing lock (nobody is dropped — see the queueing describe below), and every call must
+    // produce something new.
     const related = vi.fn(async () => {
-      await new Promise((r) => setTimeout(r, 5)); // network delay → the two calls overlap
+      await new Promise((r) => setTimeout(r, 5)); // network delay, as a real lookup has
       return [meta("sssssssssss"), meta("ttttttttttt"), meta("uuuuuuuuuuu")];
     });
     const { station } = fakeStation(meta("aaaaaaaaaaa"), {
@@ -342,8 +346,15 @@ describe("RadioEngine", () => {
       maxAutoplayDurationSec: 0,
       settings: radioSettings,
     });
-    const [a, b] = await Promise.all([r.nextCandidate(), r.nextCandidate()]);
-    expect(new Set([a?.videoId, b?.videoId]).size).toBe(2); // distinct — NOT both "sssssssssss"
+    const a = await r.nextCandidate();
+    const b = await r.nextCandidate();
+    const c = await r.nextCandidate();
+    expect([a?.videoId, b?.videoId, c?.videoId]).toEqual([
+      "sssssssssss",
+      "ttttttttttt",
+      "uuuuuuuuuuu",
+    ]);
+    expect(new Set([a?.videoId, b?.videoId, c?.videoId]).size).toBe(3); // zero repeats
   });
 
   it("overlapping ensureAhead runs never enqueue duplicate radio tracks", async () => {
@@ -401,5 +412,271 @@ describe("RadioEngine", () => {
     await r.ensureAhead(1);
     expect(station.enqueue).not.toHaveBeenCalled();
     expect(station.setUpcomingRadio).not.toHaveBeenCalled();
+  });
+});
+
+describe("RadioEngine never-dry fallback (45h production freeze)", () => {
+  // THE incident's root cause at the radio layer. On a long-running station the bounded history
+  // ring fills with the whole Mix (100/100 slots, 21 of them one artist), so EVERY candidate
+  // related() returned was already `seen`: nextCandidate returned null forever, the station
+  // dry-held permanently and the jukebox was silent for 45 hours. Picking is now graduated —
+  // seed → several alternate seeds → a least-recently-played repeat — because for an always-on
+  // station "never stops" beats "never repeats".
+
+  it("re-seeds from SEVERAL recent tracks, not just the most recent, when the seed's pool is dry", async () => {
+    // The old fallback tried exactly ONE alternate seed (the newest history entry). On a mined-out
+    // station that alternate's Mix overlaps the same already-played tracks, so it dried up too and
+    // the station still went silent. The walk-back must try several (bounded) alternates.
+    const related = vi.fn(
+      async (id: string) =>
+        id === "olderplay11"
+          ? [meta("freshtrack1")] // only the SECOND alternate seed still has something new
+          : [meta("newerplay11")], // the seed and the newest alternate are both mined out
+    );
+    const { station } = fakeStation(meta("seedddddddd"), {
+      current: null,
+      upcoming: [],
+      history: [item("olderplay11"), item("newerplay11")], // oldest → newest
+    });
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
+      settings: radioSettings,
+    });
+    expect((await r.nextCandidate())?.videoId).toBe("freshtrack1");
+    // Seed first (it stays PRIMARY), then history walked BACK from the most recent.
+    expect(related.mock.calls.map((c) => c[0])).toEqual([
+      "seedddddddd",
+      "newerplay11",
+      "olderplay11",
+    ]);
+  });
+
+  it("replays the LEAST-RECENTLY-PLAYED track instead of going silent when every source is dry", async () => {
+    // Every alternate seed is mined out too — the exact live state. Rather than null (permanent
+    // dry-hold), relax the de-dup: replay the track whose last play is furthest back.
+    const related = vi.fn(async () => [meta("newestone1"), meta("middleone1")]); // all already seen
+    const { station } = fakeStation(meta("seedddddddd"), {
+      current: item("nowplaying1"),
+      upcoming: [],
+      // oldest → newest; the currently-playing track also sits in the ring.
+      history: [item("nowplaying1"), item("oldestone1"), item("middleone1"), item("newestone1")],
+    });
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
+      settings: radioSettings,
+    });
+    const pick = await r.nextCandidate();
+    // Least-recently-played AND not the current track (replaying what is playing is not "next").
+    expect(pick?.videoId).toBe("oldestone1");
+    expect(related.mock.calls.length).toBeGreaterThan(1); // alternate seeds were genuinely tried
+  });
+
+  it("still returns null when nothing has EVER played (cold start is not a repeat)", async () => {
+    // The relaxation is strictly a last resort: with an empty history there is nothing to replay,
+    // so null (and the caller's dry-hold + backing-off retry) is still the correct answer.
+    const related = vi.fn(async () => [] as TrackMeta[]);
+    const { station } = fakeStation(meta("seedddddddd"), {
+      current: null,
+      upcoming: [],
+      history: [],
+    });
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
+      settings: radioSettings,
+    });
+    expect(await r.nextCandidate()).toBeNull();
+  });
+});
+
+describe("RadioEngine production lock QUEUES (the station is never turned away)", () => {
+  // Production is guarded by a QUEUEING Mutex, deliberately NOT a non-blocking try-lock.
+  // A try-lock answers the loser with null — and the loser is almost always the STATION: the same
+  // queue 'changed' burst that drains the queue also fires radioTopUp, so the OPTIONAL background
+  // top-up routinely owns the slot at the exact instant a track ends and the station's
+  // radioContinuation asks for its next pick. "No radio right now" on essentially every track end
+  // is a paused dry-hold per track — strictly worse than a short wait. So the station WAITS and is
+  // always served; the optional top-up is the one that backs off (ensureAhead's pendingProductions
+  // check), which also bounds the wait to at most one top-up production ahead of the station.
+  // The wait is safe because the work inside is TIME-BOUNDED (RADIO_BUDGET_MS + one already-started
+  // fetch ≈ 7 min, under the station's 15-min RADIO_WATCHDOG_MS), not because callers are refused.
+
+  const tick = () => new Promise((res) => setTimeout(res, 0));
+
+  /** A radio engine whose FIRST related() lookup parks until released; later lookups are instant. */
+  function parkedFirstFetch() {
+    let releaseFetch!: (tracks: TrackMeta[]) => void;
+    let fetches = 0;
+    const related = vi.fn(() => {
+      fetches++;
+      return fetches === 1
+        ? new Promise<TrackMeta[]>((res) => {
+            releaseFetch = res;
+          })
+        : Promise.resolve([meta("ttttttttttt")]);
+    });
+    const { station, enqueued } = fakeStation(meta("aaaaaaaaaaa"), {
+      current: null,
+      upcoming: [],
+      history: [],
+    });
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
+      settings: radioSettings,
+    });
+    return { r, related, station, enqueued, release: (t: TrackMeta[]) => releaseFetch(t) };
+  }
+
+  it("a concurrent second call WAITS for the first and is served a DISTINCT track (never null)", async () => {
+    const { r, related, release } = parkedFirstFetch();
+
+    const first = r.nextCandidate(); // takes the lock and parks mid-lookup
+    await tick();
+    expect(related).toHaveBeenCalledTimes(1); // the lock is genuinely held, mid-fetch
+
+    const second = r.nextCandidate(); // concurrent — it QUEUES, it is not refused
+    let secondSettled = false;
+    void second.then(() => {
+      secondSettled = true;
+    });
+    await tick();
+    expect(secondSettled).toBe(false); // still waiting on the holder…
+    expect(related).toHaveBeenCalledTimes(1); // …and has not started its own fetch yet
+
+    release([meta("sssssssssss")]);
+    expect((await first)?.videoId).toBe("sssssssssss");
+    // THE restored contract: the second caller is answered with a REAL track, and a different one —
+    // it ran after the first's remember(), which is exactly what kills the duplicate-queue bug.
+    const b = await second;
+    expect(b).not.toBeNull();
+    expect(b?.videoId).toBe("ttttttttttt");
+  });
+
+  it("CONCURRENT nextCandidate calls all resolve to DISTINCT tracks (no dups, nobody dropped)", async () => {
+    // The dup bug and the starvation bug in one assertion: fire three at once, as radioTopUp and
+    // radioContinuation do on a 'changed' burst. Every one must get a track (queueing, not
+    // try-locking) and no two may be the same (serialized remember(), not parallel snapshots).
+    const related = vi.fn(async () => {
+      await new Promise((res) => setTimeout(res, 5)); // network delay, as a real lookup has
+      return [meta("sssssssssss"), meta("ttttttttttt"), meta("uuuuuuuuuuu")];
+    });
+    const { station } = fakeStation(meta("aaaaaaaaaaa"), {
+      current: null,
+      upcoming: [],
+      history: [],
+    });
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
+      settings: radioSettings,
+    });
+    const picks = await Promise.all([r.nextCandidate(), r.nextCandidate(), r.nextCandidate()]);
+    const ids = picks.map((p) => p?.videoId);
+    expect(ids).not.toContain(undefined); // nobody was refused
+    expect(new Set(ids).size).toBe(3); // zero repeats
+    expect([...ids].sort()).toEqual(["sssssssssss", "ttttttttttt", "uuuuuuuuuuu"]);
+  });
+
+  it("the STATION is never starved by an in-flight background top-up (HIGH-A regression)", async () => {
+    // HIGH-A, asserted directly. radioTopUp → ensureAhead is fire-and-forget on EVERY 'changed', so
+    // a top-up is in flight at precisely the moment a track ends and the station's
+    // radioContinuation calls nextCandidate(). Under the try-lock that station call got null and
+    // the station dry-held — per track, forever, which is the freeze wearing a different hat. The
+    // station must be handed a REAL track instead.
+    const { r, related, release, enqueued } = parkedFirstFetch();
+
+    void r.ensureAhead(3); // background top-up takes the production lock and parks mid-lookup
+    await tick();
+    expect(related).toHaveBeenCalledTimes(1); // the top-up genuinely owns the lock right now
+
+    const stationPick = r.nextCandidate(); // the station's radioContinuation, concurrent with it
+    release([meta("sssssssssss")]); // the top-up's lookup finally returns
+
+    const pick = await stationPick;
+    expect(pick).not.toBeNull(); // ← THE regression: never null just because a top-up was running
+    expect(pick?.videoId).toBe("ttttttttttt");
+    // …and it is a fresh track, not a copy of what the top-up just queued.
+    expect(enqueued.map((m) => m.videoId)).not.toContain(pick?.videoId);
+  });
+
+  it("the TOP-UP is the side that gives way: ensureAhead skips while a production is pending", async () => {
+    // The other half of the same contract. Because the station now WAITS, the optional path must
+    // never stack another production in front of it — otherwise the station's bounded wait grows
+    // with every 'changed'. ensureAhead sees pendingProductions > 0 and does nothing at all; the
+    // next 'changed' brings it back.
+    const { r, related, station, release } = parkedFirstFetch();
+
+    const stationPick = r.nextCandidate(); // the station is queued/running: pendingProductions > 0
+    await r.ensureAhead(3); // must return immediately, having done nothing
+    expect(related).toHaveBeenCalledTimes(1); // no extra fetch was started by the top-up
+    expect(station.enqueue).not.toHaveBeenCalled(); // and nothing was appended
+    expect(station.setUpcomingRadio).not.toHaveBeenCalled();
+
+    release([meta("sssssssssss")]);
+    expect((await stationPick)?.videoId).toBe("sssssssssss"); // the station still got its track
+  });
+
+  it("releases the lock when the underlying FETCH rejects, so a later call still works", async () => {
+    // A rejecting related() is swallowed into "no candidates" (best-effort by contract), but the
+    // production still has to hand the lock back. A lock left held would disable radio for the
+    // LIFETIME of the process — permanent dry-hold, no error, no recovery — which is the exact
+    // failure class this whole change exists to kill.
+    let fail = true;
+    const related = vi.fn(async () => {
+      if (fail) throw new Error("yt-dlp exploded");
+      return [meta("sssssssssss")];
+    });
+    const { station } = fakeStation(meta("aaaaaaaaaaa"), {
+      current: null,
+      upcoming: [],
+      history: [], // nothing to replay, so a failed fetch really does mean null this round
+    });
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
+      settings: radioSettings,
+    });
+    await expect(r.nextCandidate()).resolves.toBeNull(); // failed lookup → no pick this round
+    fail = false;
+    expect((await r.nextCandidate())?.videoId).toBe("sssssssssss"); // radio is NOT wedged
+  });
+
+  it("releases the lock when a production REJECTS outright, so a later call still works", async () => {
+    // Harder case: fetch errors are swallowed, so a rejection out of nextCandidate means a dep
+    // violated its contract and threw. The pending-count is dropped in a `finally` and the Mutex
+    // keeps its chain alive across rejections, so the very next caller runs normally.
+    let blowUp = true;
+    const settings = vi.fn(() => {
+      if (blowUp) throw new Error("settings dep blew up");
+      return { autoplay: true, autoplaySource: "radio" as AutoplaySource };
+    });
+    const related = vi.fn(async () => [meta("sssssssssss"), meta("ttttttttttt")]);
+    const { station } = fakeStation(meta("aaaaaaaaaaa"), {
+      current: null,
+      upcoming: [],
+      history: [],
+    });
+    const r = new RadioEngine({
+      youtube: { related, artistTracks: vi.fn() },
+      station: station as unknown as RadioDeps["station"],
+      maxAutoplayDurationSec: 0,
+      settings,
+    });
+    await expect(r.nextCandidate()).rejects.toThrow("settings dep blew up");
+    blowUp = false;
+    expect((await r.nextCandidate())?.videoId).toBe("sssssssssss"); // lock was NOT left wedged
+    // …and a rejected run must not leave a phantom pending production behind either, or the
+    // optional top-up would back off forever and the queue would never be filled ahead.
+    await r.ensureAhead(1);
+    expect(station.enqueue).toHaveBeenCalled();
   });
 });

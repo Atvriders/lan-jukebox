@@ -5,7 +5,7 @@ import type { FastifyInstance, FastifyReply } from "fastify";
 import type { AudioCache } from "../cache/index.js";
 import type { YouTubeService, DownloadOptions, DownloadResult } from "../youtube/index.js";
 import type { Semaphore } from "../util/semaphore.js";
-import { chooseDelivery, transcodeToM4a } from "./format.js";
+import { chooseDelivery, transcodeToM4a, DEFAULT_TRANSCODE_BITRATE_KBPS } from "./format.js";
 import { requireSession } from "../auth/password.js";
 
 export interface AudioRouteDeps {
@@ -22,6 +22,10 @@ export interface AudioRouteDeps {
   download: (videoId: string, opts?: DownloadOptions) => Promise<DownloadResult>;
   cacheDir: string;
   downloads: Semaphore; // still gates the transcode (ffmpeg) leg
+  // AAC target rate for the fallback re-encode (MediaConfig.transcodeBitrateKbps). Optional so the
+  // route keeps working unchanged when the composition root doesn't wire it — omitting it just
+  // falls back to the historical DEFAULT_TRANSCODE_BITRATE_KBPS.
+  transcodeBitrateKbps?: number;
 }
 
 /**
@@ -156,9 +160,13 @@ async function runTranscode(
   if (cached) return { path: cached, contentType: "audio/mp4" };
   const videoId = m4aKey.replace(/\.m4a$/, "");
   const destPath = join(deps.cacheDir, `${videoId}.transcoded.m4a`);
+  // spawnFn/timeoutMs stay at their defaults; only the bitrate is configurable here.
+  const bitrateKbps = deps.transcodeBitrateKbps ?? DEFAULT_TRANSCODE_BITRATE_KBPS;
   try {
-    await deps.downloads.run(() => transcodeToM4a(sourcePath, destPath));
-    deps.cache.register(m4aKey, destPath, { codec: "aac", bitrateKbps: 192, sampleRateHz: 48000 });
+    await deps.downloads.run(() =>
+      transcodeToM4a(sourcePath, destPath, undefined, undefined, bitrateKbps),
+    );
+    deps.cache.register(m4aKey, destPath, { codec: "aac", bitrateKbps, sampleRateHz: 48000 });
     deps.cache.pin(m4aKey);
     return { path: destPath, contentType: "audio/mp4" };
   } catch {

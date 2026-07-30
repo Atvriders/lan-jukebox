@@ -57,18 +57,27 @@ export function chooseDelivery(audio: AudioInfo | null, ext: string): Delivery {
  *  eventually deadlocks all downloads/transcodes. We kill the child and reject on timeout. */
 export const TRANSCODE_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** AAC bitrate used when the caller doesn't configure one. This path is a SECOND lossy
+ *  generation (the source is already a lossy opus/mp3), so the encode should sit comfortably
+ *  above the source rate — the deployed value comes from TRANSCODE_BITRATE_KBPS. This default
+ *  only preserves the historical behaviour for callers that pass nothing. */
+export const DEFAULT_TRANSCODE_BITRATE_KBPS = 192;
+
 /**
  * Transcode/remux `srcPath` to a clean AAC `.m4a` at `destPath` via ffmpeg.
  * Resolves on exit code 0; rejects with the ffmpeg stderr tail otherwise.
  * A hung ffmpeg is force-killed after `timeoutMs` so the Promise always settles and the
  * caller's Semaphore slot is released (no slot leak / no download deadlock).
- * Injectable spawn for tests (default = node:child_process spawn).
+ * `bitrateKbps` sets the AAC target rate (re-encoding is lossy on top of an already-lossy
+ * source, so a higher rate costs only disk). Injectable spawn for tests (default =
+ * node:child_process spawn).
  */
 export function transcodeToM4a(
   srcPath: string,
   destPath: string,
   spawnFn: typeof nodeSpawn = nodeSpawn,
   timeoutMs: number = TRANSCODE_TIMEOUT_MS,
+  bitrateKbps: number = DEFAULT_TRANSCODE_BITRATE_KBPS,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const args = [
@@ -82,7 +91,7 @@ export function transcodeToM4a(
       "-c:a",
       "aac",
       "-b:a",
-      "192k",
+      `${bitrateKbps}k`,
       "-movflags",
       "+faststart", // moov atom up front so range requests work without a full read
       "-f",

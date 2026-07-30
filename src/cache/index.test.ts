@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AudioCache } from "./index.js";
-import { setRootLogger } from "../util/logger.js";
+import { setRootLogger, createLogger } from "../util/logger.js";
 
 let dir: string;
 beforeEach(async () => {
@@ -229,6 +229,98 @@ describe("AudioCache", () => {
     cache.register("ddddddddddd", await makeFile("ddddddddddd.webm", 500)); // 600+500=1100 > 1000
     expect(cache.totalBytes()).toBeLessThanOrEqual(1000);
     expect(cache.has("ddddddddddd")).toBe(true);
+  });
+
+  it("evict() drops the entry AND unlinks the file so a retry re-downloads", async () => {
+    // Self-heal path for a track that turned out to be corrupt/undecodable. Dropping only the
+    // map entry would leave the bad bytes on disk for reconcile() to re-adopt at the next start,
+    // and leaving the entry would keep serving the same broken file to every listener.
+    const cache = new AudioCache(dir, 1000);
+    await cache.init();
+    const p = await makeFile("aaaaaaaaaaa.webm", 300);
+    cache.register("aaaaaaaaaaa", p, { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 });
+    cache.register("bbbbbbbbbbb", await makeFile("bbbbbbbbbbb.webm", 200));
+
+    cache.evict("aaaaaaaaaaa");
+
+    expect(cache.has("aaaaaaaaaaa")).toBe(false);
+    expect(cache.get("aaaaaaaaaaa")).toBeNull();
+    expect(cache.getAudio("aaaaaaaaaaa")).toBeNull();
+    expect(existsSync(p)).toBe(false); // the bad bytes are really gone from disk
+    expect(cache.totalBytes()).toBe(200); // …and their bytes are reclaimed
+    expect(cache.has("bbbbbbbbbbb")).toBe(true); // innocent neighbour untouched
+  });
+
+  it("evict() ignores the pin (the corrupt track is usually the pinned current one)", async () => {
+    // Unlike LRU eviction: the whole point is to purge the track that is playing badly RIGHT NOW,
+    // which the orchestrator has pinned. A pin-respecting evict would be a no-op exactly when it
+    // is needed.
+    const cache = new AudioCache(dir, 1000);
+    await cache.init();
+    const p = await makeFile("aaaaaaaaaaa.webm", 300);
+    cache.register("aaaaaaaaaaa", p);
+    cache.pin("aaaaaaaaaaa");
+    cache.evict("aaaaaaaaaaa");
+    expect(cache.has("aaaaaaaaaaa")).toBe(false);
+    expect(existsSync(p)).toBe(false);
+  });
+
+  it("evict() is a silent no-op for an unknown id (never throws)", async () => {
+    const cache = new AudioCache(dir, 1000);
+    await cache.init();
+    cache.register("aaaaaaaaaaa", await makeFile("aaaaaaaaaaa.webm", 300));
+    expect(() => cache.evict("zzzzzzzzzzz")).not.toThrow();
+    expect(cache.totalBytes()).toBe(300);
+  });
+
+  it("evict() survives a file that is already gone, still forgetting the entry", async () => {
+    const cache = new AudioCache(dir, 1000);
+    await cache.init();
+    const p = await makeFile("aaaaaaaaaaa.webm", 300);
+    cache.register("aaaaaaaaaaa", p);
+    await rm(p); // e.g. the volume was cleaned out from under us
+    expect(() => cache.evict("aaaaaaaaaaa")).not.toThrow();
+    expect(cache.has("aaaaaaaaaaa")).toBe(false);
+    expect(cache.totalBytes()).toBe(0);
+  });
+
+  it("init() trims an INHERITED cache that is already over the cap", async () => {
+    // Regression: register() only makes room for the file it is admitting, so it can leave the
+    // cache over maxBytes when a single adopted file is larger than the whole cap (nothing to
+    // evict → warn → admit anyway). Reconcile then handed those bytes forward across EVERY future
+    // restart — which is how an oversized inherited cache (older builds leaked pins, so the cap
+    // silently stopped applying) never shrank again. init() must trim once after adopting.
+    const warn = vi.fn();
+    setRootLogger({ warn, error: vi.fn(), info: vi.fn() } as never);
+    try {
+      // Left behind by a prior run: a single file bigger than the entire cap.
+      await makeFile("aaaaaaaaaaa.webm", 800);
+      const cache = new AudioCache(dir, 500);
+      await cache.init();
+      expect(cache.totalBytes()).toBeLessThanOrEqual(500);
+      expect(cache.has("aaaaaaaaaaa")).toBe(false);
+      expect(existsSync(join(dir, "aaaaaaaaaaa.webm"))).toBe(false); // bytes given back to the fs
+    } finally {
+      setRootLogger(createLogger("silent"));
+    }
+  });
+
+  it("init() trims the inherited cache LRU-first, keeping what fits", async () => {
+    // The trim is the same LRU eviction the cap path uses, so it must stop as soon as the cache
+    // fits rather than emptying the dir — a restart is supposed to REUSE cached audio.
+    await makeFile("aaaaaaaaaaa.webm", 400);
+    await makeFile("bbbbbbbbbbb.webm", 400);
+    await makeFile("ccccccccccc.webm", 400);
+    const cache = new AudioCache(dir, 900);
+    await cache.init();
+    expect(cache.totalBytes()).toBeLessThanOrEqual(900);
+    expect(cache.totalBytes()).toBeGreaterThan(0); // not a purge
+    // Whatever survived is on disk and servable; whatever didn't is gone from both index and disk.
+    const survivors = ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"].filter((id) => cache.has(id));
+    expect(survivors.length).toBeGreaterThanOrEqual(1);
+    for (const id of ["aaaaaaaaaaa", "bbbbbbbbbbb", "ccccccccccc"]) {
+      expect(existsSync(join(dir, `${id}.webm`))).toBe(cache.has(id));
+    }
   });
 
   afterEach(async () => {

@@ -1,6 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import { EventEmitter } from "node:events";
-import { chooseDelivery, transcodeToM4a, MIME_BY_EXT, TRANSCODE_CONTENT_TYPE } from "./format.js";
+import {
+  chooseDelivery,
+  transcodeToM4a,
+  MIME_BY_EXT,
+  TRANSCODE_CONTENT_TYPE,
+  DEFAULT_TRANSCODE_BITRATE_KBPS,
+} from "./format.js";
 import type { AudioInfo } from "../types/index.js";
 
 const opus: AudioInfo = { codec: "opus", bitrateKbps: 160, sampleRateHz: 48000 };
@@ -111,6 +117,20 @@ describe("transcodeToM4a", () => {
     expect(a).toEqual(expect.arrayContaining(["-movflags", "+faststart"]));
     expect(a).toEqual(expect.arrayContaining(["-f", "mp4"]));
     expect(a).toContain("-vn");
+    // Unspecified bitrate keeps the historical rate, so existing call sites are unaffected.
+    expect(a[a.indexOf("-b:a") + 1]).toBe(`${DEFAULT_TRANSCODE_BITRATE_KBPS}k`);
+  });
+
+  it("encodes at the requested bitrate (TRANSCODE_BITRATE_KBPS), not the hardcoded 192k", async () => {
+    // This re-encode is a SECOND lossy generation on an already-lossy source, so the deployed rate
+    // needs to sit above the source's — it was pinned at 192k with no way to raise it.
+    const { spawnFn } = fakeFf(0);
+    await expect(
+      transcodeToM4a("/in/a.mp3", "/out/a.m4a", spawnFn as never, undefined, 320),
+    ).resolves.toBeUndefined();
+    const a = spawnFn.mock.calls[0]![1] as string[];
+    expect(a[a.indexOf("-b:a") + 1]).toBe("320k");
+    expect(a).not.toContain("192k");
   });
 
   it("rejects with the ffmpeg stderr tail on a non-zero exit", async () => {

@@ -25,6 +25,10 @@ export interface StationControllerDeps {
   ) => Promise<{ path: string; audio: AudioInfo | null }>;
   pin?: (videoId: string, path: string, audio: AudioInfo | null) => void;
   unpin?: (videoId: string) => void;
+  // Drop a cached track (entry + file). Used to SELF-HEAL a corrupt cached file: a track that the
+  // browser refused to play, or that failed to load, would otherwise be re-served from the very
+  // same bad bytes on every future attempt. Best-effort and optional — never load-bearing.
+  evict?: (videoId: string) => void;
   prefetch?: (videoId: string, durationSec?: number | null) => Promise<void>;
   // Read the real audio format of an already-cached track (prefetch/audio-route registered it).
   // Used by crossfadeAdvance to populate the crossfaded-in track's `.audio` (there is no download
@@ -51,6 +55,10 @@ export class StationController extends EventEmitter {
   // Set when the queue drained with no radio: we hold paused with the last `current` preserved
   // (spec §3/§4 never-stops). Distinct from a manual pause() so a later enqueue can auto-start.
   private _dryHeld = false;
+  // Set by pause() when it interrupts a dry-hold, consumed by resume() so the station restarts
+  // instead of sending a `play` that nothing can act on. Cleared whenever a track actually goes
+  // live (loadCurrentLocked) so it can never go stale across normal playback.
+  private _pausedFromDryHold = false;
   private preparing: PreparingState | null = null;
   // advance-exactly-once guard: each fresh play opens a new generation; the next trackEnd/error
   // is only honored when it matches the live generation (so an error+trackEnd pair can't double-skip).
@@ -103,10 +111,69 @@ export class StationController extends EventEmitter {
   private downloadFailStreak = 0;
   private static readonly DOWNLOAD_FAIL_BACKOFF_CAP_MS = 30_000;
   private static readonly DOWNLOAD_FAIL_BACKOFF_BASE_MS = 1_000;
+  // Ceiling on the failure-driven walk taken INSIDE a single lock task. loadCurrentLocked ⇄
+  // playNextLocked is mutual recursion: every individual await in it is bounded, but a long run of
+  // failing tracks chains them, so the TOTAL time the station lock is held is not. Past this many
+  // consecutive failure-driven advances we stop walking and dry-hold instead; the armed backoff
+  // retry resumes the search in a FRESH lock task, so the lock is released between attempts and
+  // skip/resume/enqueue stay responsive. The normal path walks exactly ONE advance, so 10 is far
+  // above anything healthy while still bounding the hold to a handful of failures.
+  private static readonly MAX_FAIL_WALK = 10;
   private readonly setTimeoutFn: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
   private readonly clearTimeoutFn: (h: ReturnType<typeof setTimeout>) => void;
   private readonly radioRetryBaseMs: number;
   private static readonly RADIO_RETRY_CAP_MS = 60_000;
+  // Never-hang backstops (see withWatchdog). The station mutex serializes EVERY playback op, so a
+  // single injected dependency that never settles inside a lock task holds that lock forever: the
+  // station freezes mid-track with no crash, no restart and no recovery, and every later
+  // resume/skip/enqueue queues behind it.
+  //
+  // Both ceilings are LAST-RESORT backstops against an unknown-unknown hang — NOT policy timers.
+  // runYtDlp is now guaranteed to settle (it settles on 'exit' as well as 'close' and kills the
+  // whole process group), and both dependencies below bound their own work, so neither watchdog
+  // fires in normal operation. They are therefore sized strictly ABOVE the true worst case of
+  // the work they guard: a FALSE trip is worse than a slow legitimate operation, because it skips
+  // a legitimate track (download) or drops a legitimate radio pick (radio) — and, worse, a trip
+  // ABANDONS a call that still holds the callee's own mutex, so a ceiling set BELOW the real worst
+  // case makes every following call queue behind the abandoned one and hold the STATION lock for
+  // the full ceiling: it would re-create the very freeze these exist to prevent, on a fixed cycle.
+  //
+  // Download worst case = QUEUEING + WORK, not work alone. `deps.download` is the coalesced
+  // downloader wired in src/index.ts: it consults the cache, then runs the real fetch inside a
+  // SHARED Semaphore(MAX_TRANSCODE_JOBS, default 2) that also gates prefetch, the /audio route's
+  // downloads and its ffmpeg transcodes — so this await includes the wait for a permit.
+  //   • work: youtube.download bounds its WHOLE client-fallback ladder with one TOTAL deadline of
+  //     DOWNLOAD_LADDER_ATTEMPTS (2) × the auto-scaled per-attempt timeout = 2 ×
+  //     DOWNLOAD_TIMEOUT_CAP_MS (30 min, see scaleDownloadTimeout) = 60 min at the cap.
+  //   • queueing: BOUNDED — but only because every permit holder is itself now time-bounded (a
+  //     download by that same 60-min ladder budget, a transcode by TRANSCODE_TIMEOUT_MS = 10 min).
+  //     It is not zero and not fixed: it is (work queued ahead of us) / 2 permits, so it grows with
+  //     how many prefetches + /audio requests are in flight.
+  // 120 min = the 60-min ladder plus 60 min of permit-queue headroom (one other full-length ladder
+  // on each permit, or a dozen queued 10-min transcodes). Under EXTREME contention a trip is still
+  // possible — this is a backstop, not a proof — and that degrades into the normal "this track
+  // failed, move on" path in loadCurrentLocked's catch (trackError banner → discard → backoff →
+  // next candidate): the station loses ONE track and keeps playing, which is acceptable for an
+  // always-on radio; a freeze is not. (An operator who raises YTDLP_TIMEOUT_MS above the 30-min cap,
+  // or drops MAX_TRANSCODE_JOBS to 1, lengthens both terms and must raise this constant with them.)
+  private static readonly DOWNLOAD_WATCHDOG_MS = 120 * 60_000;
+  // Radio worst case is QUEUEING + WORK too, for the same reason the download ceiling is:
+  // nextCandidate() now QUEUES on RadioEngine's own mutex, so the station's call can wait behind at
+  // most ONE in-flight top-up production before its own runs. The ceiling must therefore cover 2 ×
+  // the per-production worst case, not 1 ×.
+  //   • one production: RadioEngine bounds nextCandidate() with an INTERNAL ~120s time budget
+  //     (RADIO_BUDGET_MS) that it checks BETWEEN fetches, plus at most one already-started fetch —
+  //     and a single metadata lookup is itself the client-fallback ladder, 5 rungs × the 60s yt-dlp
+  //     metadata timeout = 5 min (Timeout is retryable across clients). 120s + 5 min ≈ 7 min.
+  //   • queueing: at most one such production ahead of us on that mutex — the same ~7 min.
+  // 2 × (120s + 5 min) ≈ 14 min worst case; 20 min gives real headroom, so this can never
+  // false-trip (a healthy related() lookup is seconds). Same honest framing as the download
+  // ceiling: a LAST-RESORT backstop, not a policy timer — and a trip must not be cheap, because
+  // abandoning a call that still owns RadioEngine's mutex makes the NEXT caller queue behind it.
+  // A genuine trip is treated exactly like "radio returned nothing": no radio this round →
+  // dry-hold → armed backing-off retry (see radioContinuationWatched) — never a throw out of the
+  // lock task.
+  private static readonly RADIO_WATCHDOG_MS = 20 * 60_000;
 
   constructor(private readonly deps: StationControllerDeps) {
     super();
@@ -212,10 +279,30 @@ export class StationController extends EventEmitter {
       this.playGeneration += 1;
       // Surface the failed track to the UI BEFORE we discard it (the item is still `current`),
       // so the client's "Skipped '<title>' — <reason>" banner can name what was dropped.
-      this.emitTrackError(this.queue.current, reason);
+      const failed = this.queue.current;
+      this.emitTrackError(failed, reason);
+      // Self-heal a corrupt cached track: the browser could not play THIS file, so drop its cache
+      // entry instead of re-serving the same bad bytes on every future attempt. Best-effort — the
+      // discard/advance below happens either way.
+      if (failed) this.evictTrack(failed.meta.videoId);
       await this.advanceAndPlayLocked("discard"); // failed track is NOT archived to history
     });
   };
+
+  /**
+   * Self-heal a bad cached track: drop its cache entry (and the derived transcode) so the next
+   * attempt re-downloads instead of re-serving the same corrupt file forever. Called only when a
+   * track is being discarded after a playback error or a failed load — never for a live track.
+   * Best-effort by contract, and wrapped so a throwing dep can never escape a catch block or a
+   * lock task (both callers are voided background work where that would be an unhandled rejection).
+   */
+  private evictTrack(videoId: string): void {
+    try {
+      this.deps.evict?.(videoId);
+    } catch {
+      /* best-effort: a failed eviction only means the next attempt may hit the same bad file */
+    }
+  }
 
   /**
    * Emit a {@link ServerBroadcastMessage} `trackError` payload over the "trackError" event so the
@@ -259,12 +346,22 @@ export class StationController extends EventEmitter {
     // as `current` (spec §3/§4: hold paused with current/position preserved, no teardown).
     const hasUpcoming = this.queue.snapshot().upcoming.length > 0;
     if (!hasUpcoming) {
-      const radioMeta = this.radioContinuation ? await this.radioContinuation() : null;
+      const radioMeta = await this.radioContinuationWatched();
       // A clear() ran during radioContinuation() → the station is idle; abandon this advance BEFORE
       // adding a radio track / arming a dry-hold retry / playing (all of which would un-idle it).
       if (advGen !== this.playGeneration) return;
+      // Re-read the queue AFTER that awaited (seconds-long) lookup: an enqueue that landed DURING
+      // it is already sitting in `upcoming`, and the pre-await `hasUpcoming` is stale. enqueue()
+      // does NOT auto-start in that window either (a live `current` is still held and _dryHeld is
+      // false), so without this re-check the station would dry-hold with a real track queued.
+      const gainedUpcoming = this.queue.snapshot().upcoming.length > 0;
       if (radioMeta) {
+        // Keep the pick even when a track arrived meanwhile: radio adds APPEND, and a user add
+        // sorts ahead of trailing radio filler, so the newly-enqueued track still plays first.
         await this.queue.add(radioMeta, AUTOPLAY_REQUESTER, true);
+      } else if (gainedUpcoming) {
+        // Radio had nothing, but the queue is no longer dry — fall through to the normal promote
+        // path below (never requeueHistory/dry-hold: there is a genuine next track waiting).
       } else if (this._settings.repeat === "all" && (await this.queue.requeueHistory()) > 0) {
         // repeat="all": explicit queue dry AND radio yielded nothing → re-cycle the FULL played
         // set (incl. the just-finished current) back into `upcoming`. requeueHistory clears
@@ -309,6 +406,19 @@ export class StationController extends EventEmitter {
   }
 
   /**
+   * Dry-hold at the end of a CUT-SHORT failure walk (MAX_FAIL_WALK, see loadCurrentLocked), with a
+   * retry GUARANTEED to be armed. enterDryHoldLocked only schedules its retry when radio could have
+   * produced a track (autoplay + a seed + a wired continuation); here the walk was abandoned with
+   * real candidates possibly still sitting in `upcoming`, and the retry is the ONLY thing that will
+   * resume the search — so arm it unconditionally rather than leaving the station stopped. The
+   * retry runs startNextLocked in a fresh lock task, which picks the search back up where we left.
+   */
+  private enterDryHoldAndRetryLocked(): void {
+    this.enterDryHoldLocked();
+    if (this.radioRetryHandle === null) this.scheduleRadioRetryLocked();
+  }
+
+  /**
    * Arm the next backing-off dry-hold radio retry (idempotent — replaces any pending timer).
    * The always-on station must NEVER permanently give up: there is no attempt cap. The exponential
    * delay is clamped at RADIO_RETRY_CAP_MS, so a persistently-failing upstream degrades into a
@@ -344,6 +454,21 @@ export class StationController extends EventEmitter {
     }
   }
 
+  /**
+   * Inter-attempt delay for the consecutive-failure streak. The FIRST failure advances immediately
+   * (an isolated bad track shouldn't add latency); only a RUN of consecutive failures (a whole-feed
+   * outage, or a sink that throws on every track) backs off, doubling up to a cap, so a mass
+   * failure degrades into a slow retry instead of a thundering burst of yt-dlp spawns.
+   */
+  private failBackoffMs(): number {
+    return this.downloadFailStreak <= 1
+      ? 0
+      : Math.min(
+          StationController.DOWNLOAD_FAIL_BACKOFF_CAP_MS,
+          StationController.DOWNLOAD_FAIL_BACKOFF_BASE_MS * 2 ** (this.downloadFailStreak - 2),
+        );
+  }
+
   /** Await `ms` via the injectable timer (0 resolves immediately so tests need no fake clock). */
   private delay(ms: number): Promise<void> {
     if (ms <= 0) return Promise.resolve();
@@ -353,21 +478,96 @@ export class StationController extends EventEmitter {
   }
 
   /**
+   * Race `p` against the injectable timer and reject if it has not settled within `ms`.
+   *
+   * The never-stops invariant: EVERY await reachable inside a lock task must be bounded. A
+   * dependency that never settles (a yt-dlp child whose 'close' never fires because a grandchild
+   * still holds its stdio, a wedged upstream mutex) otherwise holds the station lock forever and
+   * the station is dead until the process restarts. Ceilings are last-resort backstops, not policy
+   * timeouts — see DOWNLOAD_WATCHDOG_MS / RADIO_WATCHDOG_MS.
+   *
+   * The timer is always cleared on the settle path (nothing leaks; tests drive setTimeout/
+   * clearTimeout through the injected deps), and `p`'s own settlement is ALWAYS handled, so a late
+   * rejection arriving after a trip can never surface as an unhandled rejection. The timer is armed
+   * only if `p` is still pending on the next microtask, so an already-settled dependency (the
+   * common cached/fast path) costs no timer at all.
+   */
+  private withWatchdog<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let handle: ReturnType<typeof setTimeout> | null = null;
+      let settled = false;
+      const disarm = (): void => {
+        settled = true;
+        if (handle !== null) {
+          this.clearTimeoutFn(handle);
+          handle = null;
+        }
+      };
+      void p.then(
+        (value) => {
+          disarm();
+          resolve(value);
+        },
+        (err: unknown) => {
+          disarm();
+          reject(err); // pass the original failure through untouched (callers read err.message)
+        },
+      );
+      queueMicrotask(() => {
+        if (settled) return;
+        handle = this.setTimeoutFn(() => {
+          handle = null;
+          reject(new Error(`station watchdog: ${what} did not settle within ${ms}ms`));
+        }, ms);
+      });
+    });
+  }
+
+  /**
+   * `radioContinuation()` under the never-hang watchdog, degraded to `null` on ANY failure.
+   * Radio is best-effort by contract (related()/artistTracks() already swallow their own errors to
+   * []), so a watchdog trip — or a continuation that rejects outright — is treated exactly like
+   * "radio had nothing this round": the caller falls through to the dry-hold + backing-off
+   * self-retry. It must NEVER throw out of a lock task: on the voided lock promise that would be an
+   * unhandled rejection AND would skip the dry-hold (leaving the station stopped with no retry).
+   */
+  private async radioContinuationWatched(): Promise<TrackMeta | null> {
+    if (!this.radioContinuation) return null;
+    try {
+      return await this.withWatchdog(
+        this.radioContinuation(),
+        StationController.RADIO_WATCHDOG_MS,
+        "radio continuation",
+      );
+    } catch {
+      return null; // hung or failed lookup → "no radio this round", never a throw
+    }
+  }
+
+  /**
    * Promote the next track (head → radio → dry-hold) WITHOUT first retiring a held `current`.
    * Used by attach/enqueue auto-start: when dry-held the finished track is still `current`, so
    * we archive it here only once there is genuinely something to advance into.
    */
   private async startNextLocked(): Promise<void> {
     if (this._dryHeld) {
-      // A held current is the already-finished track; retire it before promoting the new one.
-      await this.queue.advance();
+      // A held current is normally the already-finished track: retire it before promoting the new
+      // one. Only when it genuinely went LIVE, though — a dry-hold that ended a cut-short failure
+      // walk (MAX_FAIL_WALK) holds a candidate that was promoted by discardCurrent and never
+      // played, and archiving that would silently drop a real track from the queue. When there is
+      // no current at all, playNextLocked's own advance does the promotion.
+      if (this.queue.current && this.liveItemId === this.queue.current.id) {
+        await this.queue.advance();
+      }
       this._dryHeld = false;
     }
     await this.playNextLocked();
   }
 
   // Core never-stopping advance: promote head → if none, ask radio → if none, hold paused.
-  private async playNextLocked(): Promise<void> {
+  // `failWalk` is how many consecutive FAILURE-driven advances this same lock task has already
+  // taken (see loadCurrentLocked); every normal caller starts a fresh walk at 0.
+  private async playNextLocked(failWalk = 0): Promise<void> {
     // Advance generation for the radioContinuation() await below (see advanceAndPlayLocked): a
     // clear() during that network call must abandon this advance rather than restart radio.
     const pnGen = this.playGeneration;
@@ -386,24 +586,30 @@ export class StationController extends EventEmitter {
     if (!this.queue.current) {
       const item = await this.queue.advance();
       if (!item) {
-        const radioMeta = this.radioContinuation ? await this.radioContinuation() : null;
+        const radioMeta = await this.radioContinuationWatched();
         // A clear() ran during radioContinuation() → abandon before adding radio / arming a
         // dry-hold retry, so the station stays idle instead of restarting.
         if (pnGen !== this.playGeneration) return;
-        if (radioMeta) {
-          await this.queue.add(radioMeta, AUTOPLAY_REQUESTER, true);
-          await this.queue.advance();
-        } else {
+        if (radioMeta) await this.queue.add(radioMeta, AUTOPLAY_REQUESTER, true);
+        // Re-read the queue AFTER that awaited (seconds-long) lookup (same stale-`upcoming` bug
+        // advanceAndPlayLocked guards): an enqueue that landed DURING it is already sitting in
+        // `upcoming`, and the pre-await advance() miss is stale. enqueue() cannot auto-start it
+        // either — this lock task holds the lock — so without the re-read the station would
+        // dry-hold with a real track queued. Either way this is the SAME single advance the radio
+        // branch already did (never two), so it cannot double-advance; a user add sorts ahead of
+        // trailing radio filler, so the newly-enqueued track still wins the promotion.
+        const gained = radioMeta !== null || this.queue.snapshot().upcoming.length > 0;
+        if (!gained || (await this.queue.advance()) === null) {
           // queue dry, no radio: hold paused, preserve last current/seed. NO teardown.
           this.enterDryHoldLocked();
           return;
         }
       }
     }
-    await this.loadCurrentLocked(0);
+    await this.loadCurrentLocked(0, failWalk);
   }
 
-  private async loadCurrentLocked(startMs: number): Promise<void> {
+  private async loadCurrentLocked(startMs: number, failWalk = 0): Promise<void> {
     const item = this.queue.current;
     if (!item || !this.sink) {
       this.emit("changed");
@@ -435,18 +641,25 @@ export class StationController extends EventEmitter {
         phase: "downloading",
         percent: 0,
       });
-      const res = await this.deps.download(item.meta.videoId, {
-        // Thread the track duration so the yt-dlp timeout auto-scales for long
-        // mixes/concerts instead of being SIGKILLed at the short default.
-        durationSec: item.meta.durationSec,
-        onProgress: (pct) =>
-          this.setPreparing({
-            videoId: item.meta.videoId,
-            title: item.meta.title,
-            phase: "downloading",
-            percent: pct,
-          }),
-      });
+      // Under the never-hang watchdog: a download dep that NEVER settles would hold the station
+      // lock forever. A trip rejects into the catch below, which is exactly the normal
+      // "this track failed" path (trackError banner → discard → backoff → next candidate).
+      const res = await this.withWatchdog(
+        this.deps.download(item.meta.videoId, {
+          // Thread the track duration so the yt-dlp timeout auto-scales for long
+          // mixes/concerts instead of being SIGKILLed at the short default.
+          durationSec: item.meta.durationSec,
+          onProgress: (pct) =>
+            this.setPreparing({
+              videoId: item.meta.videoId,
+              title: item.meta.title,
+              phase: "downloading",
+              percent: pct,
+            }),
+        }),
+        StationController.DOWNLOAD_WATCHDOG_MS,
+        `download ${item.meta.videoId}`,
+      );
       path = res.path;
       audio = res.audio;
     } catch (err) {
@@ -464,25 +677,28 @@ export class StationController extends EventEmitter {
       // Surface the failure to the UI (banner) BEFORE discarding, while `item` is still known.
       const reason = err instanceof Error && err.message ? err.message : "download failed";
       this.emitTrackError(item, reason);
+      // Self-heal: a half-written / corrupt cached file makes every retry of this track fail the
+      // same way. Drop its cache entry so the next attempt re-downloads (best-effort).
+      this.evictTrack(item.meta.videoId);
       await this.queue.discardCurrent();
       // Back off before walking to the next candidate so a mass-failure (whole-feed outage) is a
       // slow retry, not a tight burst of yt-dlp spawns + related() fetches. Delay grows with the
       // consecutive-failure streak up to a cap; a successful load resets the streak to 0.
       this.downloadFailStreak += 1;
-      // The FIRST failure advances immediately (an isolated bad track shouldn't add latency);
-      // only a RUN of consecutive failures (a whole-feed outage) backs off, doubling up to a cap,
-      // so a mass failure degrades into a slow retry instead of a thundering burst of yt-dlp spawns.
-      const backoff =
-        this.downloadFailStreak <= 1
-          ? 0
-          : Math.min(
-              StationController.DOWNLOAD_FAIL_BACKOFF_CAP_MS,
-              StationController.DOWNLOAD_FAIL_BACKOFF_BASE_MS * 2 ** (this.downloadFailStreak - 2),
-            );
-      await this.delay(backoff);
+      // Bound the walk (see MAX_FAIL_WALK): this method and playNextLocked call each other, so a
+      // long run of failing tracks would hold the station lock for an unbounded TOTAL even though
+      // each await is bounded. Stop walking and dry-hold instead — the guaranteed armed retry
+      // continues the search in a FRESH lock task (startNextLocked leaves this freshly-promoted,
+      // never-played candidate in place), so the lock is free for skip/resume/enqueue meanwhile.
+      // The in-lock backoff below is skipped with it; the retry's own backoff paces the next try.
+      if (failWalk >= StationController.MAX_FAIL_WALK) {
+        this.enterDryHoldAndRetryLocked();
+        return;
+      }
+      await this.delay(this.failBackoffMs());
       // A clear() during the backoff wait supersedes this advance too — don't walk to the next.
       if (loadGen !== this.playGeneration) return;
-      await this.playNextLocked();
+      await this.playNextLocked(failWalk + 1);
       return;
     }
     this._loading = false;
@@ -493,53 +709,96 @@ export class StationController extends EventEmitter {
       this.setPreparing(null);
       return;
     }
-    // Forward the real audio format so /audio/:id can serve playable opus/webm/m4a as-is (not
-    // transcode) and the NowPlaying format badge can render. Pin under the same audio so the
-    // cache carries it too.
-    this.queue.setCurrentAudio(item.meta.videoId, audio);
-    // Release the PREVIOUS track's pin before pinning the new one, so pins don't accumulate
-    // without bound and defeat LRU eviction (spec: the cache honors CACHE_MAX_MB; a station that
-    // plays forever must not pin every track it ever played). The unpin dep also releases the
-    // derived `${videoId}.m4a` transcode key (see src/index.ts wiring). Skip when the same
-    // videoId is re-pinned (repeat="one") so we never unpin the track we are about to pin.
-    if (this.pinnedVideoId && this.pinnedVideoId !== item.meta.videoId) {
-      this.deps.unpin?.(this.pinnedVideoId);
+    // The commit tail runs under error handling for the same reason the download does: this whole
+    // method is a VOIDED lock task, so a throw here (a sink whose socket died between the supersede
+    // check and the write, a synchronous 'changed'/pin listener that threw) would surface as an
+    // unhandled rejection AND leave the station with nothing playing and no advance armed — a stop
+    // with no recovery. It is straight-line synchronous, so nothing can supersede us mid-way.
+    let started = false; // the sink was already told to load/play → the track IS live
+    try {
+      // Forward the real audio format so /audio/:id can serve playable opus/webm/m4a as-is (not
+      // transcode) and the NowPlaying format badge can render. Pin under the same audio so the
+      // cache carries it too.
+      this.queue.setCurrentAudio(item.meta.videoId, audio);
+      // Release the PREVIOUS track's pin before pinning the new one, so pins don't accumulate
+      // without bound and defeat LRU eviction (spec: the cache honors CACHE_MAX_MB; a station that
+      // plays forever must not pin every track it ever played). The unpin dep also releases the
+      // derived `${videoId}.m4a` transcode key (see src/index.ts wiring). Skip when the same
+      // videoId is re-pinned (repeat="one") so we never unpin the track we are about to pin.
+      if (this.pinnedVideoId && this.pinnedVideoId !== item.meta.videoId) {
+        this.deps.unpin?.(this.pinnedVideoId);
+      }
+      this.deps.pin?.(item.meta.videoId, path, audio);
+      this.pinnedVideoId = item.meta.videoId;
+      this.setPreparing(null);
+      this.playGeneration += 1; // fresh live track → re-arm the advance guard
+      this.liveItemId = item.id;
+      // Retain the exact item the sink was told to load so snapshot()/now-playing tracks the
+      // actually-playing track (not the raw queue head that may have already advanced). `item` is
+      // the same object the queue holds while current, so setCurrentAudio mutates it in place.
+      this.liveItem = item;
+      this._dryHeld = false;
+      this._pausedFromDryHold = false; // a real track is live again — the remembered hold is stale
+      // A track is live again: cancel any pending dry-hold radio retry and reset its backoff so a
+      // future drain starts fresh from the base delay.
+      this.cancelRadioRetry();
+      this.radioRetryAttempt = 0;
+      // A concurrent seek during the (awaited) download re-anchored the position; honor it over the
+      // original startMs so the user's seek is not clobbered when the load completes.
+      const effectiveStartMs = this.pendingSeekMs ?? startMs;
+      this.pendingSeekMs = null;
+      // A pause() issued WHILE this track was still downloading must survive: prepare/anchor the
+      // audio but load it PAUSED (no play, keep _paused=true) so playback doesn't start behind the
+      // user's back. Otherwise this is an intentional (re)start — clear _paused and play. Note we
+      // key off _pausedDuringLoad, NOT the plain _paused flag: a dry-hold sets _paused=true too, and
+      // an intentional restart out of dry-hold must resume playback.
+      if (this._pausedDuringLoad) {
+        this._paused = true;
+        this._pausedDuringLoad = false;
+        this.markTrackStarted(effectiveStartMs, true);
+        this.sink.load({ audioUrl: `/audio/${item.meta.videoId}`, startMs: effectiveStartMs });
+      } else {
+        this._paused = false;
+        this.markTrackStarted(effectiveStartMs);
+        this.sink.play({ audioUrl: `/audio/${item.meta.videoId}`, startMs: effectiveStartMs });
+      }
+      started = true;
+      // Clear the consecutive-failure streak only once the track is genuinely LIVE, not merely
+      // downloaded: the commit tail can still throw (a sink whose socket died), and zeroing the
+      // streak before that would re-zero the backoff on every failed commit — turning a sink that
+      // throws on EVERY track into an undamped spin instead of a backing-off retry.
+      this.downloadFailStreak = 0;
+      this.emit("changed");
+    } catch (err) {
+      // The sink already has the track: only the trailing broadcast failed. Swallow it — tearing
+      // down an audible track would be a strictly worse outcome than one missed 'changed' (every
+      // later change re-broadcasts the full snapshot anyway).
+      if (started) return;
+      // Nothing is playing and nothing will ever signal trackEnd for this item, so treat it exactly
+      // like a failed download: banner → discard → back off → walk on to the next candidate.
+      const reason = err instanceof Error && err.message ? err.message : "playback start failed";
+      this.setPreparing(null);
+      this.emitTrackError(item, reason);
+      // Self-heal: the file we just handed the sink may itself be the problem, so drop its cache
+      // entry — the next attempt re-downloads instead of re-serving the same bad bytes forever.
+      this.evictTrack(item.meta.videoId);
+      // Capture the generation AFTER the (partially-run) tail, which may already have bumped it:
+      // only a clear()/detachSink() landing during the awaits below must abort the advance.
+      const tailGen = this.playGeneration;
+      await this.queue.discardCurrent();
+      if (tailGen !== this.playGeneration) return;
+      // Damp this path on the SAME consecutive-failure streak as a failed download: a sink that
+      // throws on every track (dead socket) would otherwise spin through the whole queue at full
+      // speed — the downloads may even be cached, so nothing else paces it. Bound the walk too.
+      this.downloadFailStreak += 1;
+      if (failWalk >= StationController.MAX_FAIL_WALK) {
+        this.enterDryHoldAndRetryLocked();
+        return;
+      }
+      await this.delay(this.failBackoffMs());
+      if (tailGen !== this.playGeneration) return;
+      await this.playNextLocked(failWalk + 1);
     }
-    this.deps.pin?.(item.meta.videoId, path, audio);
-    this.pinnedVideoId = item.meta.videoId;
-    this.setPreparing(null);
-    this.playGeneration += 1; // fresh live track → re-arm the advance guard
-    this.liveItemId = item.id;
-    // Retain the exact item the sink was told to load so snapshot()/now-playing tracks the
-    // actually-playing track (not the raw queue head that may have already advanced). `item` is
-    // the same object the queue holds while current, so setCurrentAudio mutates it in place.
-    this.liveItem = item;
-    this._dryHeld = false;
-    // A track is live again: cancel any pending dry-hold radio retry and reset its backoff so a
-    // future drain starts fresh from the base delay. Also reset the download-failure streak.
-    this.cancelRadioRetry();
-    this.radioRetryAttempt = 0;
-    this.downloadFailStreak = 0;
-    // A concurrent seek during the (awaited) download re-anchored the position; honor it over the
-    // original startMs so the user's seek is not clobbered when the load completes.
-    const effectiveStartMs = this.pendingSeekMs ?? startMs;
-    this.pendingSeekMs = null;
-    // A pause() issued WHILE this track was still downloading must survive: prepare/anchor the
-    // audio but load it PAUSED (no play, keep _paused=true) so playback doesn't start behind the
-    // user's back. Otherwise this is an intentional (re)start — clear _paused and play. Note we
-    // key off _pausedDuringLoad, NOT the plain _paused flag: a dry-hold sets _paused=true too, and
-    // an intentional restart out of dry-hold must resume playback.
-    if (this._pausedDuringLoad) {
-      this._paused = true;
-      this._pausedDuringLoad = false;
-      this.markTrackStarted(effectiveStartMs, true);
-      this.sink.load({ audioUrl: `/audio/${item.meta.videoId}`, startMs: effectiveStartMs });
-    } else {
-      this._paused = false;
-      this.markTrackStarted(effectiveStartMs);
-      this.sink.play({ audioUrl: `/audio/${item.meta.videoId}`, startMs: effectiveStartMs });
-    }
-    this.emit("changed");
   }
 
   skip(): void {
@@ -558,6 +817,12 @@ export class StationController extends EventEmitter {
   }
   pause(): void {
     this._paused = true;
+    // Remember that this pause happened DURING a dry-hold. We still clear _dryHeld (a manual pause
+    // is deliberate: enqueue's auto-start must not fire behind the user's back), but resume() needs
+    // the fact back — otherwise it takes the plain sink.resume() branch, sends `play` for a queue
+    // that has nothing left to play, and (because pause() also cancels the radio retry) the station
+    // never restarts: a permanent silent stop from a single Pause press on a drained queue.
+    this._pausedFromDryHold = this._dryHeld;
     this._dryHeld = false; // a manual pause is deliberate; it is not the dry-queue hold
     // If a load is in flight, record that the pause happened DURING it so loadCurrentLocked lands
     // the track PAUSED instead of auto-playing over the user's pause when the download completes.
@@ -570,7 +835,14 @@ export class StationController extends EventEmitter {
   resume(): void {
     // When holding paused on a dry queue, resume() restarts the station: advance past the
     // finished (held) track into whatever is now queued / radio (spec §3/§4 never-stops).
-    if (this._dryHeld && this.sink) {
+    // `_pausedFromDryHold` covers the same state after a manual Pause cleared _dryHeld — without
+    // it, Pause-then-Resume on a drained queue is a permanent silent stop (see pause()).
+    if ((this._dryHeld || this._pausedFromDryHold) && this.sink) {
+      // Restore the hold before restarting: startNextLocked's "retire the finished held track"
+      // step is gated on _dryHeld, so without this we would RELOAD the already-finished track
+      // from 0 instead of advancing into the queue/radio.
+      this._dryHeld = true;
+      this._pausedFromDryHold = false;
       // Explicit user action: no generation gate (see skip()). The lock serializes us; bump the
       // generation so a stale end/error can't also fire.
       void this.lock.runExclusive(async () => {

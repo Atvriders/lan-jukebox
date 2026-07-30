@@ -1,4 +1,4 @@
-import { readdir } from "node:fs/promises";
+import { readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 import type { MediaConfig } from "../config.js";
 import type { AudioInfo, TrackMeta } from "../types/index.js";
@@ -90,6 +90,19 @@ export function parseDownloadProgress(line: string): DownloadProgress | null {
 export const DOWNLOAD_PER_SEC_MS = 2000;
 /** Hard ceiling for an auto-scaled download timeout (30 min). */
 export const DOWNLOAD_TIMEOUT_CAP_MS = 30 * 60_000;
+/**
+ * How many per-attempt timeouts' worth of wall clock the DOWNLOAD client-fallback ladder
+ * gets in TOTAL. A download rung can legitimately run to DOWNLOAD_TIMEOUT_CAP_MS and the
+ * ladder is up to 5 rungs, so an UNBOUNDED ladder's worst case is 5 × 30 min = 150 min —
+ * far above the orchestrator's last-resort download watchdog, which would then false-trip
+ * and truncate the very fallback ladder it exists to sit above. Two attempts' worth keeps
+ * the whole point of the ladder (one real client swap after a broken first client) while
+ * pinning the worst case at 2 × 30 min = 60 min, comfortably under that backstop.
+ *
+ * Metadata ladders (resolve/related) deliberately pass NO budget: their rungs use the short
+ * `YTDLP_TIMEOUT_MS` metadata timeout (60s), so all 5 rungs are already only ~5 min.
+ */
+export const DOWNLOAD_LADDER_ATTEMPTS = 2;
 
 /**
  * Auto-scale the yt-dlp download timeout by track duration so a long mix/concert isn't
@@ -207,10 +220,25 @@ function toMeta(j: RawInfo): TrackMeta {
   };
 }
 
+/**
+ * TOTAL-time bound for one `withClientFallback` ladder. Only the DOWNLOAD path passes one
+ * (see DOWNLOAD_LADDER_ATTEMPTS). A rung AFTER the first only starts when it could still
+ * finish inside `totalMs`, so the ladder's worst case is exactly `totalMs` rather than
+ * `rungs × perAttemptMs`.
+ */
+interface LadderBudget {
+  /** Ceiling on the attempt time the whole ladder may consume (see `spentMs` in the loop). */
+  totalMs: number;
+  /** Per-rung timeout, i.e. the room the NEXT rung needs before it is worth starting. */
+  perAttemptMs: number;
+}
+
 export class YouTubeService {
   constructor(
     private readonly cfg: MediaConfig,
     private readonly run: RunFn = runYtDlp,
+    /** Injectable clock (tests); only used to bound the download ladder's total time. */
+    private readonly now: () => number = () => Date.now(),
   ) {}
 
   /**
@@ -239,16 +267,43 @@ export class YouTubeService {
    * *terminal* failure (Private/Unavailable/MembersOnly/GeoBlocked/Live/TooLong) aborts
    * the ladder immediately since no client swap can fix it. If every client fails, the
    * LAST error is rethrown so the caller surfaces a concrete reason — never a silent skip.
+   *
+   * With a `budget` (download only) the ladder is additionally bounded in TOTAL wall clock:
+   * once too little of the budget remains for another full-length rung, the ladder stops
+   * early and rethrows the last error down the SAME path as "every client failed", so the
+   * caller still gets a concrete reason. The FIRST rung always runs to completion.
    */
-  private async withClientFallback<T>(fn: (client: string) => Promise<T>): Promise<T> {
+  private async withClientFallback<T>(
+    fn: (client: string) => Promise<T>,
+    budget?: LadderBudget,
+  ): Promise<T> {
     const ladder = buildClientLadder(this.cfg.playerClients);
+    // Budget consumed so far, with each rung CHARGED AT MOST one per-attempt timeout. Charging
+    // the clamped cost rather than raw wall clock is deliberate: a rung that runs to its full
+    // timeout overshoots it by a few ms (kill + settle), which made the raw sum
+    // `elapsed + perAttemptMs > totalMs` true immediately — so under a 2-attempt budget the
+    // SECOND rung, i.e. the one client swap the ladder exists to buy, was unreachable in exactly
+    // the case it was meant for (a first client that hung to its timeout). Each rung is itself
+    // hard-bounded by that same timeout at the runner, so the worst case stays ~`totalMs`.
+    let spentMs = 0;
     let lastErr: unknown;
-    for (const client of ladder) {
+    for (const [i, client] of ladder.entries()) {
+      // Stop before STARTING a rung that could outlast the budget (rather than after
+      // overrunning it): that is what keeps the worst case at `totalMs` instead of
+      // `totalMs + perAttemptMs`. `i > 0` guarantees a single legitimate attempt always runs.
+      if (budget && i > 0 && spentMs + budget.perAttemptMs > budget.totalMs) break;
+      const rungStartedAt = this.now();
       try {
         return await fn(client);
       } catch (err) {
         lastErr = err;
         if (!isRetryableAcrossClients(err)) throw err;
+      } finally {
+        // Never charge more than one attempt for a rung, nor a negative amount should the wall
+        // clock step backwards mid-rung. Budget-less ladders (resolve/related) charge nothing.
+        if (budget) {
+          spentMs += Math.min(Math.max(0, this.now() - rungStartedAt), budget.perAttemptMs);
+        }
       }
     }
     throw lastErr ?? new YtError(YtErrorKind.Unknown, "no player clients configured");
@@ -444,6 +499,37 @@ export class YouTubeService {
     }
   }
 
+  /**
+   * Best-effort sweep of every partial artifact a FAILED download attempt may have left in
+   * `outDir`: any `<videoId>.*`, EXCEPT `<videoId>.transcoded.m4a` (owned by the audio route,
+   * survives an evict-then-redownload of the source and is none of our business).
+   *
+   * FAILURE MODE this exists for: `--force-overwrites` only protects the SAME filename, but a
+   * killed/timed-out rung routinely writes a DIFFERENT extension than the rung that later
+   * succeeds — a SIGKILLed `<id>.webm`, then a good `<id>.m4a`. The truncated `<id>.webm`
+   * survives on disk, AudioCache.reconcile() adopts it on the next process start, and it is then
+   * served as a valid cache hit: a permanently corrupt/skipping track. So each attempt clears its
+   * own debris before the next rung runs / before the error is rethrown.
+   *
+   * NEVER throws — a cleanup failure must not mask the real download error — and the
+   * produced-file filter in download() stays as the second line of defense.
+   */
+  private async purgeFailedArtifacts(outDir: string, videoId: string): Promise<void> {
+    try {
+      const files = await readdir(outDir);
+      for (const f of files) {
+        if (!f.startsWith(`${videoId}.`) || f.endsWith(".transcoded.m4a")) continue;
+        try {
+          await unlink(join(outDir, f));
+        } catch {
+          // Already gone, or unlinkable (permissions/open handle): nothing further to do.
+        }
+      }
+    } catch {
+      // outDir unreadable (missing dir, permissions) — nothing we can see to clean up.
+    }
+  }
+
   async download(
     videoId: string,
     outDir: string,
@@ -457,6 +543,14 @@ export class YouTubeService {
     }
     // Auto-scale the timeout so a long mix/concert isn't killed by the short default.
     const timeoutMs = scaleDownloadTimeout(this.cfg.ytdlpTimeoutMs, opts.durationSec);
+    // …and bound the TOTAL ladder, not just each rung: the per-rung timeout above scales up
+    // to DOWNLOAD_TIMEOUT_CAP_MS, so five unbounded rungs would be 150 min. Worst case here
+    // is DOWNLOAD_LADDER_ATTEMPTS × timeoutMs (≤ 60 min), which the orchestrator's
+    // last-resort download watchdog sits safely above so it can never false-trip.
+    const ladderBudget: LadderBudget = {
+      totalMs: timeoutMs * DOWNLOAD_LADDER_ATTEMPTS,
+      perAttemptMs: timeoutMs,
+    };
     // Per progress line: parse it and (best-effort) forward to the caller. A throw inside
     // onProgress is swallowed at the runner (runYtDlp's emitLine), so it can't break the
     // download; we also guard the parse here.
@@ -475,15 +569,30 @@ export class YouTubeService {
     const sponsorblockArgs = this.cfg.sponsorblockCategories
       ? ["--sponsorblock-remove", this.cfg.sponsorblockCategories]
       : [];
-    const stdout = await this.withClientFallback(async (client) => {
+    const attempt = async (client: string): Promise<string> => {
       const args = [
+        // Bitrate-first audio selection. The old hardcoded `bestaudio[acodec=opus]/bestaudio/best`
+        // picked opus BEFORE considering bitrate, so a higher-bitrate stream was discarded in
+        // favor of a lower-bitrate opus. With the defaults (`bestaudio/best` + `-S abr,acodec:opus`)
+        // yt-dlp sorts candidates by AUDIO BITRATE first and prefers opus only as a tie-break, so
+        // when a better stream exists — notably with YouTube Premium cookies — it is the one taken.
+        // On a free account the ceiling is still ~160 kbps opus, so nothing changes there.
         "-f",
-        "bestaudio[acodec=opus]/bestaudio/best",
+        this.cfg.audioFormat,
+        ...(this.cfg.audioSort ? ["-S", this.cfg.audioSort] : []),
         "--no-playlist",
         // Write the download in place rather than to a separate `<id>.<fmt>.part` file, so a
         // killed/timed-out attempt (SIGKILL on timeout skips yt-dlp's own cleanup) cannot
         // leave a partial artifact that the readdir-based file detection below could pick up.
         "--no-part",
+        // …but the flip side of `--no-part` is that a killed attempt leaves its TRUNCATED bytes
+        // at the FINAL `<id>.<ext>` name — which carries a real audio extension, so the
+        // produced-file filter below cannot exclude it. yt-dlp does not overwrite by default, so
+        // the NEXT attempt (the ladder's next rung, or any later re-download) would report "has
+        // already been downloaded", skip the fetch, and hand back the truncated file: a corrupt
+        // track cached forever that plays broken / gets skipped. Force every attempt to start
+        // from a clean file so none can ever adopt a previous attempt's partial output.
+        "--force-overwrites",
         "--max-filesize",
         `${Math.max(1, Math.min(maxMb, 500))}M`,
         ...sponsorblockArgs,
@@ -508,10 +617,28 @@ export class YouTubeService {
         `https://www.youtube.com/watch?v=${videoId}`,
       );
 
-      const { stdout, stderr, code } = await this.run(args, timeoutMs, onLine);
-      if (code !== 0) throw classifyYtdlpError(stderr, code);
-      return stdout;
-    });
+      try {
+        const { stdout, stderr, code } = await this.run(args, timeoutMs, onLine);
+        if (code !== 0) throw classifyYtdlpError(stderr, code);
+        return stdout;
+      } catch (err) {
+        // This rung failed (non-zero exit, timeout kill, spawn error): drop whatever truncated
+        // `<id>.<ext>` it wrote BEFORE the next rung — which may well settle on a different
+        // extension — starts, so nothing it leaves behind can be adopted later as a cache hit.
+        await this.purgeFailedArtifacts(outDir, videoId);
+        throw err;
+      }
+    };
+
+    let stdout: string;
+    try {
+      stdout = await this.withClientFallback(attempt, ladderBudget);
+    } catch (err) {
+      // Every rung failed (or the ladder ran out of budget before another could start): sweep
+      // once more so no partial outlives the request even if a rung's own sweep never ran.
+      await this.purgeFailedArtifacts(outDir, videoId);
+      throw err;
+    }
 
     const files = await readdir(outDir);
     // Never select a partial/intermediate artifact. A previous client's timed-out attempt is
@@ -541,6 +668,9 @@ export class YouTubeService {
         !f.endsWith(".transcoded.m4a"),
     );
     if (!produced) {
+      // A "success" that produced only intermediates is a failed download too: sweep them, or
+      // the leftovers are what reconcile() adopts on the next start.
+      await this.purgeFailedArtifacts(outDir, videoId);
       throw new YtError(
         YtErrorKind.Unknown,
         `download completed but no file for ${videoId} was found`,

@@ -326,6 +326,14 @@ export interface MediaConfig {
   poTokenProviderUrl: string | null;
   playerClients: string; // default "android_vr,web_embedded,tv"
   ytdlpTimeoutMs: number;
+  /** yt-dlp `-f` format selector for the audio download. Default "bestaudio/best". */
+  audioFormat: string;
+  /** yt-dlp `-S` format-sort preferring the highest-bitrate opus; null = no -S (yt-dlp's own order). */
+  audioSort: string | null;
+  /** Target kbps for the FALLBACK ffmpeg re-encode only — playable opus/m4a is served untouched. */
+  transcodeBitrateKbps: number;
+  /** Refuse to start a download with less than this many MiB free on the cache filesystem; 0 = off. */
+  minFreeDiskMb: number;
 }
 
 export interface StationConfig {

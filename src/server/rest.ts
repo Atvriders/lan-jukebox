@@ -43,10 +43,14 @@ export function registerRest(app: FastifyInstance, deps: RestDeps): void {
     const snap = deps.station.snapshot();
     const body: StationStateResponse = {
       ...snap,
-      // The orchestrator hardcodes the player-presence fields to false/null; the server fills them
-      // from the registry so the header speaker indicator ("● {label} live") is not dead UI.
+      // The orchestrator hardcodes the player-presence fields to false/null/[]; the server fills
+      // them from the registry so the header speaker indicator ("● {label} live") is not dead UI.
       activePlayerPresent: deps.registry.activePlayerDeviceId !== null,
       activePlayerLabel: deps.registry.activePlayerLabel,
+      // Same live roster source the WS overlay (withPresence) uses — without this, REST reports
+      // listeners:[] while the WS simultaneously shows every connected device, and the two
+      // producers disagree about who is listening.
+      listeners: deps.registry.listConnected(),
       isThisDeviceSpeaker: info ? deps.registry.isSpeaker(info.deviceId) : false,
     };
     return reply.send(body);

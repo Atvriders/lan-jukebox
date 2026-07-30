@@ -7,6 +7,7 @@ import { registerAuthRoutes } from "../auth/password.js";
 import { registerRest, type RestDeps } from "./rest.js";
 import { YtError, YtErrorKind } from "../youtube/errors.js";
 import type { WebConfig } from "../config.js";
+import type { PresenceUser } from "../types/index.js";
 
 const meta = (id: string, title = id) => ({
   videoId: id,
@@ -50,6 +51,7 @@ function fakeStation() {
       preparing: null,
       activePlayerPresent: false,
       activePlayerLabel: null,
+      listeners: [],
     })),
     enqueue: vi.fn(async () => ({ id: "i1" })),
     pause: vi.fn(),
@@ -77,6 +79,9 @@ function fakeRegistry() {
   return {
     activePlayerDeviceId: null as string | null,
     activePlayerLabel: null as string | null,
+    // /api/state fills the live listeners roster from the registry (same source as the WS
+    // presence overlay), so the fake must provide it or every /api/state read 500s.
+    listConnected: vi.fn((): PresenceUser[] => []),
     isSpeaker: vi.fn((d: string) => d === "dev-1"),
     release: vi.fn(() => ({ activePlayerDeviceId: null })),
     remember: vi.fn((d: string) => ({ activePlayerDeviceId: d })),
@@ -159,6 +164,26 @@ describe("GET /api/state", () => {
     const body = res.json();
     expect(body.activePlayerPresent).toBe(true);
     expect(body.activePlayerLabel).toBe("Living Room");
+    await app.close();
+  });
+
+  it("fills the live listeners roster from the registry, not the orchestrator's empty default", async () => {
+    // The orchestrator snapshot hardcodes listeners:[]; the WS presence overlay fills it from the
+    // registry. If REST doesn't use the SAME source, the two producers disagree about who is
+    // listening and the drawer flickers empty on every REST refresh.
+    const registry = fakeRegistry();
+    registry.listConnected.mockReturnValue([
+      { deviceId: "dev-1", displayName: "Ada", isSpeaker: true },
+      { deviceId: "dev-2", displayName: "Bo", isSpeaker: false },
+    ]);
+    const { app } = await build({ registry: registry as never });
+    const c = await login(app);
+    const res = await app.inject({ method: "GET", url: "/api/state", headers: { cookie: c } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().listeners).toEqual([
+      { deviceId: "dev-1", displayName: "Ada", isSpeaker: true },
+      { deviceId: "dev-2", displayName: "Bo", isSpeaker: false },
+    ]);
     await app.close();
   });
 });

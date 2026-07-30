@@ -34,7 +34,11 @@ async function main(): Promise<void> {
   media.ytCookiesFile = await materializeCookies(media);
 
   const youtube = new YouTubeService(media);
-  const cache = new AudioCache(media.cacheDir, media.cacheMaxBytes);
+  // CACHE_MAX_MB bounds what the cache TRACKS; MIN_FREE_DISK_MB is the second, independent floor
+  // on the HOST filesystem (shared volume, logs, an under-provisioned disk). It must be threaded
+  // here or the guard silently stays disabled at its 0 default — which is the state the live host
+  // filled its disk in.
+  const cache = new AudioCache(media.cacheDir, media.cacheMaxBytes, media.minFreeDiskMb);
   await cache.init();
   const downloads = new Semaphore(stationCfg.maxConcurrentDownloads);
 
@@ -112,6 +116,10 @@ async function main(): Promise<void> {
     // Lets crossfadeAdvance read an already-cached track's real audio format (the crossfade path
     // has no download to source it from) so the NowPlaying format badge renders for crossfaded tracks.
     getAudio: (videoId) => cache.getAudio(videoId),
+    // Drop a track from the cache ENTRY AND DISK. The orchestrator calls this when a downloaded
+    // file turns out to be unusable (or when the disk is tight), so the bytes are reclaimed and a
+    // later retry re-downloads instead of re-serving the same broken file from the LRU.
+    evict: (videoId) => cache.evict(videoId),
     // Prefetch the upcoming head. Register the resulting file in the LRU cache (NOT pinned)
     // so its bytes are tracked + evictable and loadCurrentLocked can hit it instead of
     // re-downloading. Without register() the file was an untracked on-disk orphan the
@@ -168,6 +176,9 @@ async function main(): Promise<void> {
     cache,
     cacheDir: media.cacheDir,
     downloads,
+    // TRANSCODE_BITRATE_KBPS: without this the fallback re-encode silently keeps the route's
+    // built-in default instead of the configured rate.
+    transcodeBitrateKbps: media.transcodeBitrateKbps,
     // Hand the audio route the SAME coalesced downloader the orchestrator uses so a browser
     // preload of upcoming[0] joins the in-flight prefetch instead of spawning a second yt-dlp
     // that races it on the same `--no-part` file (corruption -> playbackError -> skip).

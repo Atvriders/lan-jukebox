@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { describe, it, expect, vi } from "vitest";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,6 +12,7 @@ import {
   intEnv,
   strEnv,
 } from "./config.js";
+import { setRootLogger, createLogger } from "./util/logger.js";
 
 const SECRET = "x".repeat(32);
 const base = {
@@ -159,5 +160,26 @@ describe("cookies (paste-into-compose)", () => {
   it("returns null when neither cookies option is set", async () => {
     const dir = mkdtempSync(join(tmpdir(), "lj-ck-"));
     expect(await materializeCookies(loadMediaConfig({ CACHE_DIR: dir }))).toBeNull();
+  });
+
+  it("returns null (never throws) when CACHE_DIR itself cannot be created", async () => {
+    // Same degradation contract as the ENOSPC case in config.enospc.test.ts, exercised against
+    // the real filesystem: CACHE_DIR is a path UNDER a regular file, so mkdir fails (ENOTDIR).
+    // Startup must not die over cookies — yt-dlp just runs without them.
+    const error = vi.fn();
+    setRootLogger({ error, warn: vi.fn(), info: vi.fn() } as never);
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "lj-ck-"));
+      const notADir = join(dir, "a-file");
+      writeFileSync(notADir, "i am not a directory");
+      const media = loadMediaConfig({
+        CACHE_DIR: join(notADir, "cache"),
+        YT_COOKIES_TEXT: "SID=abc",
+      });
+      await expect(materializeCookies(media)).resolves.toBeNull();
+      expect(error).toHaveBeenCalledTimes(1);
+    } finally {
+      setRootLogger(createLogger("silent"));
+    }
   });
 });
