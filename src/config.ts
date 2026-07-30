@@ -95,9 +95,12 @@ export function loadMediaConfig(env: Env = process.env): MediaConfig {
     // bounded rather than free-form: below 32 the re-encode is unlistenable, above 512 it is
     // pure waste for an audio-only stream.
     transcodeBitrateKbps: intEnv(env, "TRANSCODE_BITRATE_KBPS", 256, { min: 32, max: 512 }),
-    // Free-space floor (MiB) the cache filesystem must keep before a download may start.
-    // 0 disables the guard entirely — the live station once filled its disk and crash-looped,
-    // so the default is a real, non-zero reserve.
+    // Free-space floor (MiB) for the cache filesystem. Best-effort RECOVERY, not admission control:
+    // AudioCache.enforceFreeDisk runs from register() — i.e. AFTER the file is already on disk — and
+    // evicts LRU unpinned entries to try to regain the floor, stopping early when evicting stops
+    // reclaiming space (the shortfall is often external) and warning when it cannot. It never rejects
+    // a track and never throws. 0 disables the guard entirely — the live station once filled its disk
+    // and crash-looped, so the default is a real, non-zero reserve.
     minFreeDiskMb: intEnv(env, "MIN_FREE_DISK_MB", 1024, { min: 0 }),
   };
 }

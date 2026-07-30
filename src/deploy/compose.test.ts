@@ -35,9 +35,12 @@ describe("docker-compose.yml", () => {
     expect(yml).toMatch(/volumes:\s*\[\s*"cache:\/data\/cache"\s*\]/);
     expect(yml).toMatch(/^volumes:\s*$/m);
     expect(yml).toMatch(/^\s{2}cache:\s*$/m);
-    // documented in a comment so operators know the persisted files live here
-    expect(yml).toMatch(/station-snapshot\.json/);
-    expect(yml).toMatch(/device-registry\.json/);
+    // The persisted files are documented in the README, not in compose comments: the compose file
+    // is deliberately kept to values only. Assert the DOCS carry it rather than the YAML prose, so
+    // operators can still find out that these survive a restart.
+    const readme = readFileSync(resolve(repoRoot, "README.md"), "utf8");
+    expect(readme).toMatch(/station-snapshot\.json/);
+    expect(readme).toMatch(/device-registry\.json/);
   });
 
   it("restarts unless stopped and healthchecks /healthz", () => {
